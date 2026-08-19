@@ -1,33 +1,122 @@
 import SwiftUI
 
+/// MessageBubble is the dispatcher that routes to appropriate sub-components
+/// based on message role and content type.
 struct MessageBubble: View {
-    @Environment(\.colorScheme) private var colorScheme
     let message: MothxMessage
-    private var isUser: Bool { message.role == "user" }
+    let isCurrentRunning: Bool
+    let isLastToolResult: Bool  // true if this is the last in a group of consecutive tool results
+
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            if isUser { Spacer(minLength: 70) }
-            HStack(alignment: .top, spacing: 10) {
-                if !isUser { Image("MothxLogo").resizable().scaledToFit().frame(width: 18, height: 18) }
-                Text(message.content.isEmpty ? (isUser ? "…" : "Thinking…") : message.content)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: 560, alignment: .leading)
-                if isUser { Image(systemName: "person.circle").foregroundStyle(Color.secondary) }
+        Group {
+            switch message.role {
+            case "user":
+                TextMessageBubble(message: message, isCurrentRunning: false)
+
+            case "assistant":
+                VStack(alignment: .leading, spacing: 8) {
+                    // Text content (with typewriter)
+                    if !message.displayText.isEmpty {
+                        TextMessageBubble(message: message, isCurrentRunning: isCurrentRunning)
+                    }
+
+                    // Tool call cards
+                    ForEach(message.toolCallBlocks) { block in
+                        if let tc = block.toolCall {
+                            ToolCallCard(
+                                toolCall: tc,
+                                isRunning: isCurrentRunning
+                            )
+                            .padding(.leading, 28)
+                            .transition(
+                                .move(edge: .bottom).combined(with: .opacity)
+                            )
+                        }
+                    }
+                }
+
+            case "toolResult":
+                if isLastToolResult {
+                    ToolResultCard(
+                        toolName: message.toolName ?? "",
+                        content: message.content,
+                        isError: message.isError,
+                        callCount: 1
+                    )
+                    .padding(.leading, 28)
+                    .transition(
+                        .scale(scale: 0.8).combined(with: .opacity)
+                    )
+                }
+
+            default:
+                TextMessageBubble(message: message, isCurrentRunning: false)
             }
-            .padding(14)
-            .background(isUser ? userBackground : assistantBackground)
-            .clipShape(RoundedRectangle(cornerRadius: 10))
-            if !isUser { Spacer(minLength: 70) }
         }
-        .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
-        .id(message.id)
+        .transition(
+            .move(edge: .bottom).combined(with: .opacity)
+        )
+    }
+}
+
+// MARK: - Deduplicated tool result view
+
+/// A wrapper that deduplicates consecutive tool results and shows count badges.
+struct ToolResultGroupView: View {
+    let messages: [MothxMessage]
+    let startIndex: Int
+
+    private var group: ToolResultGroup {
+        ToolResultGroup.from(messages: messages, startIndex: startIndex)
     }
 
-    private var assistantBackground: Color {
-        colorScheme == .light ? .white : .codexCard
+    var body: some View {
+        ToolResultCard(
+            toolName: group.toolName,
+            content: group.mergedContent,
+            isError: group.isError,
+            callCount: group.count
+        )
+        .padding(.leading, 28)
+        .transition(
+            .scale(scale: 0.8).combined(with: .opacity)
+        )
     }
+}
 
-    private var userBackground: Color {
-        colorScheme == .light ? Color(red: 0.94, green: 0.94, blue: 0.95) : Color.orange.opacity(0.18)
+/// Represents a group of consecutive tool results with the same toolName
+struct ToolResultGroup {
+    let toolName: String
+    let mergedContent: String
+    let isError: Bool
+    let count: Int
+
+    static func from(messages: [MothxMessage], startIndex: Int) -> ToolResultGroup {
+        guard startIndex < messages.count,
+              messages[startIndex].isToolResult,
+              let toolName = messages[startIndex].toolName else {
+            return ToolResultGroup(toolName: "", mergedContent: "", isError: false, count: 0)
+        }
+
+        let baseIsError = messages[startIndex].isError
+        var contents: [String] = []
+        var count = 0
+        var i = startIndex
+
+        while i < messages.count,
+              messages[i].isToolResult,
+              messages[i].toolName == toolName,
+              messages[i].isError == baseIsError {
+            contents.append(messages[i].content)
+            count += 1
+            i += 1
+        }
+
+        return ToolResultGroup(
+            toolName: toolName,
+            mergedContent: contents.joined(separator: "\n---\n"),
+            isError: baseIsError,
+            count: count
+        )
     }
 }

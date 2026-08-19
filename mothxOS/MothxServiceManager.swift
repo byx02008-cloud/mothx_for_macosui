@@ -68,6 +68,9 @@ final class MothxServiceManager: ObservableObject {
     @Published private(set) var currentRunID: String?
     @Published private(set) var sessionModels: [String: String] = [:]
     @Published private(set) var serviceLog = ""
+    @Published private(set) var currentPlan: MothxPlan?
+    @Published private(set) var currentRunningMessageID: String?
+    @Published private(set) var isRunning: Bool = false
     private let localProjectStore = try? LocalProjectStore()
 
     func connect() async {
@@ -416,6 +419,11 @@ final class MothxServiceManager: ObservableObject {
                     message.role != "user" && !runExistingMessageIDs.contains(message.id)
                 }?.id
             }
+            // Extract plan from plan tool results
+            if let planMsg = messages.last(where: { $0.isPlanResult }),
+               let plan = planMsg.plan {
+                currentPlan = plan
+            }
         } catch {
             settingsError = "读取会话消息失败：\(error.localizedDescription)"
         }
@@ -431,6 +439,9 @@ final class MothxServiceManager: ObservableObject {
         runSessionID = sessionID
         runReplyMessageID = nil
         currentRunID = nil
+        currentPlan = nil
+        currentRunningMessageID = nil
+        isRunning = true
         runExistingMessageIDs = Set((messagesBySession[sessionID] ?? []).map(\.id))
         runStartedAt = Date()
         do {
@@ -443,7 +454,7 @@ final class MothxServiceManager: ObservableObject {
             // Show the submitted question immediately. The API returns 202 and
             // runs the agent in the background, so the assistant message is not
             // available in the first history response yet.
-            let localMessage = MothxMessage(id: "local-\(UUID().uuidString)", role: "user", content: message, createdAt: nil)
+            let localMessage = MothxMessage(id: "local-\(UUID().uuidString)", role: "user", content: message, contents: [], toolCallId: nil, toolName: nil, isError: false, createdAt: nil)
             messagesBySession[sessionID, default: []].append(localMessage)
             let body = try jsonData(payload)
             let response = try await request(path: "api/sessions/\(sessionID)/runs", method: "POST", body: body, headers: ["Idempotency-Key": UUID().uuidString])
@@ -486,6 +497,8 @@ final class MothxServiceManager: ObservableObject {
         defer {
             runElapsed = elapsedSinceRunStart()
             isSubmittingRun = false
+            isRunning = false
+            currentRunningMessageID = nil
         }
         for _ in 0..<120 {
             runElapsed = elapsedSinceRunStart()
@@ -495,6 +508,10 @@ final class MothxServiceManager: ObservableObject {
                 let status = object["status"] as? String ?? object["state"] as? String ?? "running"
                 runStatus = status
                 await loadMessages(sessionID: sessionID)
+                // Track current running message for typewriter effect
+                if let replyID = runReplyMessageID {
+                    currentRunningMessageID = replyID
+                }
                 if ["completed", "succeeded", "failed", "error", "cancelled", "canceled"].contains(status.lowercased()) {
                     if ["failed", "error"].contains(status.lowercased()) { runError = object["error"] as? String ?? object["errorMessage"] as? String ?? "Agent run failed" }
                     await loadWorkspace()
@@ -565,24 +582,72 @@ final class MothxServiceManager: ObservableObject {
     private func decodeMessages(_ data: Data) -> [MothxMessage] {
         guard let object = try? JSONSerialization.jsonObject(with: data) else { return [] }
         let values: [[String: Any]]
-        if let direct = object as? [[String: Any] ] { values = direct }
+        if let direct = object as? [[String: Any]] { values = direct }
         else { values = (object as? [String: Any])?["messages"] as? [[String: Any]] ?? [] }
         return values.enumerated().map { index, item in
             let id = item["id"] as? String ?? item["messageId"] as? String ?? "message-\(index)"
             let role = item["role"] as? String ?? item["author"] as? String ?? "assistant"
             let content: String
-            if let text = item["content"] as? String { content = text }
-            else if let text = item["text"] as? String { content = text }
-            else {
-                let blocks = item["contents"] as? [[String: Any]] ?? item["content"] as? [[String: Any]] ?? []
-                content = blocks.compactMap { block in
-                    if let text = block["text"] as? String { return text }
-                    if let textObject = block["text"] as? [String: Any] { return textObject["value"] as? String }
-                    return nil
-                }.joined()
+            let contents: [MothxContentBlock]
+
+            // Parse content blocks (assistant messages with rich content)
+            let rawBlocks = item["contents"] as? [[String: Any]] ?? []
+            if !rawBlocks.isEmpty {
+                var parsedBlocks: [MothxContentBlock] = []
+                var textParts: [String] = []
+                for block in rawBlocks {
+                    let blockType = block["type"] as? String ?? "text"
+                    switch blockType {
+                    case "text":
+                        let text = block["text"] as? String ?? ""
+                        textParts.append(text)
+                        parsedBlocks.append(MothxContentBlock(type: "text", text: text, toolCall: nil, thinking: nil))
+                    case "toolCall":
+                        if let tc = block["toolCall"] as? [String: Any] {
+                            let tcID = tc["id"] as? String ?? ""
+                            let tcName = tc["name"] as? String ?? ""
+                            let tcKind = tc["kind"] as? String
+                            let tcInput = tc["input"] as? String
+                            let tcArgs: String
+                            if let args = tc["arguments"], !(args is NSNull) {
+                                if let argsStr = args as? String { tcArgs = argsStr }
+                                else if JSONSerialization.isValidJSONObject(args),
+                                        let argsData = try? JSONSerialization.data(withJSONObject: args),
+                                        let argsStr = String(data: argsData, encoding: .utf8) { tcArgs = argsStr }
+                                else { tcArgs = "\(args)" }
+                            } else { tcArgs = "" }
+                            parsedBlocks.append(MothxContentBlock(
+                                type: "toolCall", text: nil,
+                                toolCall: MothxToolCallBlock(id: tcID, name: tcName, kind: tcKind, input: tcInput, arguments: tcArgs),
+                                thinking: nil))
+                        }
+                    case "thinking":
+                        let thinking = block["thinking"] as? String ?? ""
+                        parsedBlocks.append(MothxContentBlock(type: "thinking", text: nil, toolCall: nil, thinking: thinking))
+                    default:
+                        break
+                    }
+                }
+                contents = parsedBlocks
+                content = textParts.joined()
+            } else {
+                // Plain text content
+                if let text = item["content"] as? String { content = text }
+                else if let text = item["text"] as? String { content = text }
+                else { content = "" }
+                contents = []
             }
-            return MothxMessage(id: id, role: role, content: content, createdAt: item["createdAt"] as? String)
-        }.filter { !$0.content.isEmpty || $0.role == "toolCall" || $0.role == "toolResult" }
+
+            return MothxMessage(
+                id: id, role: role, content: content, contents: contents,
+                toolCallId: item["toolCallId"] as? String,
+                toolName: item["toolName"] as? String,
+                isError: item["isError"] as? Bool ?? false,
+                createdAt: item["createdAt"] as? String
+            )
+        }.filter { msg in
+            !msg.content.isEmpty || !msg.contents.isEmpty || msg.isToolResult
+        }
     }
 
     func setSessionModel(_ model: String, for sessionID: String) {

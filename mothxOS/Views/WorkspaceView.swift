@@ -11,6 +11,8 @@ struct WorkspaceView: View {
     @State private var selectedSkills: Set<String> = []
     @State private var selectedTools: Set<String> = []
     @State private var attachmentError: String?
+    @State private var currentTurns: [Turn] = []
+    @State private var expandedTurnIDs: Set<UUID> = []
 
     private var currentModels: [MothxModelConfig] {
         let provider = mothx.providers.first(where: { $0.id == mothx.defaultProvider }) ?? mothx.providers.first
@@ -21,34 +23,72 @@ struct WorkspaceView: View {
         let c = languageStore.copy
         return VStack(spacing: 0) {
             HStack {
-                Text(mothx.sessions.first(where: { $0.id == sessionID })?.title ?? c.workspace).font(.system(size: 14, weight: .medium))
+                Text(mothx.sessions.first(where: { $0.id == sessionID })?.title ?? c.workspace)
+                    .font(.system(size: 14, weight: .medium))
                 Spacer()
                 CurrentDirectoryMenu(path: currentWorkDir)
             }.padding(.horizontal, 24).frame(height: 54)
             Divider()
+
             if let sessionID {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
-                        let messages = mothx.messagesBySession[sessionID] ?? []
-                        ForEach(Array(messages.enumerated()), id: \.element.id) { index, message in
-                            if message.role.lowercased() == "assistant",
-                               let historicalRun = mothx.historicalRunsByMessage[sessionID]?[message.id],
-                               historicalRun.id != mothx.currentRunID {
-                                RunStatusRow(status: historicalRun.status, elapsed: historicalRun.elapsed, error: historicalRun.error)
-                            }
-                            if mothx.runReplyMessageID == message.id {
-                                RunStatusRow(status: mothx.runStatus ?? "", elapsed: mothx.runElapsed, error: mothx.runError)
-                            }
-                            MessageBubble(message: message)
+                        let isRunActive = mothx.runSessionID == sessionID && mothx.isRunning
+
+                        ForEach(currentTurns) { turn in
+                            TurnBlock(
+                                turn: turn,
+                                sessionID: sessionID,
+                                isExpanded: expandedTurnIDs.contains(turn.id),
+                                onToggle: { toggleTurn(turn) }
+                            )
                         }
-                        if mothx.runSessionID == sessionID, mothx.runStatus != nil, mothx.runReplyMessageID == nil, let status = mothx.runStatus {
-                            RunStatusRow(status: status, elapsed: mothx.runElapsed, error: mothx.runError)
+
+                        // Thinking indicator + status when running but no messages yet
+                        if isRunActive, currentTurns.isEmpty {
+                            if mothx.runReplyMessageID == nil, mothx.runStatus == "running" {
+                                ThinkingIndicator(isActive: true)
+                            }
+                            if mothx.runStatus != nil, mothx.runReplyMessageID == nil,
+                               let status = mothx.runStatus {
+                                StatusInline(
+                                    status: status,
+                                    elapsed: mothx.runElapsed,
+                                    error: mothx.runError
+                                )
+                            }
                         }
-                    }.frame(maxWidth: 760, alignment: .leading).padding(28).frame(maxWidth: .infinity)
+
+                        // Status when run active but no reply in last turn
+                        if isRunActive,
+                           mothx.runStatus != nil,
+                           mothx.runReplyMessageID == nil,
+                           !currentTurns.isEmpty {
+                            StatusInline(
+                                status: mothx.runStatus ?? "",
+                                elapsed: mothx.runElapsed,
+                                error: mothx.runError
+                            )
+                        }
+                    }
+                    .frame(maxWidth: 760, alignment: .leading)
+                    .padding(28)
+                    .frame(maxWidth: .infinity)
+                }
+
+                // PlanCard pinned above composer (conditionally shown)
+                if mothx.runSessionID == sessionID,
+                   mothx.isRunning,
+                   let plan = mothx.currentPlan {
+                    PlanCard(plan: plan, isRunning: true)
+                        .padding(.horizontal, 25)
+                        .frame(maxWidth: 760)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             } else {
                 Spacer(); Text(c.workspaceHint).foregroundStyle(.secondary); Spacer()
             }
+
             PromptComposer(
                 prompt: $prompt,
                 attachments: $attachments,
@@ -78,9 +118,39 @@ struct WorkspaceView: View {
                 await mothx.loadSkills(for: sessionID)
                 selectedSkills = mothx.activeSkillsBySession[sessionID] ?? []
                 await mothx.loadMessages(sessionID: sessionID)
+                currentTurns = computeTurns(mothx.messagesBySession[sessionID] ?? [])
+                expandedTurnIDs = currentTurns.last.map { [$0.id] } ?? []
+            }
+        }
+        .onChange(of: mothx.messagesBySession) { _, _ in
+            if let sessionID {
+                currentTurns = computeTurns(mothx.messagesBySession[sessionID] ?? [])
+                // Keep last turn expanded, preserve other expanded
+                if let lastID = currentTurns.last?.id {
+                    expandedTurnIDs.insert(lastID)
+                }
             }
         }
     }
+
+    // MARK: - Turn accordion
+
+    private func toggleTurn(_ turn: Turn) {
+        if expandedTurnIDs.contains(turn.id) {
+            expandedTurnIDs.remove(turn.id)
+        } else {
+            // Expand this turn, collapse all other non-last turns
+            var newIDs = expandedTurnIDs
+            if let lastID = currentTurns.last?.id, turn.id != lastID {
+                // Keep last turn expanded, remove other expanded turns
+                newIDs = [lastID]
+            }
+            newIDs.insert(turn.id)
+            expandedTurnIDs = newIDs
+        }
+    }
+
+    // MARK: - Helpers
 
     private func workDir(for sessionID: String) -> String {
         let session = mothx.sessions.first(where: { $0.id == sessionID }) ?? mothx.pendingSessions[sessionID]
@@ -161,6 +231,8 @@ struct WorkspaceView: View {
         return "data:image/\(mime);base64,\(try Data(contentsOf: url).base64EncodedString())"
     }
 }
+
+// MARK: - Supporting views (unchanged)
 
 struct DirectoryApplication: Identifiable {
     let url: URL
@@ -319,8 +391,6 @@ struct PromptComposer: View {
                 .padding(.horizontal, 12)
                 .padding(.top, 12)
                 .onKeyPress(.return, phases: .down) { keyPress in
-                    // Return sends; Shift-Return and Command-Return retain the
-                    // native TextEditor behavior and insert a blank line.
                     guard keyPress.modifiers.isEmpty else { return .ignored }
                     guard !isRunning else { return .handled }
                     submit()
@@ -466,4 +536,3 @@ struct PromptComposer: View {
 struct Suggestion: View { let title: String; let icon: String
     var body: some View { Label(title, systemImage: icon).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 12).padding(.vertical, 8).background(Color.primary.opacity(0.06)).clipShape(Capsule()) }
 }
-
