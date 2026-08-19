@@ -1,7 +1,5 @@
 import SwiftUI
 
-/// A turn groups: 1 user message + all following assistant/toolResult messages
-/// until the next user message.
 struct Turn: Identifiable {
     let id = UUID()
     let index: Int
@@ -9,39 +7,41 @@ struct Turn: Identifiable {
     let subsequentMessages: [MothxMessage]
     let isLast: Bool
 
-    var responseMessages: [MothxMessage] { subsequentMessages }
-
-    var hasProcess: Bool {
-        responseMessages.contains { $0.isToolResult || ($0.isAssistant && $0.hasStructuredContent) }
+    /// Process: toolCall + toolResult messages
+    var processMessages: [MothxMessage] {
+        subsequentMessages.filter { $0.isToolCall || $0.isToolResult }
     }
-    var hasResponded: Bool { !responseMessages.isEmpty }
 
-    var toolResultGroups: [ToolResultGroup] {
-        let trs = responseMessages.filter(\.isToolResult)
-        var groups: [ToolResultGroup] = []
-        var i = 0
-        while i < trs.count {
-            let g = ToolResultGroup.from(messages: trs, startIndex: i)
-            groups.append(g); i += g.count
-        }
-        return groups
+    /// Result: assistant messages (final answer)
+    var resultMessages: [MothxMessage] {
+        subsequentMessages.filter { $0.isAssistant }
     }
+
+    var hasProcess: Bool { !processMessages.isEmpty }
+    var hasResponded: Bool { !subsequentMessages.isEmpty }
 
     var uniqueToolNames: [String] {
-        var names = Set<String>()
-        for msg in responseMessages {
-            for b in msg.toolCallBlocks { if let tc = b.toolCall { names.insert(tc.name) } }
-            if let n = msg.toolName { names.insert(n) }
+        let names = processMessages.compactMap(\.toolName)
+        return Array(Set(names)).sorted()
+    }
+
+    /// Full process text
+    var processText: String {
+        var lines: [String] = []
+        for msg in processMessages {
+            if msg.isToolCall {
+                let name = toolDisplayName(msg.toolName ?? "")
+                let args = toolArgSummary(toolName: msg.toolName ?? "", arguments: msg.arguments)
+                if let args { lines.append("🔧 \(name): \(args)") }
+                else { lines.append("🔧 \(name)") }
+            } else if msg.isToolResult {
+                let name = toolDisplayName(msg.toolName ?? "")
+                let text = msg.summary ?? ""
+                if text.isEmpty { lines.append("✓ \(name)") }
+                else { lines.append("✓ \(name): \(text)") }
+            }
         }
-        return names.sorted()
-    }
-
-    var allToolCallBlocks: [MothxToolCallBlock] {
-        responseMessages.flatMap { $0.toolCallBlocks.compactMap(\.toolCall) }
-    }
-
-    var resultMessages: [MothxMessage] {
-        responseMessages.filter { $0.isAssistant && !$0.hasStructuredContent }
+        return lines.joined(separator: "\n")
     }
 }
 
@@ -64,11 +64,8 @@ func computeTurns(_ messages: [MothxMessage]) -> [Turn] {
     return turns
 }
 
-// MARK: - TurnBlock
-
 struct TurnBlock: View {
     @EnvironmentObject private var mothx: MothxServiceManager
-
     let turn: Turn
     let sessionID: String
     let isExpanded: Bool
@@ -78,7 +75,6 @@ struct TurnBlock: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Clickable header (user message preview)
             Button(action: onToggle) {
                 HStack(spacing: 8) {
                     Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
@@ -94,7 +90,7 @@ struct TurnBlock: View {
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: 10) {
-                    MessageBubble(message: turn.userMessage, isCurrentRunning: false, isLastToolResult: true)
+                    MessageBubble(message: turn.userMessage, isCurrentRunning: false)
                     if turn.hasResponded { agentResponseBlock }
                     if turn.isLast, isRunActive, mothx.runReplyMessageID == nil, mothx.runStatus == "running" {
                         ThinkingIndicator(isActive: true)
@@ -122,18 +118,18 @@ struct TurnBlock: View {
                 if mothx.runReplyMessageID == message.id {
                     StatusInline(status: mothx.runStatus ?? "", elapsed: mothx.runElapsed, error: mothx.runError)
                 }
-                MessageBubble(message: message, isCurrentRunning: isRunActive && mothx.currentRunningMessageID == message.id, isLastToolResult: true)
+                MessageBubble(message: message, isCurrentRunning: isRunActive && mothx.currentRunningMessageID == message.id)
             }
         }
         .padding(10)
         .background(Color.primary.opacity(0.015))
         .clipShape(RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(turn.hasProcess ? Color.blue.opacity(0.2) : Color.primary.opacity(0.08), lineWidth: 1))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.blue.opacity(0.2), lineWidth: 1))
     }
 
     // MARK: - Process Block
 
-    @State private var isProcessExpanded: Bool = true
+    @State private var isProcessExpanded: Bool = false
 
     private var processBlock: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -162,21 +158,17 @@ struct TurnBlock: View {
             .buttonStyle(.plain)
 
             if isProcessExpanded {
-                VStack(alignment: .leading, spacing: 6) {
-                    Divider()
-                    ForEach(turn.allToolCallBlocks) { tc in
-                        ToolCallCard(toolCall: tc, isRunning: isRunActive && mothx.currentRunningMessageID == tc.id)
-                    }
-                    ForEach(turn.toolResultGroups.indices, id: \.self) { idx in
-                        let tr = turn.toolResultGroups[idx]
-                        ToolResultCard(toolName: tr.toolName, content: tr.mergedContent, isError: tr.isError, callCount: tr.count)
-                            .transition(.scale(scale: 0.8).combined(with: .opacity))
-                    }
-                    if turn.isLast, isRunActive, let status = mothx.runStatus {
-                        StatusInline(status: status, elapsed: mothx.runElapsed, error: mothx.runError)
-                    }
+                Divider()
+                ScrollView {
+                    Text(turn.processText)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
                 }
-                .padding(.horizontal, 8).padding(.bottom, 6)
+                .frame(maxHeight: 300)
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }

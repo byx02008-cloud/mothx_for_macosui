@@ -419,9 +419,9 @@ final class MothxServiceManager: ObservableObject {
                     message.role != "user" && !runExistingMessageIDs.contains(message.id)
                 }?.id
             }
-            // Extract plan from plan tool results
-            if let planMsg = messages.last(where: { $0.isPlanResult }),
-               let plan = planMsg.plan {
+            // Extract plan from toolCall messages
+            if let planMsg = messages.last(where: { $0.isPlan }),
+               let plan = MothxPlan.parse(from: planMsg.arguments) {
                 currentPlan = plan
             }
         } catch {
@@ -454,7 +454,7 @@ final class MothxServiceManager: ObservableObject {
             // Show the submitted question immediately. The API returns 202 and
             // runs the agent in the background, so the assistant message is not
             // available in the first history response yet.
-            let localMessage = MothxMessage(id: "local-\(UUID().uuidString)", role: "user", content: message, contents: [], toolCallId: nil, toolName: nil, isError: false, createdAt: nil)
+            let localMessage = MothxMessage(id: "local-\(UUID().uuidString)", seq: nil, role: "user", content: message, toolCallId: nil, toolName: nil, arguments: "", summary: nil, hasDetail: false, createdAt: nil)
             messagesBySession[sessionID, default: []].append(localMessage)
             let body = try jsonData(payload)
             let response = try await request(path: "api/sessions/\(sessionID)/runs", method: "POST", body: body, headers: ["Idempotency-Key": UUID().uuidString])
@@ -586,67 +586,59 @@ final class MothxServiceManager: ObservableObject {
         else { values = (object as? [String: Any])?["messages"] as? [[String: Any]] ?? [] }
         return values.enumerated().map { index, item in
             let id = item["id"] as? String ?? item["messageId"] as? String ?? "message-\(index)"
-            let role = item["role"] as? String ?? item["author"] as? String ?? "assistant"
-            let content: String
-            let contents: [MothxContentBlock]
+            let role = (item["role"] as? String) ?? "assistant"
+            let seq = item["seq"] as? Int
 
-            // Parse content blocks (assistant messages with rich content)
-            let rawBlocks = item["contents"] as? [[String: Any]] ?? []
-            if !rawBlocks.isEmpty {
-                var parsedBlocks: [MothxContentBlock] = []
-                var textParts: [String] = []
-                for block in rawBlocks {
-                    let blockType = block["type"] as? String ?? "text"
-                    switch blockType {
-                    case "text":
-                        let text = block["text"] as? String ?? ""
-                        textParts.append(text)
-                        parsedBlocks.append(MothxContentBlock(type: "text", text: text, toolCall: nil, thinking: nil))
-                    case "toolCall":
-                        if let tc = block["toolCall"] as? [String: Any] {
-                            let tcID = tc["id"] as? String ?? ""
-                            let tcName = tc["name"] as? String ?? ""
-                            let tcKind = tc["kind"] as? String
-                            let tcInput = tc["input"] as? String
-                            let tcArgs: String
-                            if let args = tc["arguments"], !(args is NSNull) {
-                                if let argsStr = args as? String { tcArgs = argsStr }
-                                else if JSONSerialization.isValidJSONObject(args),
-                                        let argsData = try? JSONSerialization.data(withJSONObject: args),
-                                        let argsStr = String(data: argsData, encoding: .utf8) { tcArgs = argsStr }
-                                else { tcArgs = "\(args)" }
-                            } else { tcArgs = "" }
-                            parsedBlocks.append(MothxContentBlock(
-                                type: "toolCall", text: nil,
-                                toolCall: MothxToolCallBlock(id: tcID, name: tcName, kind: tcKind, input: tcInput, arguments: tcArgs),
-                                thinking: nil))
-                        }
-                    case "thinking":
-                        let thinking = block["thinking"] as? String ?? ""
-                        parsedBlocks.append(MothxContentBlock(type: "thinking", text: nil, toolCall: nil, thinking: thinking))
-                    default:
-                        break
-                    }
-                }
-                contents = parsedBlocks
-                content = textParts.joined()
-            } else {
-                // Plain text content
-                if let text = item["content"] as? String { content = text }
-                else if let text = item["text"] as? String { content = text }
-                else { content = "" }
-                contents = []
+            let content: String
+            let toolCallId: String?
+            let toolName: String?
+            let arguments: String
+            let summary: String?
+            let hasDetail: Bool
+
+            switch role {
+            case "toolCall":
+                content = ""
+                toolCallId = item["toolCallId"] as? String
+                toolName = item["toolName"] as? String
+                summary = nil
+                hasDetail = false
+                // arguments is a JSON object -> serialize to string
+                if let args = item["arguments"] {
+                    if let argsStr = args as? String { arguments = argsStr }
+                    else if JSONSerialization.isValidJSONObject(args),
+                            let argsData = try? JSONSerialization.data(withJSONObject: args),
+                            let argsStr = String(data: argsData, encoding: .utf8) { arguments = argsStr }
+                    else { arguments = "\(args)" }
+                } else { arguments = "" }
+
+            case "toolResult":
+                content = ""
+                toolCallId = item["toolCallId"] as? String
+                toolName = item["toolName"] as? String
+                arguments = ""
+                summary = item["summary"] as? String
+                hasDetail = item["hasDetail"] as? Bool ?? false
+
+            default:
+                // user, assistant
+                content = (item["content"] as? String) ?? (item["text"] as? String) ?? ""
+                toolCallId = nil
+                toolName = nil
+                arguments = ""
+                summary = nil
+                hasDetail = false
             }
 
             return MothxMessage(
-                id: id, role: role, content: content, contents: contents,
-                toolCallId: item["toolCallId"] as? String,
-                toolName: item["toolName"] as? String,
-                isError: item["isError"] as? Bool ?? false,
+                id: id, seq: seq, role: role,
+                content: content, toolCallId: toolCallId,
+                toolName: toolName, arguments: arguments,
+                summary: summary, hasDetail: hasDetail,
                 createdAt: item["createdAt"] as? String
             )
         }.filter { msg in
-            !msg.content.isEmpty || !msg.contents.isEmpty || msg.isToolResult
+            !msg.content.isEmpty || msg.isToolCall || msg.isToolResult
         }
     }
 
