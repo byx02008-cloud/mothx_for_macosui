@@ -1,42 +1,6 @@
 import Combine
 import Foundation
 
-struct MothxProject: Identifiable, Hashable {
-    let id: String
-    var name: String
-    var workDir: String = ""
-    var sessionIDs: [String] = []
-}
-
-struct MothxSession: Identifiable, Hashable {
-    let id: String
-    var title: String
-    var projectID: String?
-    var updatedAt: String?
-    var workDir: String?
-}
-
-struct MothxMessage: Identifiable, Hashable {
-    let id: String
-    let role: String
-    let content: String
-    let createdAt: String?
-}
-
-struct MothxRunSummary: Hashable {
-    let id: String
-    let status: String
-    let startedAt: Date?
-    let finishedAt: Date?
-    let updatedAt: Date?
-    let error: String?
-
-    var elapsed: TimeInterval {
-        guard let startedAt else { return 0 }
-        let end = finishedAt ?? updatedAt ?? Date()
-        return max(0, end.timeIntervalSince(startedAt))
-    }
-}
 
 private struct MothxLogEvent: Decodable {
     let type: String
@@ -59,48 +23,6 @@ private struct AnyCodableValue: Decodable {
     }
 }
 
-struct MothxModelConfig: Codable, Identifiable, Hashable {
-    var id: String
-    var name: String
-    var reasoning: Bool = false
-    var contextWindow: Int = 0
-    var maxTokens: Int = 0
-    var temperature: Double?
-    var topP: Double?
-    var input: [String] = []
-
-    var displayName: String { name.isEmpty ? id : name }
-}
-
-struct MothxProviderConfig: Codable, Identifiable, Hashable {
-    var id: String
-    var vendor: String = ""
-    var apiKey: String = ""
-    var baseUrl: String = ""
-    var httpProxy: String = ""
-    var forceHTTP11: Bool = false
-    var headers: [String: String] = [:]
-    var api: String = "openai-chat"
-    var thinkingFormat: String = ""
-    var models: [MothxModelConfig] = []
-
-    enum CodingKeys: String, CodingKey { case vendor, apiKey, baseUrl, httpProxy, forceHTTP11, headers, api, thinkingFormat, models }
-    init(id: String = "", vendor: String = "", apiKey: String = "", baseUrl: String = "", httpProxy: String = "", forceHTTP11: Bool = false, headers: [String: String] = [:], api: String = "openai-chat", thinkingFormat: String = "", models: [MothxModelConfig] = []) {
-        self.id = id; self.vendor = vendor; self.apiKey = apiKey; self.baseUrl = baseUrl; self.httpProxy = httpProxy; self.forceHTTP11 = forceHTTP11; self.headers = headers; self.api = api; self.thinkingFormat = thinkingFormat; self.models = models
-    }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.init(vendor: try c.decodeIfPresent(String.self, forKey: .vendor) ?? "", apiKey: try c.decodeIfPresent(String.self, forKey: .apiKey) ?? "", baseUrl: try c.decodeIfPresent(String.self, forKey: .baseUrl) ?? "", httpProxy: try c.decodeIfPresent(String.self, forKey: .httpProxy) ?? "", forceHTTP11: try c.decodeIfPresent(Bool.self, forKey: .forceHTTP11) ?? false, headers: try c.decodeIfPresent([String: String].self, forKey: .headers) ?? [:], api: try c.decodeIfPresent(String.self, forKey: .api) ?? "openai-chat", thinkingFormat: try c.decodeIfPresent(String.self, forKey: .thinkingFormat) ?? "", models: try c.decodeIfPresent([MothxModelConfig].self, forKey: .models) ?? [])
-    }
-}
-
-struct MothxSkill: Identifiable, Hashable {
-    let id: String
-    let name: String
-    let directory: String
-}
-
-@MainActor
 final class MothxServiceManager: ObservableObject {
     enum State: Equatable {
         case checking
@@ -900,6 +822,7 @@ final class MothxServiceManager: ObservableObject {
         }
     }
 }
+
 
 private struct MothxAPIError: LocalizedError {
     let statusCode: Int
