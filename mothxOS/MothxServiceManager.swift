@@ -2,6 +2,10 @@ import Combine
 import Foundation
 
 
+private struct MothxHealthResponse: Decodable {
+    let status: String
+}
+
 private struct MothxLogEvent: Decodable {
     let type: String
     let message: String?
@@ -28,6 +32,7 @@ final class MothxServiceManager: ObservableObject {
         case checking
         case starting
         case connected
+        case needsInstall
         case failed(String)
     }
 
@@ -123,7 +128,7 @@ final class MothxServiceManager: ObservableObject {
 
         state = .starting
         guard let executable = await MothxServiceManager.resolveGlobalMothxExecutable() else {
-            state = .failed(copy.runtimeNotFound)
+            state = .needsInstall
             return
         }
 
@@ -180,6 +185,48 @@ final class MothxServiceManager: ObservableObject {
         if state == .connected {
             startLogStream()
             await loadSettings()
+        }
+    }
+
+    /// App-launch-only entry point. Unlike connect(), which adopts any
+    /// already healthy server, this kills whatever mothx instance is already
+    /// listening on the default port first, then always starts a fresh
+    /// app-owned process. isHealthy()'s response-body check confirms what's
+    /// listening is actually mothx before terminating it, so this never
+    /// kills an unrelated process that happens to occupy the port.
+    func connectAtLaunch() async {
+        state = .checking
+        if await isHealthy() {
+            await killExistingMothxOnDefaultPort()
+        }
+        await connect()
+    }
+
+    private func killExistingMothxOnDefaultPort() async {
+        await MothxServiceManager.runShellFireAndForget("lsof -ti tcp:7872 | xargs kill 2>/dev/null")
+        for _ in 0..<20 {
+            if !(await isHealthy()) { return }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        await MothxServiceManager.runShellFireAndForget("lsof -ti tcp:7872 | xargs kill -9 2>/dev/null")
+        for _ in 0..<8 {
+            if !(await isHealthy()) { return }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+    }
+
+    private static func runShellFireAndForget(_ command: String) async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+                process.arguments = ["-c", command]
+                process.standardOutput = FileHandle.nullDevice
+                process.standardError = FileHandle.nullDevice
+                do { try process.run() } catch { continuation.resume(); return }
+                process.waitUntilExit()
+                continuation.resume()
+            }
         }
     }
 
@@ -1013,9 +1060,14 @@ final class MothxServiceManager: ObservableObject {
         var request = URLRequest(url: baseURL.appendingPathComponent("health"))
         request.timeoutInterval = 1.0
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
-            guard let status = (response as? HTTPURLResponse)?.statusCode else { return false }
-            return (200..<300).contains(status)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let status = (response as? HTTPURLResponse)?.statusCode, (200..<300).contains(status) else { return false }
+            // Confirm the response body actually looks like mothx's /health
+            // payload, not just any 2xx from whatever happens to be
+            // listening on the port — callers rely on this to decide
+            // whether it's safe to terminate the process.
+            guard let health = try? JSONDecoder().decode(MothxHealthResponse.self, from: data) else { return false }
+            return health.status.lowercased() == "ok"
         } catch {
             return false
         }
@@ -1031,6 +1083,13 @@ final class MothxServiceManager: ObservableObject {
     /// serve` holding the port after a stop/restart. So this resolves the
     /// real binary inside the platform optional-dependency package instead,
     /// which behaves like any other directly-launched executable.
+    /// Presence-only check used by the launch-time environment checklist,
+    /// which needs to know whether mothx is installed without needing the
+    /// resolved executable URL itself.
+    static func isMothxInstalled() async -> Bool {
+        await resolveGlobalMothxExecutable() != nil
+    }
+
     private static func resolveGlobalMothxExecutable() async -> URL? {
         guard let npmRoot = await shellCapturedPath("npm root -g") else { return nil }
         #if arch(arm64)

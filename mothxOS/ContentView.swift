@@ -11,6 +11,7 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var selectedProjectID: String?
     @State private var showNewProject = false
+    @State private var showEnvironmentCheck = true
     @State private var newProjectName = ""
     @State private var newProjectWorkDir = ""
     @State private var appearanceNow = Date()
@@ -32,6 +33,9 @@ struct ContentView: View {
         .background(Color.codexBackground)
         .preferredColorScheme(effectiveColorScheme)
         .overlay(alignment: .top) { ConnectionBanner(state: mothx.state) }
+        .sheet(isPresented: $showEnvironmentCheck) {
+            EnvironmentCheckSheet(isPresented: $showEnvironmentCheck)
+        }
         .sheet(isPresented: $showNewProject) {
             VStack(alignment: .leading, spacing: 16) {
                 Text(languageStoreCopy.newProject).font(.title2.bold())

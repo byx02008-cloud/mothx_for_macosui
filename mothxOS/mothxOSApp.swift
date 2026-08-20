@@ -19,9 +19,6 @@ struct mothxOSApp: App {
                 .environmentObject(language)
                 .task {
                     mothx.languageStore = language
-                    await mothx.connect()
-                    await mothx.loadWorkspace()
-                    language.update(setting: mothx.tuilang)
                 }
         }
         .commands {

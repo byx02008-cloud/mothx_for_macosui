@@ -10,6 +10,7 @@ struct ConnectionBanner: View {
             case .starting: status("Starting mothx server…", .orange)
             case .failed(let message): status(message, .red)
             case .connected: EmptyView()
+            case .needsInstall: status("mothx not found — please reinstall", .red)
             }
         }.padding(.top, 8)
     }

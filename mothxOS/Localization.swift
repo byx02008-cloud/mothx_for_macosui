@@ -212,6 +212,27 @@ struct Copy {
     var updateLogSucceeded: String { text("[完成] 更新成功，服务已重启", "[Done] Update succeeded, service restarted") }
     var updateLogFailedPrefix: (Int32) -> String { { code in self.text("[失败] npm install 退出码 \(code)", "[Failed] npm install exited with code \(code)") } }
 
+    // MARK: - Environment check
+    var envCheckTitle: String { text("环境检查", "Environment Check") }
+    var envCheckSubtitle: String { text("首次进入前检查运行环境", "Checking your environment before launch") }
+    var envCheckChecking: String { text("正在检测…", "Checking…") }
+    var envCheckNodeLabel: String { text("Node.js", "Node.js") }
+    var envCheckMothxLabel: String { text("mothx", "mothx") }
+    var envCheckPassed: String { text("环境检查通过", "Environment check passed") }
+    var installNodeMissingTitle: String { text("未检测到 Node.js", "Node.js not found") }
+    var installNodeMissingMessage: String { text("mothx 通过 npm 分发，需要先安装 Node.js（其中包含 npm）才能继续。", "mothx is distributed via npm, which requires Node.js. Install Node.js first to continue.") }
+    var installOpenNodeSite: String { text("打开 Node.js 官网下载安装包", "Open nodejs.org to download the installer") }
+    var installUseHomebrew: String { text("使用 Homebrew 安装 Node.js", "Install Node.js with Homebrew") }
+    var installRecheck: String { text("我已安装，重新检测", "I've installed it — recheck") }
+    var installStageInstallingBrewNode: String { text("正在执行 brew install node…", "Running brew install node…") }
+    var installStageInstallingMothx: String { text("正在执行 npm install -g mothx-installer…", "Running npm install -g mothx-installer…") }
+    var installStageConnecting: String { text("正在启动 mothx 服务…", "Starting the mothx service…") }
+    var installRetry: String { text("重试", "Retry") }
+    var installBrewFailedPrefix: (Int32) -> String { { code in self.text("brew install node 失败（退出码 \(code)）", "brew install node failed (exit code \(code))") } }
+    var installMothxFailedPrefix: (Int32) -> String { { code in self.text("npm install -g mothx-installer 失败（退出码 \(code)）", "npm install -g mothx-installer failed (exit code \(code))") } }
+    var installStillNotFoundAfterInstall: String { text("已执行安装，但仍未检测到 mothx，请重试", "Installation ran, but mothx still wasn't detected. Please retry.") }
+    var installWaitingForOutput: String { text("等待输出…", "Waiting for output…") }
+
     // MARK: - Workspace
     var ok: String { text("确定", "OK") }
     var attachmentsInstruction: (String) -> String { { names in self.text("请处理工作目录中的附件：\(names)", "Please process the attachments in the working directory: \(names)") } }
