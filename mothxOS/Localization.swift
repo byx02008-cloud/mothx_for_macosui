@@ -119,6 +119,162 @@ struct Copy {
     var modelCount: String { text("个模型", "models") }
     var forceHTTP11: String { "Force HTTP/1.1" }
     var noModelsHint: String { text("暂无模型，请先填写 Base URL 后从 API 获取。", "No models. Enter a Base URL to discover models from the API.") }
+
+    // MARK: - Run / service status
+    var statusQueued: String { text("排队中", "Queued") }
+    var statusRunning: String { text("处理中", "Running") }
+    var statusCompleted: String { text("已完成", "Completed") }
+    var statusFailed: String { text("失败", "Failed") }
+    var statusCancelled: String { text("已取消", "Cancelled") }
+    var statusTimeout: String { text("超时", "Timed out") }
+    var runRowRunning: String { text("模型处理中", "Model is processing") }
+    var runRowFailed: String { text("处理失败", "Failed") }
+    var runRowTimeout: String { text("等待超时", "Timed out waiting") }
+    var thinking: String { text("思考中…", "Thinking…") }
+    var thinkingLabel: String { text("思考中", "Thinking") }
+    var process: String { text("过程", "Process") }
+
+    // MARK: - Plan card
+    var taskPlan: String { text("任务计划", "Task plan") }
+    var planRunning: String { text("执行中", "Running") }
+
+    // MARK: - Service log
+    var serviceLogTitle: String { text("运行日志", "Service log") }
+    var close: String { text("关闭", "Close") }
+    var noServiceLog: String { text("暂无运行日志", "No log output yet") }
+
+    // MARK: - Stats view
+    var statsTitle: String { text("统计数据", "Stats") }
+    var statsSubtitle: String { text("查看请求、Token、模型和 Provider 使用情况", "View request, token, model, and provider usage") }
+    var statsTimeRange: String { text("时间范围", "Time range") }
+    var statsRangeSeven: String { text("最近 7 天", "Last 7 days") }
+    var statsRangeThirty: String { text("最近 30 天", "Last 30 days") }
+    var statsRangeAll: String { text("全部时间", "All time") }
+    var statsLoading: String { text("加载中…", "Loading…") }
+    var statsRefresh: String { text("刷新", "Refresh") }
+    var statsRequests: String { text("请求数", "Requests") }
+    var statsTotalTokens: String { text("总 Token", "Total tokens") }
+    var statsInputTokens: String { text("输入 Token", "Input tokens") }
+    var statsOutputTokens: String { text("输出 Token", "Output tokens") }
+    var statsProviderRanking: String { text("Provider 排行", "Provider ranking") }
+    var statsModelRanking: String { text("模型排行", "Model ranking") }
+    var statsUsageTrend: String { text("使用趋势", "Usage trend") }
+    var statsTotalTokenLabel: (String) -> String { { v in self.text("总 Token: \(v)", "Total tokens: \(v)") } }
+    var statsNoData: String { text("暂无数据", "No data") }
+    var statsDate: String { text("日期", "Date") }
+    var statsItemsCount: (Int) -> String { { n in self.text("\(n) 个", "\(n) items") } }
+    var statsRecentRequests: String { text("最近请求", "Recent requests") }
+    var statsColTime: String { text("时间", "Time") }
+    var statsColModel: String { text("模型", "Model") }
+    var statsColInput: String { text("输入", "Input") }
+    var statsColOutput: String { text("输出", "Output") }
+    var statsColDuration: String { text("耗时", "Duration") }
+    var statsPageLabel: (Int, Int) -> String { { page, total in self.text("第 \(page) / \(total) 页", "Page \(page) of \(total)") } }
+
+    // MARK: - Sidebar
+    var refreshProjectsHelp: String { text("刷新项目和会话列表", "Refresh projects and sessions") }
+    var restartService: String { text("重启服务", "Restart service") }
+    var startService: String { text("启动服务", "Start service") }
+    var openWebUI: String { text("打开 WebUI", "Open WebUI") }
+    var appearanceHelp: String { text("界面主题", "Appearance") }
+    var appearanceLight: String { text("日间", "Light") }
+    var appearanceDark: String { text("夜间", "Dark") }
+    var appearanceAuto: String { text("自动", "Auto") }
+    var closeSettings: String { text("关闭设置", "Close settings") }
+
+    // MARK: - About
+    var about: String { text("关于软件", "About") }
+    var aboutSubtitle: String { text("Mothx UI for MacOS 的版本信息与更新", "Version info and updates for Mothx UI for MacOS") }
+    var appNameLabel: String { text("应用名称", "App Name") }
+    var appVersionLabel: String { text("App 版本", "App Version") }
+    var mothxVersionLabel: String { text("mothx 版本", "mothx Version") }
+    var latestVersionLabel: String { text("最新版本（npm）", "Latest Version (npm)") }
+    var versionUnknown: String { text("未知", "Unknown") }
+    var refreshVersion: String { text("刷新", "Refresh") }
+    var updateAvailableHint: String { text("发现新版本，可点击下方按钮在线更新", "A new version is available") }
+    var upToDateHint: String { text("已是最新版本", "You're up to date") }
+    var npmUnavailableHint: String { text("未能获取最新版本，请确认已安装 npm", "Couldn't check the latest version. Make sure npm is installed.") }
+    var updateButton: String { text("在线更新", "Update") }
+    var updating: String { text("更新中…", "Updating…") }
+    var updateSucceeded: String { text("更新成功，请重启 mothx 服务以生效", "Update succeeded. Restart the mothx service to apply it.") }
+    var updateFailedPrefix: (String) -> String { { detail in self.text("更新失败：\(detail)", "Update failed: \(detail)") } }
+    var updateProgressTitle: String { text("在线更新", "Online Update") }
+    var updateWaitingForOutput: String { text("等待输出…", "Waiting for output…") }
+    var updateStageStoppingService: String { text("正在停止 mothx 服务…", "Stopping mothx service…") }
+    var updateStageInstalling: String { text("正在执行 npm install -g mothx-installer…", "Running npm install -g mothx-installer…") }
+    var updateStageRestartingService: String { text("正在重启 mothx 服务…", "Restarting mothx service…") }
+    var updateStageSucceeded: String { text("更新完成", "Update complete") }
+    var updateStageFailed: String { text("更新失败", "Update failed") }
+    var updateLogStoppingService: String { text("[步骤] 停止 mothx 服务", "[Step] Stopping mothx service") }
+    var updateLogExternalServiceSkipped: String { text("[步骤] 检测到外部启动的 mothx 服务，跳过停止（避免终止非本应用进程）", "[Step] Detected an externally-started mothx service, skipping stop (won't terminate a process this app doesn't own)") }
+    var updateLogRunningNpmInstall: String { text("[步骤] 执行 npm install -g mothx-installer", "[Step] Running npm install -g mothx-installer") }
+    var updateLogRestartingService: String { text("[步骤] 重启 mothx 服务", "[Step] Restarting mothx service") }
+    var updateLogSucceeded: String { text("[完成] 更新成功，服务已重启", "[Done] Update succeeded, service restarted") }
+    var updateLogFailedPrefix: (Int32) -> String { { code in self.text("[失败] npm install 退出码 \(code)", "[Failed] npm install exited with code \(code)") } }
+
+    // MARK: - Workspace
+    var ok: String { text("确定", "OK") }
+    var attachmentsInstruction: (String) -> String { { names in self.text("请处理工作目录中的附件：\(names)", "Please process the attachments in the working directory: \(names)") } }
+    var noWorkDirForAttachment: String { text("当前会话没有可用的项目工作目录", "This session has no available project working directory") }
+    var addAttachmentFailedPrefix: (String) -> String { { detail in self.text("添加附件失败：\(detail)", "Failed to add attachment: \(detail)") } }
+    var noWorkDir: String { text("无工作目录", "No working directory") }
+    var noAppsForDirectory: String { text("没有找到可打开此目录的应用", "No apps found to open this directory") }
+    var attachmentsCountLabel: (Int) -> String { { n in self.text("附件 \(n) 个", "\(n) attachments") } }
+    var moreOptionsHelp: String { text("更多选项", "More options") }
+    var noModelsForProvider: String { text("当前运营商没有可用模型", "No models available for the current provider") }
+    var stop: String { text("停止", "Stop") }
+    var send: String { text("发送", "Send") }
+    var skillsActivatedLabel: (Int) -> String { { n in self.text("技能（已激活 \(n) 个）", "Skills (\(n) active)") } }
+    var toolsLabel: String { text("工具", "Tools") }
+    var noInstalledSkills: String { text("暂无已安装技能", "No installed skills") }
+    var scrollRunningHelp: String { text("正在输出，滚动到底部", "Streaming output, scroll to bottom") }
+    var scrollBottomHelp: String { text("滚动到底部", "Scroll to bottom") }
+
+    // MARK: - Service manager errors
+    var runtimeNotFound: String { text("未找到系统安装的 mothx 命令，请先执行 npm install -g mothx-installer", "mothx command not found on this system. Run npm install -g mothx-installer first.") }
+    var workDirCreateFailedPrefix: (String) -> String { { detail in self.text("无法创建 mothx 工作目录：\(detail)", "Failed to create the mothx working directory: \(detail)") } }
+    var mothxLaunchFailedPrefix: (String) -> String { { detail in self.text("无法启动 mothx：\(detail)", "Failed to launch mothx: \(detail)") } }
+    var serveStartFailedWithOutput: (String) -> String { { output in self.text("mothx serve 启动失败：\n\(output)", "mothx serve failed to start:\n\(output)") } }
+    var serveStartTimeout: String { text("mothx serve 启动超时（端口 127.0.0.1:7872）", "mothx serve start timed out (port 127.0.0.1:7872)") }
+    var serveExited: (Int32) -> String { { status in self.text("mothx serve 已退出（状态码 \(status)）", "mothx serve exited (status code \(status))") } }
+    var loadSettingsFailedPrefix: (String) -> String { { detail in self.text("读取配置失败：\(detail)", "Failed to load settings: \(detail)") } }
+    var loadLocalProjectsFailedPrefix: (String) -> String { { detail in self.text("读取本地项目失败：\(detail)", "Failed to load local projects: \(detail)") } }
+    var loadSessionsFailedPrefix: (String) -> String { { detail in self.text("读取会话失败：\(detail)", "Failed to load sessions: \(detail)") } }
+    var loadActiveSessionFailedPrefix: (String) -> String { { detail in self.text("读取当前会话失败：\(detail)", "Failed to load the current session: \(detail)") } }
+    var loadStatsFailedPrefix: (String) -> String { { detail in self.text("读取统计数据失败：\(detail)", "Failed to load stats: \(detail)") } }
+    var createProjectFailedPrefix: (String) -> String { { detail in self.text("创建本地项目失败：\(detail)", "Failed to create local project: \(detail)") } }
+    var updateProjectFailedPrefix: (String) -> String { { detail in self.text("更新本地项目失败：\(detail)", "Failed to update local project: \(detail)") } }
+    var deleteProjectFailedPrefix: (String) -> String { { detail in self.text("删除本地项目失败：\(detail)", "Failed to delete local project: \(detail)") } }
+    var saveSessionProjectLinkFailedPrefix: (String) -> String { { detail in self.text("保存会话项目关系失败：\(detail)", "Failed to save the session-project link: \(detail)") } }
+    var deleteSessionProjectLinkFailedPrefix: (String) -> String { { detail in self.text("删除会话项目关系失败：\(detail)", "Failed to remove the session-project link: \(detail)") } }
+    var deleteSessionFailedPrefix: (String) -> String { { detail in self.text("删除会话失败：\(detail)", "Failed to delete session: \(detail)") } }
+    var loadMessagesFailedPrefix: (String) -> String { { detail in self.text("读取会话消息失败：\(detail)", "Failed to load session messages: \(detail)") } }
+    var noRunIDReturned: String { text("服务端未返回 run ID", "The server did not return a run ID") }
+    var submitRunFailedPrefix: (String) -> String { { detail in self.text("提交会话失败：\(detail)", "Failed to submit the session: \(detail)") } }
+    var stopRunFailedPrefix: (String) -> String { { detail in self.text("停止运行失败：\(detail)", "Failed to stop the run: \(detail)") } }
+    var waitReplyTimeout: String { text("等待模型回复超时", "Timed out waiting for the model's reply") }
+    var runFailedFallback: String { text("Agent 运行失败", "Agent run failed") }
+    var updateSessionFailedPrefix: (String) -> String { { detail in self.text("更新会话失败：\(detail)", "Failed to update session: \(detail)") } }
+    var saveGlobalSettingsFailedPrefix: (String) -> String { { detail in self.text("保存全局配置失败：\(detail)", "Failed to save global settings: \(detail)") } }
+    var deleteProviderFailedPrefix: (String) -> String { { detail in self.text("删除 Provider 失败：\(detail)", "Failed to delete provider: \(detail)") } }
+    var saveProviderFailedPrefix: (String) -> String { { detail in self.text("保存配置失败：\(detail)", "Failed to save configuration: \(detail)") } }
+    var discoverModelsFailedPrefix: (String) -> String { { detail in self.text("获取模型失败：\(detail)", "Failed to discover models: \(detail)") } }
+    var projectResponseInvalid: String { text("项目创建接口返回的数据无效", "The project creation API returned invalid data") }
+    var settingsInvalidResponse: String { text("mothx /api/settings 返回格式无效", "mothx /api/settings returned an invalid format") }
+    var settingsNoProvidersDecoded: String { text("mothx /api/settings 中存在 providers，但客户端无法解析", "mothx /api/settings contains providers but the client could not parse them") }
+    var localDatabaseUnavailable: String { text("本地项目数据库无法访问", "Local project database is unavailable") }
+}
+
+/// Shared short elapsed-time formatter for run status views (StatusInline, RunStatusRow).
+func formatElapsedShort(_ elapsed: TimeInterval, language: AppLanguage) -> String {
+    if elapsed < 60 {
+        return language == .zh ? String(format: "%.1f 秒", elapsed) : String(format: "%.1fs", elapsed)
+    }
+    let minutes = floor(elapsed / 60)
+    let seconds = elapsed.truncatingRemainder(dividingBy: 60)
+    return language == .zh
+        ? String(format: "%.0f 分 %.0f 秒", minutes, seconds)
+        : String(format: "%.0fm %.0fs", minutes, seconds)
 }
 
 

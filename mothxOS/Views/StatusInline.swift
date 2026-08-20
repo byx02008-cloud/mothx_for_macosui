@@ -7,6 +7,7 @@ struct StatusInline: View {
     let elapsed: TimeInterval
     let error: String?
 
+    @EnvironmentObject private var languageStore: LanguageStore
     @State private var isExpanded = false
     @State private var dotBlink = false
 
@@ -83,13 +84,14 @@ struct StatusInline: View {
     // MARK: - Computed
 
     private var statusLabel: String {
+        let copy = languageStore.copy
         switch status.lowercased() {
-        case "queued":       return "排队中"
-        case "running", "in_progress": return "处理中"
-        case "completed", "succeeded": return "已完成"
-        case "failed", "error": return "失败"
-        case "cancelled", "canceled": return "已取消"
-        case "timeout":      return "超时"
+        case "queued":       return copy.statusQueued
+        case "running", "in_progress": return copy.statusRunning
+        case "completed", "succeeded": return copy.statusCompleted
+        case "failed", "error": return copy.statusFailed
+        case "cancelled", "canceled": return copy.statusCancelled
+        case "timeout":      return copy.statusTimeout
         default:             return status
         }
     }
@@ -131,9 +133,6 @@ struct StatusInline: View {
     }
 
     private var formattedElapsed: String {
-        if elapsed < 60 { return String(format: "%.1f 秒", elapsed) }
-        return String(format: "%.0f 分 %.0f 秒",
-            floor(elapsed / 60),
-            elapsed.truncatingRemainder(dividingBy: 60))
+        formatElapsedShort(elapsed, language: languageStore.language)
     }
 }

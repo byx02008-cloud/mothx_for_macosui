@@ -51,25 +51,26 @@ func toolIcon(for toolName: String) -> String {
 }
 
 /// Human-readable tool name for display
-func toolDisplayName(_ name: String) -> String {
+func toolDisplayName(_ name: String, language: AppLanguage) -> String {
+    let c = Copy(resolvedLanguage: language)
     switch name.lowercased() {
-    case "read":                return "读取文件"
-    case "write":               return "写入文件"
-    case "edit":                return "编辑文件"
-    case "insert":              return "插入内容"
-    case "find":                return "查找文件"
-    case "grep":                return "搜索内容"
-    case "ls":                  return "列出文件"
+    case "read":                return c.text("读取文件", "Read file")
+    case "write":               return c.text("写入文件", "Write file")
+    case "edit":                return c.text("编辑文件", "Edit file")
+    case "insert":              return c.text("插入内容", "Insert content")
+    case "find":                return c.text("查找文件", "Find files")
+    case "grep":                return c.text("搜索内容", "Search content")
+    case "ls":                  return c.text("列出文件", "List files")
     case "bash", "shell":       return "Shell"
-    case "browser":             return "浏览器"
-    case "web_search":          return "网页搜索"
-    case "plan":                return "任务计划"
-    case "delegate":            return "委托"
-    case "multi_agent":         return "多 Agent"
-    case "workflow":            return "工作流"
-    case "skill_ref":           return "技能引用"
-    case "image_generation":    return "图片生成"
-    case "question":            return "提问"
+    case "browser":             return c.text("浏览器", "Browser")
+    case "web_search":          return c.text("网页搜索", "Web search")
+    case "plan":                return c.text("任务计划", "Task plan")
+    case "delegate":            return c.text("委托", "Delegate")
+    case "multi_agent":         return c.text("多 Agent", "Multi-agent")
+    case "workflow":            return c.text("工作流", "Workflow")
+    case "skill_ref":           return c.text("技能引用", "Skill reference")
+    case "image_generation":    return c.text("图片生成", "Image generation")
+    case "question":            return c.text("提问", "Question")
     default:                    return name
     }
 }

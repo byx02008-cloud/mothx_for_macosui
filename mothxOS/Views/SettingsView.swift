@@ -30,7 +30,7 @@ struct SettingsView: View {
                     Text(languageStore.copy.settings).font(.system(size: 22, weight: .semibold))
                     Spacer()
                     Button { showSettings = false } label: {
-                        Label("关闭设置", systemImage: "xmark")
+                        Label(languageStore.copy.closeSettings, systemImage: "xmark")
                     }.buttonStyle(.plain).hoverHighlight().foregroundStyle(.secondary)
                 }
                 if section == "providers" {
@@ -48,8 +48,10 @@ struct SettingsView: View {
                     GeneralSection(language: $language)
                 } else if section == "skills" {
                     SkillsSection(skillsDir: $skillsDir)
-                } else {
+                } else if section == "sessions" {
                     SessionsSection(sessionDir: $sessionDir)
+                } else {
+                    AboutSection()
                 }
                 if let error = mothx.settingsError { Text(error).font(.callout).foregroundStyle(.red) }
             }.padding(38).frame(maxWidth: 900, alignment: .leading) }.frame(maxWidth: .infinity)
@@ -124,7 +126,7 @@ struct SettingsNavigation: View {
     @Environment(\.colorScheme) private var colorScheme
     @EnvironmentObject private var languageStore: LanguageStore
     @Binding var section: String
-    var body: some View { let c = languageStore.copy; return VStack(alignment: .leading, spacing: 8) { Text(c.settings.uppercased()).sectionLabel().padding(.bottom, 10); SettingsNavItem(title: c.general, icon: "gearshape", id: "general", section: $section); SettingsNavItem(title: c.providers, icon: "server.rack", id: "providers", section: $section); SettingsNavItem(title: c.skills, icon: "sparkles", id: "skills", section: $section); SettingsNavItem(title: c.sessions, icon: "clock", id: "sessions", section: $section); Spacer() }.padding(22).frame(width: 230).background(colorScheme == .light ? .white : .codexSidebar) }
+    var body: some View { let c = languageStore.copy; return VStack(alignment: .leading, spacing: 8) { Text(c.settings.uppercased()).sectionLabel().padding(.bottom, 10); SettingsNavItem(title: c.general, icon: "gearshape", id: "general", section: $section); SettingsNavItem(title: c.providers, icon: "server.rack", id: "providers", section: $section); SettingsNavItem(title: c.skills, icon: "sparkles", id: "skills", section: $section); SettingsNavItem(title: c.sessions, icon: "clock", id: "sessions", section: $section); SettingsNavItem(title: c.about, icon: "info.circle", id: "about", section: $section); Spacer() }.padding(22).frame(width: 230).background(colorScheme == .light ? .white : .codexSidebar) }
 }
 
 struct SettingsNavItem: View { let title: String; let icon: String; let id: String; @Binding var section: String

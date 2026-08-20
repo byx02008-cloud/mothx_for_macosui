@@ -45,15 +45,21 @@ struct StatsRecentPage: Codable {
 }
 
 enum StatsRange: String, CaseIterable, Identifiable {
-    case seven = "最近 7 天"
-    case thirty = "最近 30 天"
-    case all = "全部时间"
+    case seven, thirty, all
     var id: String { rawValue }
     var days: Int? { self == .seven ? 7 : (self == .thirty ? 30 : nil) }
+    func label(_ copy: Copy) -> String {
+        switch self {
+        case .seven: return copy.statsRangeSeven
+        case .thirty: return copy.statsRangeThirty
+        case .all: return copy.statsRangeAll
+        }
+    }
 }
 
 struct StatsView: View {
     @EnvironmentObject private var mothx: MothxServiceManager
+    @EnvironmentObject private var languageStore: LanguageStore
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
     @State private var range: StatsRange = .seven
@@ -74,22 +80,23 @@ struct StatsView: View {
     }
 
     var body: some View {
+        let c = languageStore.copy
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .firstTextBaseline, spacing: 16) {
-                Text("统计数据").font(.system(size: 25, weight: .bold))
-                Text("查看请求、Token、模型和 Provider 使用情况").foregroundStyle(.secondary)
+                Text(c.statsTitle).font(.system(size: 25, weight: .bold))
+                Text(c.statsSubtitle).foregroundStyle(.secondary)
                 Spacer()
-                Button("关闭") { dismiss() }.buttonStyle(.bordered)
+                Button(c.close) { dismiss() }.buttonStyle(.bordered)
             }.padding(.horizontal, 28).padding(.vertical, 22)
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     HStack(spacing: 12) {
-                        Picker("时间范围", selection: $range) {
-                            ForEach(StatsRange.allCases) { Text($0.rawValue).tag($0) }
+                        Picker(c.statsTimeRange, selection: $range) {
+                            ForEach(StatsRange.allCases) { Text($0.label(c)).tag($0) }
                         }.labelsHidden().frame(width: 150)
                         Button { Task { await load() } } label: {
-                            Label(isLoading ? "加载中…" : "刷新", systemImage: "arrow.clockwise")
+                            Label(isLoading ? c.statsLoading : c.statsRefresh, systemImage: "arrow.clockwise")
                         }.buttonStyle(.bordered).disabled(isLoading)
                         Spacer()
                     }
@@ -97,21 +104,21 @@ struct StatsView: View {
                         let cardWidth = (proxy.size.width - 42) / 4
 
                         HStack(spacing: 14) {
-                            StatsMetricCard(title: "请求数", value: formatStatsNumber(summary.totalRequests)).frame(width: cardWidth)
-                            StatsMetricCard(title: "总 Token", value: formatStatsNumber(summary.totalTokens)).frame(width: cardWidth)
-                            StatsMetricCard(title: "输入 Token", value: formatStatsNumber(summary.inputTokens)).frame(width: cardWidth)
-                            StatsMetricCard(title: "输出 Token", value: formatStatsNumber(summary.outputTokens)).frame(width: cardWidth)
+                            StatsMetricCard(title: c.statsRequests, value: formatStatsNumber(summary.totalRequests)).frame(width: cardWidth)
+                            StatsMetricCard(title: c.statsTotalTokens, value: formatStatsNumber(summary.totalTokens)).frame(width: cardWidth)
+                            StatsMetricCard(title: c.statsInputTokens, value: formatStatsNumber(summary.inputTokens)).frame(width: cardWidth)
+                            StatsMetricCard(title: c.statsOutputTokens, value: formatStatsNumber(summary.outputTokens)).frame(width: cardWidth)
                         }
                     }.frame(height: 112)
                     GeometryReader { proxy in
                         let rankingWidth = (proxy.size.width - 28) / 3.6
                         HStack(spacing: 14) {
-                            StatsTrendCard(data: timeseries, total: summary.totalTokens).frame(width: rankingWidth * 1.6)
-                            StatsRankingCard(title: "Provider 排行", rows: providers, label: { $0.label }).frame(width: rankingWidth)
-                            StatsRankingCard(title: "模型排行", rows: models, label: { $0.model.isEmpty ? $0.label : $0.model }).frame(width: rankingWidth)
+                            StatsTrendCard(data: timeseries, total: summary.totalTokens, copy: c).frame(width: rankingWidth * 1.6)
+                            StatsRankingCard(title: c.statsProviderRanking, rows: providers, label: { $0.label }, copy: c).frame(width: rankingWidth)
+                            StatsRankingCard(title: c.statsModelRanking, rows: models, label: { $0.model.isEmpty ? $0.label : $0.model }, copy: c).frame(width: rankingWidth)
                         }
                     }.frame(height: 300)
-                    StatsRecentCard(page: $page, data: recent, allTotal: allSummary.totalRequests, loadPage: { target in
+                    StatsRecentCard(page: $page, data: recent, allTotal: allSummary.totalRequests, copy: c, loadPage: { target in
                         page = target
                         Task { await loadRecent(page: target) }
                     })
@@ -173,14 +180,15 @@ struct StatsTrendCard: View {
     @Environment(\.colorScheme) private var colorScheme
     let data: [StatsAggregate]
     let total: Int
+    let copy: Copy
     var body: some View {
         StatsCard {
             VStack(alignment: .leading, spacing: 14) {
-                HStack { Text("使用趋势").font(.headline); Spacer(); Text("总 Token: \(formatStatsNumber(total))").foregroundStyle(.secondary) }
-                if data.isEmpty { ContentUnavailableView("暂无数据", systemImage: "chart.bar") .frame(maxWidth: .infinity, minHeight: 210) }
+                HStack { Text(copy.statsUsageTrend).font(.headline); Spacer(); Text(copy.statsTotalTokenLabel(formatStatsNumber(total))).foregroundStyle(.secondary) }
+                if data.isEmpty { ContentUnavailableView(copy.statsNoData, systemImage: "chart.bar") .frame(maxWidth: .infinity, minHeight: 210) }
                 else {
                     Chart(data) { item in
-                        BarMark(x: .value("日期", shortDate(item.label)), y: .value("Token", item.totalTokens)).foregroundStyle(.linearGradient(colors: colorScheme == .light ? [.black.opacity(0.9), .green] : [.green.opacity(0.55), .green], startPoint: .top, endPoint: .bottom))
+                        BarMark(x: .value(copy.statsDate, shortDate(item.label)), y: .value("Token", item.totalTokens)).foregroundStyle(.linearGradient(colors: colorScheme == .light ? [.black.opacity(0.9), .green] : [.green.opacity(0.55), .green], startPoint: .top, endPoint: .bottom))
                     }.chartYAxis { AxisMarks(position: .leading) }.chartLegend(.hidden).frame(height: 230)
                 }
             }
@@ -192,11 +200,12 @@ struct StatsRankingCard: View {
     let title: String
     let rows: [StatsAggregate]
     let label: (StatsAggregate) -> String
+    let copy: Copy
     var body: some View {
         StatsCard {
             VStack(alignment: .leading, spacing: 14) {
-                HStack { Text(title).font(.headline); Spacer(); Text("\(rows.count) 个").foregroundStyle(.secondary) }
-                if rows.isEmpty { Text("暂无数据").foregroundStyle(.secondary).frame(maxWidth: .infinity, minHeight: 215, alignment: .center) }
+                HStack { Text(title).font(.headline); Spacer(); Text(copy.statsItemsCount(rows.count)).foregroundStyle(.secondary) }
+                if rows.isEmpty { Text(copy.statsNoData).foregroundStyle(.secondary).frame(maxWidth: .infinity, minHeight: 215, alignment: .center) }
                 else { VStack(alignment: .leading, spacing: 15) { ForEach(Array(rows.prefix(6))) { row in
                     VStack(alignment: .leading, spacing: 6) {
                         HStack { Text(label(row)).lineLimit(1); Spacer(); Text(formatStatsNumber(row.totalTokens)).foregroundStyle(.secondary) }
@@ -212,12 +221,13 @@ struct StatsRecentCard: View {
     @Binding var page: Int
     let data: StatsRecentPage
     let allTotal: Int
+    let copy: Copy
     let loadPage: (Int) -> Void
     var body: some View {
         StatsCard {
             VStack(alignment: .leading, spacing: 0) {
-                HStack { Text("最近请求").font(.headline); Spacer(); Text("\(allTotal) 个").foregroundStyle(.secondary) }.padding(.bottom, 14)
-                HStack { Text("时间").frame(width: 145, alignment: .leading); Text("模型").frame(maxWidth: .infinity, alignment: .leading); Text("Provider").frame(width: 150, alignment: .leading); Text("输入").frame(width: 80, alignment: .trailing); Text("输出").frame(width: 80, alignment: .trailing); Text("耗时").frame(width: 70, alignment: .trailing) }.font(.caption.bold()).foregroundStyle(.secondary).padding(.vertical, 10).background(Color.primary.opacity(0.05))
+                HStack { Text(copy.statsRecentRequests).font(.headline); Spacer(); Text(copy.statsItemsCount(allTotal)).foregroundStyle(.secondary) }.padding(.bottom, 14)
+                HStack { Text(copy.statsColTime).frame(width: 145, alignment: .leading); Text(copy.statsColModel).frame(maxWidth: .infinity, alignment: .leading); Text("Provider").frame(width: 150, alignment: .leading); Text(copy.statsColInput).frame(width: 80, alignment: .trailing); Text(copy.statsColOutput).frame(width: 80, alignment: .trailing); Text(copy.statsColDuration).frame(width: 70, alignment: .trailing) }.font(.caption.bold()).foregroundStyle(.secondary).padding(.vertical, 10).background(Color.primary.opacity(0.05))
                 ForEach(data.items) { item in
                     HStack { Text(formatStatsTime(item.timestamp)).frame(width: 145, alignment: .leading); Text(item.model).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading); Text(item.vendor).frame(width: 150, alignment: .leading); Text(formatStatsNumber(item.inputTokens)).frame(width: 80, alignment: .trailing); Text(formatStatsNumber(item.outputTokens)).frame(width: 80, alignment: .trailing); Text(String(format: "%.1fs", Double(item.durationMs) / 1000)).frame(width: 70, alignment: .trailing) }.padding(.vertical, 10).overlay(alignment: .bottom) { Divider().opacity(0.35) }
                 }
@@ -229,7 +239,7 @@ struct StatsRecentCard: View {
                             Text("\(pageNumber)").frame(width: 26, height: 24)
                         }.buttonStyle(.plain).background(pageNumber == page ? Color.accentColor.opacity(0.16) : .clear).clipShape(RoundedRectangle(cornerRadius: 5)).foregroundStyle(pageNumber == page ? Color.accentColor : .primary)
                     }
-                    Text("第 \(page) / \(totalPages) 页").font(.caption).foregroundStyle(.secondary).padding(.leading, 5)
+                    Text(copy.statsPageLabel(page, totalPages)).font(.caption).foregroundStyle(.secondary).padding(.leading, 5)
                     Button { if page * data.pageSize < data.total { loadPage(page + 1) } } label: { Image(systemName: "chevron.right") }.buttonStyle(.borderless).disabled(page * data.pageSize >= data.total)
                 }.padding(.top, 14)
             }
@@ -264,10 +274,9 @@ struct StatsCard<Content: View>: View {
 
 func formatStatsNumber(_ value: Int) -> String {
     let number = Double(value)
-    if value >= 100_000_000 { return String(format: "%.1f亿", number / 100_000_000) }
-    if value >= 10_000_000 { return String(format: "%.1f千万", number / 10_000_000) }
-    if value >= 1_000_000 { return String(format: "%.1f百万", number / 1_000_000) }
-    if value >= 10_000 { return String(format: "%.1f万", number / 10_000) }
+    if value >= 1_000_000_000 { return String(format: "%.1fB", number / 1_000_000_000) }
+    if value >= 1_000_000 { return String(format: "%.1fM", number / 1_000_000) }
+    if value >= 1_000 { return String(format: "%.1fK", number / 1_000) }
     return NumberFormatter.localizedString(from: NSNumber(value: value), number: .decimal)
 }
 

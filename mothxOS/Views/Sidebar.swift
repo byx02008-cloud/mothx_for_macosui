@@ -42,7 +42,7 @@ struct Sidebar: View {
                 .buttonStyle(.plain)
                 .hoverHighlight()
                 .foregroundStyle(.secondary)
-                .help("刷新项目和会话列表")
+                .help(c.refreshProjectsHelp)
                 .disabled(isRefreshing || mothx.state != .connected)
             }.padding(.bottom, 22)
             HStack {
@@ -98,19 +98,19 @@ struct Sidebar: View {
                 .popover(isPresented: $showConnectionMenu, arrowEdge: .bottom) {
                     VStack(alignment: .leading, spacing: 3) {
                         Button { showConnectionMenu = false; Task { await mothx.restartService() } } label: {
-                            Label(mothx.state == .connected ? "重启服务" : "启动服务", systemImage: mothx.state == .connected ? "arrow.clockwise" : "play.fill")
+                            Label(mothx.state == .connected ? c.restartService : c.startService, systemImage: mothx.state == .connected ? "arrow.clockwise" : "play.fill")
                                 .padding(.horizontal, 10).frame(maxWidth: .infinity, minHeight: 40, alignment: .leading).contentShape(Rectangle())
                         }.buttonStyle(.plain).hoverHighlight().frame(maxWidth: .infinity)
                         Button { showConnectionMenu = false; NSWorkspace.shared.open(URL(string: "http://127.0.0.1:7872/")!) } label: {
-                            Label("打开 WebUI", systemImage: "safari")
+                            Label(c.openWebUI, systemImage: "safari")
                                 .padding(.horizontal, 10).frame(maxWidth: .infinity, minHeight: 40, alignment: .leading).contentShape(Rectangle())
                         }.buttonStyle(.plain).hoverHighlight().frame(maxWidth: .infinity)
                         Button { showConnectionMenu = false; showServiceLogs = true } label: {
-                            Label("运行日志", systemImage: "doc.text.magnifyingglass")
+                            Label(c.serviceLogTitle, systemImage: "doc.text.magnifyingglass")
                                 .padding(.horizontal, 10).frame(maxWidth: .infinity, minHeight: 40, alignment: .leading).contentShape(Rectangle())
                         }.buttonStyle(.plain).hoverHighlight().frame(maxWidth: .infinity)
                         Button { showConnectionMenu = false; showStats = true } label: {
-                            Label("统计数据", systemImage: "chart.bar.xaxis")
+                            Label(c.statsTitle, systemImage: "chart.bar.xaxis")
                                 .padding(.horizontal, 10).frame(maxWidth: .infinity, minHeight: 40, alignment: .leading).contentShape(Rectangle())
                         }.buttonStyle(.plain).hoverHighlight().frame(maxWidth: .infinity)
                     }
@@ -127,12 +127,12 @@ struct Sidebar: View {
                 .buttonStyle(.plain)
                 .contentShape(Rectangle())
                 .hoverHighlight()
-                .help("界面主题")
+                .help(c.appearanceHelp)
                 .popover(isPresented: $showAppearanceMenu, arrowEdge: .bottom) {
                     VStack(alignment: .leading, spacing: 3) {
-                        appearanceButton("日间", value: "light")
-                        appearanceButton("夜间", value: "dark")
-                        appearanceButton("自动", value: "auto")
+                        appearanceButton(c.appearanceLight, value: "light")
+                        appearanceButton(c.appearanceDark, value: "dark")
+                        appearanceButton(c.appearanceAuto, value: "auto")
                     }.padding(10).frame(width: 120, alignment: .leading)
                 }
             }.padding(.top, 12)

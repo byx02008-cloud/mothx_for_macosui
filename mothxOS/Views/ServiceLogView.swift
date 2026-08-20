@@ -3,18 +3,19 @@ import SwiftUI
 struct ServiceLogView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var mothx: MothxServiceManager
+    @EnvironmentObject private var languageStore: LanguageStore
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Label("运行日志", systemImage: "doc.text.magnifyingglass")
+                Label(languageStore.copy.serviceLogTitle, systemImage: "doc.text.magnifyingglass")
                     .font(.title2.bold())
                 Spacer()
-                Button("关闭") { dismiss() }
+                Button(languageStore.copy.close) { dismiss() }
             }
 
             if mothx.serviceLog.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                ContentUnavailableView("暂无运行日志", systemImage: "doc.text")
+                ContentUnavailableView(languageStore.copy.noServiceLog, systemImage: "doc.text")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {

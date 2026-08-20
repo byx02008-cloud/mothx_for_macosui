@@ -139,8 +139,8 @@ struct WorkspaceView: View {
                 stop: { Task { await mothx.cancelRun() } }
             ).frame(maxWidth: 760).padding(.horizontal, 25).padding(.bottom, 16)
         }.padding(.top, 1)
-        .alert("附件", isPresented: Binding(get: { attachmentError != nil }, set: { if !$0 { attachmentError = nil } })) {
-            Button("确定") { attachmentError = nil }
+        .alert(c.attach, isPresented: Binding(get: { attachmentError != nil }, set: { if !$0 { attachmentError = nil } })) {
+            Button(c.ok) { attachmentError = nil }
         } message: {
             Text(attachmentError ?? "")
         }
@@ -223,7 +223,8 @@ struct WorkspaceView: View {
         guard !question.isEmpty || !attachments.isEmpty else { return }
         let imageAttachments = attachments.compactMap(\.dataURL)
         if question.isEmpty, !attachments.isEmpty {
-            question = "请处理工作目录中的附件：" + attachments.map(\.name).joined(separator: "、")
+            let separator = languageStore.language == .zh ? "、" : ", "
+            question = languageStore.copy.attachmentsInstruction(attachments.map(\.name).joined(separator: separator))
         }
         let selectedModel = selectedModelID
         let selectedMode = selectedMode
@@ -248,7 +249,7 @@ struct WorkspaceView: View {
         guard panel.runModal() == .OK else { return }
         let directory = workDir(for: sessionID ?? "")
         guard !directory.isEmpty else {
-            attachmentError = "当前会话没有可用的项目工作目录"
+            attachmentError = languageStore.copy.noWorkDirForAttachment
             return
         }
         do {
@@ -262,7 +263,7 @@ struct WorkspaceView: View {
                 attachments.append(ComposerAttachment(name: destination.lastPathComponent, dataURL: dataURL))
             }
         } catch {
-            attachmentError = "添加附件失败：\(error.localizedDescription)"
+            attachmentError = languageStore.copy.addAttachmentFailedPrefix(error.localizedDescription)
         }
     }
 
@@ -299,6 +300,7 @@ struct DirectoryApplication: Identifiable {
 
 struct CurrentDirectoryMenu: View {
     @Environment(\.colorScheme) private var colorScheme
+    @EnvironmentObject private var languageStore: LanguageStore
     let path: String
     @State private var isPresented = false
     @State private var applications: [DirectoryApplication] = []
@@ -306,7 +308,7 @@ struct CurrentDirectoryMenu: View {
 
     private var directoryURL: URL { URL(fileURLWithPath: path, isDirectory: true) }
     private var directoryName: String {
-        guard !path.isEmpty else { return "无工作目录" }
+        guard !path.isEmpty else { return languageStore.copy.noWorkDir }
         return directoryURL.lastPathComponent.isEmpty ? path : directoryURL.lastPathComponent
     }
 
@@ -352,7 +354,7 @@ struct CurrentDirectoryMenu: View {
                 Text(path).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 Divider()
                 if applications.isEmpty {
-                    Text("没有找到可打开此目录的应用").foregroundStyle(.secondary).padding(.vertical, 10)
+                    Text(languageStore.copy.noAppsForDirectory).foregroundStyle(.secondary).padding(.vertical, 10)
                 } else {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 2) {
@@ -426,7 +428,7 @@ struct PromptComposer: View {
 
     private var selectedModelLabel: String {
         if let model = models.first(where: { $0.id == modelID }) { return model.displayName }
-        return modelID.isEmpty ? "选择模型" : modelID
+        return modelID.isEmpty ? languageStore.copy.selectModel : modelID
     }
 
     var body: some View {
@@ -434,7 +436,7 @@ struct PromptComposer: View {
         return VStack(spacing: 0) {
             if !attachments.isEmpty {
                 HStack(spacing: 8) {
-                    Text("附件 \(attachments.count) 个").font(.caption).foregroundStyle(.secondary)
+                    Text(c.attachmentsCountLabel(attachments.count)).font(.caption).foregroundStyle(.secondary)
                     Text(attachments.map(\.name).joined(separator: "、")).font(.caption).foregroundStyle(.tertiary).lineLimit(1)
                     Spacer()
                     Button { attachments.removeAll() } label: { Image(systemName: "xmark") }.buttonStyle(.plain).hoverHighlight()
@@ -459,7 +461,7 @@ struct PromptComposer: View {
                     plusMenuOpen.toggle()
                 } label: {
                     Image(systemName: "plus").frame(width: 36, height: 36).foregroundStyle(.primary).contentShape(Rectangle())
-                }.buttonStyle(.plain).hoverHighlight().help("更多选项")
+                }.buttonStyle(.plain).hoverHighlight().help(c.moreOptionsHelp)
                 .popover(isPresented: $plusMenuOpen, arrowEdge: .bottom) {
                     plusPopover
                 }
@@ -490,7 +492,7 @@ struct PromptComposer: View {
                     .popover(isPresented: $showModelMenu, arrowEdge: .bottom) {
                         VStack(alignment: .leading, spacing: 3) {
                             if models.isEmpty {
-                                Text("当前运营商没有可用模型").foregroundStyle(.secondary).padding(8)
+                                Text(c.noModelsForProvider).foregroundStyle(.secondary).padding(8)
                             } else {
                                 ScrollView {
                                     VStack(alignment: .leading, spacing: 3) {
@@ -518,7 +520,7 @@ struct PromptComposer: View {
                     } else {
                         Image(systemName: "arrow.up").frame(width: 25, height: 25).foregroundStyle(.white).background(Color.gray).clipShape(Circle())
                     }
-                }.buttonStyle(.plain).hoverHighlight().help(isRunning ? "停止" : "发送")
+                }.buttonStyle(.plain).hoverHighlight().help(isRunning ? c.stop : c.send)
             }.padding(.horizontal, 10).padding(.top, 4).padding(.bottom, 8)
         }.background(composerBackground).clipShape(RoundedRectangle(cornerRadius: 12)).overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.12)))
     }
@@ -534,13 +536,14 @@ struct PromptComposer: View {
 
     @ViewBuilder
     private var plusPopover: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        let copy = languageStore.copy
+        return VStack(alignment: .leading, spacing: 4) {
             if let plusSubmenu {
                 HStack(spacing: 8) {
                     Button { self.plusSubmenu = nil } label: { Image(systemName: "chevron.left") }.buttonStyle(.plain).hoverHighlight()
                     switch plusSubmenu {
-                    case .skills: Text("技能（已激活 \(selectedSkills.count) 个）").font(.headline)
-                    case .tools: Text("工具").font(.headline)
+                    case .skills: Text(copy.skillsActivatedLabel(selectedSkills.count)).font(.headline)
+                    case .tools: Text(copy.toolsLabel).font(.headline)
                     }
                     Spacer()
                 }.padding(.bottom, 6)
@@ -548,7 +551,7 @@ struct PromptComposer: View {
                     VStack(alignment: .leading, spacing: 2) {
                         switch plusSubmenu {
                         case .skills:
-                            if skills.isEmpty { Text("暂无已安装技能").foregroundStyle(.secondary).padding(8) }
+                            if skills.isEmpty { Text(copy.noInstalledSkills).foregroundStyle(.secondary).padding(8) }
                             ForEach(skills) { skill in
                                 let active = selectedSkills.contains(skill.name)
                                 Button {
@@ -580,10 +583,10 @@ struct PromptComposer: View {
                     }
                 }.frame(maxHeight: 300)
             } else {
-                Text("更多选项").font(.headline).padding(.bottom, 6)
-                Button { plusSubmenu = .skills } label: { HStack { Label("技能", systemImage: "sparkles"); Spacer(); Image(systemName: "chevron.right") }.padding(.horizontal, 10).padding(.vertical, 10).frame(maxWidth: .infinity, minHeight: 48, alignment: .leading).contentShape(Rectangle()) }.buttonStyle(.plain).hoverHighlight().frame(maxWidth: .infinity)
-                Button { plusSubmenu = .tools } label: { HStack { Label("工具", systemImage: "wrench.and.screwdriver"); Spacer(); Image(systemName: "chevron.right") }.padding(.horizontal, 10).padding(.vertical, 10).frame(maxWidth: .infinity, minHeight: 48, alignment: .leading).contentShape(Rectangle()) }.buttonStyle(.plain).hoverHighlight().frame(maxWidth: .infinity)
-                Button { plusMenuOpen = false; chooseFiles() } label: { Label("附件", systemImage: "paperclip").padding(.horizontal, 10).padding(.vertical, 10).frame(maxWidth: .infinity, minHeight: 48, alignment: .leading).contentShape(Rectangle()) }.buttonStyle(.plain).hoverHighlight().frame(maxWidth: .infinity)
+                Text(copy.moreOptionsHelp).font(.headline).padding(.bottom, 6)
+                Button { plusSubmenu = .skills } label: { HStack { Label(copy.skills, systemImage: "sparkles"); Spacer(); Image(systemName: "chevron.right") }.padding(.horizontal, 10).padding(.vertical, 10).frame(maxWidth: .infinity, minHeight: 48, alignment: .leading).contentShape(Rectangle()) }.buttonStyle(.plain).hoverHighlight().frame(maxWidth: .infinity)
+                Button { plusSubmenu = .tools } label: { HStack { Label(copy.toolsLabel, systemImage: "wrench.and.screwdriver"); Spacer(); Image(systemName: "chevron.right") }.padding(.horizontal, 10).padding(.vertical, 10).frame(maxWidth: .infinity, minHeight: 48, alignment: .leading).contentShape(Rectangle()) }.buttonStyle(.plain).hoverHighlight().frame(maxWidth: .infinity)
+                Button { plusMenuOpen = false; chooseFiles() } label: { Label(copy.attach, systemImage: "paperclip").padding(.horizontal, 10).padding(.vertical, 10).frame(maxWidth: .infinity, minHeight: 48, alignment: .leading).contentShape(Rectangle()) }.buttonStyle(.plain).hoverHighlight().frame(maxWidth: .infinity)
             }
         }.padding(12).frame(width: 300)
     }
@@ -594,11 +597,12 @@ struct Suggestion: View { let title: String; let icon: String
 }
 
 private struct ThinkingContentView: View {
+    @EnvironmentObject private var languageStore: LanguageStore
     let text: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Label("思考中", systemImage: "brain.head.profile")
+            Label(languageStore.copy.thinkingLabel, systemImage: "brain.head.profile")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.orange)
             Text(text)
@@ -700,6 +704,7 @@ private struct ConversationScrollObserver: NSViewRepresentable {
 }
 
 private struct ConversationScrollButton: View {
+    @EnvironmentObject private var languageStore: LanguageStore
     let isRunning: Bool
     let action: () -> Void
     @State private var animationPhase = false
@@ -733,7 +738,7 @@ private struct ConversationScrollButton: View {
         .background(.regularMaterial, in: Circle())
         .overlay(Circle().stroke(Color.primary.opacity(0.12), lineWidth: 1))
         .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
-        .help(isRunning ? "正在输出，滚动到底部" : "滚动到底部")
+        .help(isRunning ? languageStore.copy.scrollRunningHelp : languageStore.copy.scrollBottomHelp)
         .onAppear {
             if isRunning { animationPhase = true }
         }

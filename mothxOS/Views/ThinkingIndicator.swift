@@ -2,6 +2,7 @@ import SwiftUI
 
 /// Thinking indicator: 3 dots breathing sequentially when the agent is thinking.
 struct ThinkingIndicator: View {
+    @EnvironmentObject private var languageStore: LanguageStore
     let isActive: Bool
 
     var body: some View {
@@ -26,7 +27,7 @@ struct ThinkingIndicator: View {
                     }
                 }
 
-                Text("思考中…")
+                Text(languageStore.copy.thinking)
                     .font(.caption)
                     .foregroundStyle(.secondary)
 

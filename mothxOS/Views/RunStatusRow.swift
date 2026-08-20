@@ -4,6 +4,7 @@ struct RunStatusRow: View {
     let status: String
     let elapsed: TimeInterval
     let error: String?
+    @EnvironmentObject private var languageStore: LanguageStore
     @State private var expanded = false
 
     var body: some View {
@@ -32,13 +33,14 @@ struct RunStatusRow: View {
     }
 
     private var statusLabel: String {
+        let copy = languageStore.copy
         switch status.lowercased() {
-        case "queued": return "排队中"
-        case "running", "in_progress": return "模型处理中"
-        case "completed", "succeeded": return "已完成"
-        case "failed", "error": return "处理失败"
-        case "cancelled", "canceled": return "已取消"
-        case "timeout": return "等待超时"
+        case "queued": return copy.statusQueued
+        case "running", "in_progress": return copy.runRowRunning
+        case "completed", "succeeded": return copy.statusCompleted
+        case "failed", "error": return copy.runRowFailed
+        case "cancelled", "canceled": return copy.statusCancelled
+        case "timeout": return copy.runRowTimeout
         default: return status
         }
     }
@@ -51,7 +53,6 @@ struct RunStatusRow: View {
     }
 
     private var formattedElapsed: String {
-        if elapsed < 60 { return String(format: "%.1f 秒", elapsed) }
-        return String(format: "%.0f 分 %.0f 秒", floor(elapsed / 60), elapsed.truncatingRemainder(dividingBy: 60))
+        formatElapsedShort(elapsed, language: languageStore.language)
     }
 }

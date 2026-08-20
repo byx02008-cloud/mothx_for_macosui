@@ -40,18 +40,18 @@ struct Turn: Identifiable {
     }
 
     /// Full process text, compact (no blank lines between entries)
-    var processText: String {
+    func processText(language: AppLanguage) -> String {
         var lines: [String] = []
         for msg in processMessages {
             if msg.isToolCall {
-                let name = toolDisplayName(msg.toolName ?? "")
+                let name = toolDisplayName(msg.toolName ?? "", language: language)
                 if let args = toolArgSummary(toolName: msg.toolName ?? "", arguments: msg.arguments) {
                     lines.append("🔧 \(name): \(args)")
                 } else {
                     lines.append("🔧 \(name)")
                 }
             } else if msg.isToolResult {
-                let name = toolDisplayName(msg.toolName ?? "")
+                let name = toolDisplayName(msg.toolName ?? "", language: language)
                 let text = (msg.summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 if text.isEmpty {
                     lines.append("✓ \(name)")
@@ -95,6 +95,7 @@ func computeTurns(_ messages: [MothxMessage]) -> [Turn] {
 
 struct TurnBlock: View {
     @EnvironmentObject private var mothx: MothxServiceManager
+    @EnvironmentObject private var languageStore: LanguageStore
     let turn: Turn
     let sessionID: String
     let isExpanded: Bool
@@ -192,11 +193,11 @@ struct TurnBlock: View {
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "gearshape.2").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
-                    Text("过程").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                    Text(languageStore.copy.process).font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
                     ForEach(turn.uniqueToolNames, id: \.self) { name in
                         HStack(spacing: 2) {
                             Image(systemName: toolIcon(for: name)).font(.system(size: 8))
-                            Text(toolDisplayName(name)).font(.system(size: 8))
+                            Text(toolDisplayName(name, language: languageStore.language)).font(.system(size: 8))
                         }
                         .foregroundStyle(.orange)
                         .padding(.horizontal, 4).padding(.vertical, 1)
@@ -214,7 +215,7 @@ struct TurnBlock: View {
             if isProcessExpanded {
                 Divider()
                 ScrollView {
-                    Text(turn.processText)
+                    Text(turn.processText(language: languageStore.language))
                         .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)

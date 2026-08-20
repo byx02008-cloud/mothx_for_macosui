@@ -139,11 +139,11 @@ final class LocalProjectStore {
     }
 }
 
-private enum LocalProjectStoreError: LocalizedError {
+enum LocalProjectStoreError: LocalizedError {
     case openFailed, prepareFailed, writeFailed
-    var errorDescription: String? { "本地项目数据库无法访问" }
+    var errorDescription: String? { "Local project database is unavailable" }
 }
 
 struct LocalProjectStoreUnavailable: LocalizedError {
-    var errorDescription: String? { "本地项目数据库无法访问" }
+    var errorDescription: String? { "Local project database is unavailable" }
 }

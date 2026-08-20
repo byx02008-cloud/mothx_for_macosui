@@ -61,6 +61,7 @@ final class MothxServiceManager: ObservableObject {
     let baseURL = URL(string: "http://127.0.0.1:7872")!
     private var process: Process?
     private var startupPipe: Pipe?
+    private static var cachedLoginShellEnvironment: [String: String]?
     private var startupOutput = ""
     private var logStreamTask: Task<Void, Never>?
     private var logSocket: URLSessionWebSocketTask?
@@ -68,6 +69,8 @@ final class MothxServiceManager: ObservableObject {
     private var runExistingMessageIDs: Set<String> = []
     private var cancelRequested = false
     private var runEventTask: Task<Void, Never>?
+    private var runEventStreamSessionID: String?
+    private var runEventLastSeq: Int = 0
     @Published private(set) var currentRunID: String?
     @Published private(set) var sessionModels: [String: String] = [:]
     @Published private(set) var serviceLog = ""
@@ -75,6 +78,25 @@ final class MothxServiceManager: ObservableObject {
     @Published private(set) var currentRunningMessageID: String?
     @Published private(set) var isRunning: Bool = false
     private let localProjectStore = try? LocalProjectStore()
+    weak var languageStore: LanguageStore?
+
+    private var copy: Copy { Copy(resolvedLanguage: languageStore?.language ?? AppLanguage.resolve(setting: "auto")) }
+
+    /// Localized description for an error, using our own copy for errors we
+    /// throw ourselves (LocalProjectStore, settings decoding); falls back to
+    /// the system-localized description for network/Foundation errors.
+    private func describe(_ error: Error) -> String {
+        if error is LocalProjectStoreUnavailable || error is LocalProjectStoreError {
+            return copy.localDatabaseUnavailable
+        }
+        if let settingsError = error as? SettingsLoadError {
+            switch settingsError {
+            case .invalidResponse: return copy.settingsInvalidResponse
+            case .noProvidersDecoded: return copy.settingsNoProvidersDecoded
+            }
+        }
+        return error.localizedDescription
+    }
 
     func connect() async {
         state = .checking
@@ -100,8 +122,8 @@ final class MothxServiceManager: ObservableObject {
         }
 
         state = .starting
-        guard let executable = Bundle.main.url(forResource: "mothx", withExtension: nil) else {
-            state = .failed("App bundle 中没有找到 mothx runtime")
+        guard let executable = await MothxServiceManager.resolveGlobalMothxExecutable() else {
+            state = .failed(copy.runtimeNotFound)
             return
         }
 
@@ -110,7 +132,7 @@ final class MothxServiceManager: ObservableObject {
         do {
             try FileManager.default.createDirectory(at: workDirectory, withIntermediateDirectories: true)
         } catch {
-            state = .failed("无法创建 mothx 工作目录：\(error.localizedDescription)")
+            state = .failed(copy.workDirCreateFailedPrefix(describe(error)))
             return
         }
 
@@ -120,6 +142,11 @@ final class MothxServiceManager: ObservableObject {
         // probes. An explicit CLI override is applied by mothx at startup.
         child.arguments = ["serve", "--port", "127.0.0.1:7872"]
         child.currentDirectoryURL = workDirectory
+        // Without this, mothx serve inherits the GUI app's bare environment
+        // (no PATH beyond /usr/bin, no shell-exported provider API keys),
+        // and provider requests referencing ${SOME_API_KEY} fail even though
+        // the same command works fine from a Terminal.
+        child.environment = await MothxServiceManager.loginShellEnvironment()
         let output = Pipe()
         startupPipe = output
         startupOutput = ""
@@ -146,7 +173,7 @@ final class MothxServiceManager: ObservableObject {
             try child.run()
             process = child
         } catch {
-            state = .failed("无法启动 mothx：\(error.localizedDescription)")
+            state = .failed(copy.mothxLaunchFailedPrefix(describe(error)))
             return
         }
         await waitForHealth(process: child)
@@ -173,9 +200,9 @@ final class MothxServiceManager: ObservableObject {
 
     private func failureMessage(status: Int32, timedOut: Bool = false) -> String {
         let output = readStartupOutput()
-        if !output.isEmpty { return "mothx serve 启动失败：\\n\(output)" }
-        if timedOut { return "mothx serve 启动超时（端口 127.0.0.1:7872）" }
-        return "mothx serve 已退出（状态码 \(status)）"
+        if !output.isEmpty { return copy.serveStartFailedWithOutput(output) }
+        if timedOut { return copy.serveStartTimeout }
+        return copy.serveExited(status)
     }
 
     private func readStartupOutput() -> String {
@@ -262,18 +289,20 @@ final class MothxServiceManager: ObservableObject {
             }
             settingsError = nil
         } catch {
-            settingsError = "读取配置失败：\(error.localizedDescription)"
+            settingsError = copy.loadSettingsFailedPrefix(describe(error))
         }
     }
 
     func loadWorkspace() async {
         guard state == .connected else { return }
 
+        var hadLocalProjectLoadError = false
         do {
             guard let localProjectStore else { throw LocalProjectStoreUnavailable() }
             projects = try localProjectStore.projects()
         } catch {
-            settingsError = "读取本地项目失败：\(error.localizedDescription)"
+            hadLocalProjectLoadError = true
+            settingsError = copy.loadLocalProjectsFailedPrefix(describe(error))
         }
 
         do {
@@ -307,9 +336,9 @@ final class MothxServiceManager: ObservableObject {
                 session.projectID = projectIDsBySession[session.id]
                 return session
             }
-            if settingsError?.hasPrefix("读取本地项目失败") != true { settingsError = nil }
+            if !hadLocalProjectLoadError { settingsError = nil }
         } catch {
-            settingsError = "读取会话失败：\(error.localizedDescription)"
+            settingsError = copy.loadSessionsFailedPrefix(describe(error))
         }
 
         do {
@@ -317,7 +346,7 @@ final class MothxServiceManager: ObservableObject {
             activeSessions = decodeSessions(data)
         } catch {
             activeSessions = []
-            if settingsError == nil { settingsError = "读取当前会话失败：\(error.localizedDescription)" }
+            if settingsError == nil { settingsError = copy.loadActiveSessionFailedPrefix(describe(error)) }
         }
 
         await loadInstalledSkills()
@@ -327,7 +356,7 @@ final class MothxServiceManager: ObservableObject {
         do {
             return try await request(path: path, method: "GET")
         } catch {
-            settingsError = "读取统计数据失败：\(error.localizedDescription)"
+            settingsError = copy.loadStatsFailedPrefix(describe(error))
             return nil
         }
     }
@@ -341,7 +370,7 @@ final class MothxServiceManager: ObservableObject {
             projects.append(project)
             return project
         } catch {
-            settingsError = "创建本地项目失败：\(error.localizedDescription)"
+            settingsError = copy.createProjectFailedPrefix(describe(error))
             return nil
         }
     }
@@ -354,7 +383,7 @@ final class MothxServiceManager: ObservableObject {
             projects[index].name = name
             projects[index].workDir = workDir
         } catch {
-            settingsError = "更新本地项目失败：\(error.localizedDescription)"
+            settingsError = copy.updateProjectFailedPrefix(describe(error))
         }
     }
 
@@ -374,7 +403,7 @@ final class MothxServiceManager: ObservableObject {
                 pendingSessions[sessionID] = unassigned
             }
         } catch {
-            settingsError = "删除本地项目失败：\(error.localizedDescription)"
+            settingsError = copy.deleteProjectFailedPrefix(describe(error))
         }
     }
 
@@ -384,7 +413,7 @@ final class MothxServiceManager: ObservableObject {
         let session = MothxSession(id: UUID().uuidString.lowercased(), title: "New session", projectID: projectID, updatedAt: nil, workDir: nil)
         if let projectID {
             do { try localProjectStore?.assign(sessionID: session.id, to: projectID) }
-            catch { settingsError = "保存会话项目关系失败：\(error.localizedDescription)" }
+            catch { settingsError = copy.saveSessionProjectLinkFailedPrefix(describe(error)) }
         }
         pendingSessions[session.id] = session
         return session
@@ -400,13 +429,13 @@ final class MothxServiceManager: ObservableObject {
         messagesBySession.removeValue(forKey: id)
         historicalRunsByMessage.removeValue(forKey: id)
         do { try localProjectStore?.removeSession(sessionID: id) }
-        catch { settingsError = "删除会话项目关系失败：\(error.localizedDescription)" }
+        catch { settingsError = copy.deleteSessionProjectLinkFailedPrefix(describe(error)) }
         do {
             _ = try await request(path: "api/sessions/\(id)", method: "DELETE")
             await loadWorkspace()
         } catch {
             if !(error is URLError) {
-                settingsError = "删除会话失败：\(error.localizedDescription)"
+                settingsError = copy.deleteSessionFailedPrefix(describe(error))
             }
         }
     }
@@ -431,7 +460,7 @@ final class MothxServiceManager: ObservableObject {
             }
             return messages
         } catch {
-            settingsError = "读取会话消息失败：\(error.localizedDescription)"
+            settingsError = copy.loadMessagesFailedPrefix(describe(error))
             return []
         }
     }
@@ -473,7 +502,7 @@ final class MothxServiceManager: ObservableObject {
             guard let runID else {
                 isSubmittingRun = false
                 runStatus = "failed"
-                runError = "服务端未返回 run ID"
+                runError = copy.noRunIDReturned
                 return nil
             }
             currentRunID = runID
@@ -484,8 +513,8 @@ final class MothxServiceManager: ObservableObject {
         } catch {
             isSubmittingRun = false
             runStatus = "failed"
-            runError = error.localizedDescription
-            settingsError = "提交会话失败：\(error.localizedDescription)"
+            runError = describe(error)
+            settingsError = copy.submitRunFailedPrefix(describe(error))
             return nil
         }
     }
@@ -500,7 +529,7 @@ final class MothxServiceManager: ObservableObject {
             runStatus = "cancelled"
             runElapsed = elapsedSinceRunStart()
         } catch {
-            runError = "停止运行失败：\(error.localizedDescription)"
+            runError = copy.stopRunFailedPrefix(describe(error))
             settingsError = runError
         }
     }
@@ -536,19 +565,19 @@ final class MothxServiceManager: ObservableObject {
                     currentRunningMessageID = lastAssistant.id
                 }
                 if ["completed", "succeeded", "failed", "error", "cancelled", "canceled"].contains(status.lowercased()) {
-                    if ["failed", "error"].contains(status.lowercased()) { runError = object["error"] as? String ?? object["errorMessage"] as? String ?? "Agent run failed" }
+                    if ["failed", "error"].contains(status.lowercased()) { runError = object["error"] as? String ?? object["errorMessage"] as? String ?? copy.runFailedFallback }
                     await loadWorkspace()
                     return
                 }
             } catch {
                 runStatus = "failed"
-                runError = error.localizedDescription
+                runError = describe(error)
                 return
             }
             try? await Task.sleep(for: .milliseconds(500))
         }
         runStatus = "timeout"
-        runError = "等待模型回复超时"
+        runError = copy.waitReplyTimeout
     }
 
     private func elapsedSinceRunStart() -> TimeInterval {
@@ -621,9 +650,25 @@ final class MothxServiceManager: ObservableObject {
     }
 
     private func startRunEventStream(sessionID: String) {
+        // Called on every polling tick (every ~500ms while a run is active),
+        // not just once. Reconnecting the WebSocket that often tears down the
+        // stream mid-generation, so short-lived reasoning content emitted
+        // during the handshake gap never reaches thinkingBySession. Keep the
+        // existing connection alive as long as it's already serving this
+        // session; only (re)connect on session switch or genuine drop.
+        if runEventStreamSessionID == sessionID, runEventTask != nil { return }
         runEventTask?.cancel()
+        if runEventStreamSessionID != sessionID { runEventLastSeq = 0 }
+        runEventStreamSessionID = sessionID
         runEventTask = Task { [weak self] in
             guard let self else { return }
+            defer {
+                Task { @MainActor in
+                    if self.runEventStreamSessionID == sessionID {
+                        self.runEventStreamSessionID = nil
+                    }
+                }
+            }
             var request = URLRequest(url: URL(string: "ws://127.0.0.1:7872/ws/runs")!)
             request.setValue("http://127.0.0.1:7872/", forHTTPHeaderField: "Origin")
             let socket = URLSession.shared.webSocketTask(with: request)
@@ -631,14 +676,18 @@ final class MothxServiceManager: ObservableObject {
             defer { socket.cancel(with: .goingAway, reason: nil) }
             do {
                 try await socket.send(.string("{\"type\":\"hello\",\"clientId\":\"mothxOS\"}"))
-                let subscription = "{\"type\":\"subscribe\",\"subscriptions\":[{\"sessionId\":\"\(sessionID)\",\"cursor\":{\"seq\":0}}]}"
+                let startSeq = await MainActor.run { self.runEventLastSeq }
+                let subscription = "{\"type\":\"subscribe\",\"subscriptions\":[{\"sessionId\":\"\(sessionID)\",\"cursor\":{\"seq\":\(startSeq)}}]}"
                 try await socket.send(.string(subscription))
                 while !Task.isCancelled {
                     let message = try await socket.receive()
                     guard case .string(let text) = message,
                           let data = text.data(using: .utf8),
-                          let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                          object["stream"] as? String == "transcript",
+                          let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+                    if let seq = object["seq"] as? Int {
+                        await MainActor.run { self.runEventLastSeq = max(self.runEventLastSeq, seq) }
+                    }
+                    guard object["stream"] as? String == "transcript",
                           let eventData = object["data"] as? [String: Any],
                           eventData["type"] as? String == "thinking_delta",
                           let messageObject = eventData["message"] as? [String: Any],
@@ -774,9 +823,9 @@ final class MothxServiceManager: ObservableObject {
     func updateSessionTitle(id: String, title: String) async {
         do {
             let body = try jsonData(["title": title])
-            _ = try await request(path: "api/sessions/\\(id)/title", method: "POST", body: body)
+            _ = try await request(path: "api/sessions/\(id)/title", method: "POST", body: body)
             await loadWorkspace()
-        } catch { settingsError = "更新会话失败：\\(error.localizedDescription)" }
+        } catch { settingsError = copy.updateSessionFailedPrefix(describe(error)) }
     }
 
     private func decodeProject(_ data: Data) -> MothxProject? {
@@ -823,7 +872,7 @@ final class MothxServiceManager: ObservableObject {
             _ = try await request(path: "api/settings", method: "PUT", body: data)
             await loadSettings()
         } catch {
-            settingsError = "保存全局配置失败：\(error.localizedDescription)"
+            settingsError = copy.saveGlobalSettingsFailedPrefix(describe(error))
         }
     }
 
@@ -847,7 +896,7 @@ final class MothxServiceManager: ObservableObject {
             let data = try JSONSerialization.data(withJSONObject: rawSettings)
             _ = try await request(path: "api/settings", method: "PUT", body: data)
             await loadSettings()
-        } catch { settingsError = "删除 Provider 失败：\(error.localizedDescription)" }
+        } catch { settingsError = copy.deleteProviderFailedPrefix(describe(error)) }
     }
 
     func saveProvider(_ provider: MothxProviderConfig, asDefault: Bool) async {
@@ -865,7 +914,7 @@ final class MothxServiceManager: ObservableObject {
             _ = try await request(path: "api/settings", method: "PUT", body: data)
             await loadSettings()
         } catch {
-            settingsError = "保存配置失败：\(error.localizedDescription)"
+            settingsError = copy.saveProviderFailedPrefix(describe(error))
         }
     }
 
@@ -876,7 +925,7 @@ final class MothxServiceManager: ObservableObject {
             let result = try JSONDecoder().decode(DiscoveredModelsResponse.self, from: data)
             return result.data.map { MothxModelConfig(id: $0.id, name: $0.name, reasoning: $0.reasoning, contextWindow: $0.contextWindow, maxTokens: $0.maxTokens, input: $0.input) }
         } catch {
-            settingsError = "获取模型失败：\(error.localizedDescription)"
+            settingsError = copy.discoverModelsFailedPrefix(describe(error))
             return []
         }
     }
@@ -935,7 +984,14 @@ final class MothxServiceManager: ObservableObject {
     private func jsonData(_ value: Any) throws -> Data { try JSONSerialization.data(withJSONObject: value) }
     private func jsonDictionary(_ value: MothxProviderConfig) throws -> [String: Any] { try (JSONSerialization.jsonObject(with: JSONEncoder().encode(value)) as? [String: Any]) ?? [:] }
 
-    func restartService() async {
+    /// Whether this app instance currently owns a running mothx process (as
+    /// opposed to being connected to a server started outside the app).
+    var ownsRunningProcess: Bool { process?.isRunning ?? false }
+
+    /// Terminates the process this app itself started, if any. Safe to call
+    /// when connected to an externally-started server: does nothing in that
+    /// case, per the invariant that we never kill a foreign mothx process.
+    func stopOwnedService() async {
         logStreamTask?.cancel()
         logSocket?.cancel(with: .goingAway, reason: nil)
         if let process, process.isRunning {
@@ -946,6 +1002,10 @@ final class MothxServiceManager: ObservableObject {
         }
         self.process = nil
         state = .checking
+    }
+
+    func restartService() async {
+        await stopOwnedService()
         await connect()
     }
 
@@ -959,6 +1019,115 @@ final class MothxServiceManager: ObservableObject {
         } catch {
             return false
         }
+    }
+
+    /// Resolves the native mothx binary managed by `npm install -g
+    /// mothx-installer`. The global `mothx` command on PATH is a Node.js
+    /// wrapper script (`#!/usr/bin/env node`) that shells out to the real,
+    /// platform-specific compiled binary — launching the wrapper directly
+    /// would require `node` to be on this app's (non-login-shell) PATH, and
+    /// even then the wrapper's child process wouldn't be reliably
+    /// terminated by our `terminate()` calls, risking an orphaned `mothx
+    /// serve` holding the port after a stop/restart. So this resolves the
+    /// real binary inside the platform optional-dependency package instead,
+    /// which behaves like any other directly-launched executable.
+    private static func resolveGlobalMothxExecutable() async -> URL? {
+        guard let npmRoot = await shellCapturedPath("npm root -g") else { return nil }
+        #if arch(arm64)
+        let platformPackage = "mothx-installer-darwin-arm64"
+        #else
+        let platformPackage = "mothx-installer-darwin-x64"
+        #endif
+        let candidates = [
+            "\(npmRoot)/mothx-installer/node_modules/\(platformPackage)/bin/mothx",
+            "\(npmRoot)/\(platformPackage)/bin/mothx",
+        ]
+        for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
+            return URL(fileURLWithPath: candidate)
+        }
+        return nil
+    }
+
+    /// Runs `command` in an interactive login shell (so nvm/homebrew PATH
+    /// entries are honored) and returns the last absolute-path-looking line
+    /// of its combined stdout+stderr output, or nil on failure. Stderr is
+    /// merged into the drained pipe rather than left in a separate unread
+    /// pipe — an interactive shell's rc-file output can otherwise fill an
+    /// unread pipe's buffer and hang the child process indefinitely.
+    private static func shellCapturedPath(_ command: String) async -> String? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+                process.arguments = ["-i", "-l", "-c", command]
+                let pipe = Pipe()
+                process.standardOutput = pipe
+                process.standardError = pipe
+                do {
+                    try process.run()
+                } catch {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                guard process.terminationStatus == 0,
+                      let text = String(data: data, encoding: .utf8) else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                let path = text
+                    .split(separator: "\n")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .last(where: { $0.hasPrefix("/") })
+                continuation.resume(returning: path)
+            }
+        }
+    }
+
+    /// GUI apps on macOS are launched by launchd/LaunchServices with a bare
+    /// environment (`PATH=/usr/bin:/bin:/usr/sbin:/sbin`, no `.zshrc`/`.zprofile`
+    /// exports) — provider API keys referenced from settings as `${SOME_KEY}`
+    /// only exist in the user's login shell environment, so `mothx serve`
+    /// launched with `Process`'s default (inherited) environment can fail to
+    /// resolve them, causing provider calls to fail. This captures the login
+    /// shell's full environment once and merges it over the app's own, so the
+    /// child process sees the same variables the user's Terminal would.
+    private static func loginShellEnvironment() async -> [String: String] {
+        if let cachedLoginShellEnvironment { return cachedLoginShellEnvironment }
+        let env = await withCheckedContinuation { (continuation: CheckedContinuation<[String: String], Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+                process.arguments = ["-i", "-l", "-c", "env -0"]
+                let pipe = Pipe()
+                process.standardOutput = pipe
+                process.standardError = pipe
+                do {
+                    try process.run()
+                } catch {
+                    continuation.resume(returning: ProcessInfo.processInfo.environment)
+                    return
+                }
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                guard process.terminationStatus == 0,
+                      let text = String(data: data, encoding: .utf8) else {
+                    continuation.resume(returning: ProcessInfo.processInfo.environment)
+                    return
+                }
+                var merged = ProcessInfo.processInfo.environment
+                for entry in text.split(separator: "\0") {
+                    guard let separator = entry.firstIndex(of: "=") else { continue }
+                    let key = String(entry[entry.startIndex..<separator])
+                    let value = String(entry[entry.index(after: separator)...])
+                    merged[key] = value
+                }
+                continuation.resume(returning: merged)
+            }
+        }
+        cachedLoginShellEnvironment = env
+        return env
     }
 }
 

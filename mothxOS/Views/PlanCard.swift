@@ -2,6 +2,7 @@ import SwiftUI
 
 struct PlanCard: View {
     @Environment(\.colorScheme) private var colorScheme
+    @EnvironmentObject private var languageStore: LanguageStore
     let plan: MothxPlan
     let isRunning: Bool
 
@@ -15,7 +16,7 @@ struct PlanCard: View {
                     .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(.blue)
 
-                Text(plan.title.isEmpty ? "任务计划" : plan.title)
+                Text(plan.title.isEmpty ? languageStore.copy.taskPlan : plan.title)
                     .font(.subheadline.weight(.semibold))
 
                 Spacer()
@@ -26,12 +27,12 @@ struct PlanCard: View {
                             .fill(.blue)
                             .frame(width: 6, height: 6)
                             .opacity(blinkOpacity)
-                        Text("执行中")
+                        Text(languageStore.copy.planRunning)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                 } else {
-                    Text("已完成")
+                    Text(languageStore.copy.statusCompleted)
                         .font(.caption)
                         .foregroundStyle(.green)
                 }
