@@ -60,7 +60,11 @@ final class LocalProjectStore {
     }
 
     func createProject(name: String, workDir: String) throws -> MothxProject {
-        let project = MothxProject(id: UUID().uuidString.lowercased(), name: name, workDir: workDir)
+        return try createProject(id: UUID().uuidString.lowercased(), name: name, workDir: workDir)
+    }
+
+    func createProject(id: String, name: String, workDir: String) throws -> MothxProject {
+        let project = MothxProject(id: id, name: name, workDir: workDir)
         let statement = try prepare("INSERT INTO projects (id, name, work_dir, created_at) VALUES (?, ?, ?, ?)")
         defer { sqlite3_finalize(statement) }
         try bind(project.id, to: statement, index: 1)
@@ -71,12 +75,25 @@ final class LocalProjectStore {
         return project
     }
 
+    func replaceProjectID(oldID: String, newID: String) throws {
+        try execute("UPDATE project_sessions SET project_id = ? WHERE project_id = ?", bindings: [newID, oldID])
+        try execute("UPDATE projects SET id = ? WHERE id = ?", bindings: [newID, oldID])
+    }
+
     func updateProject(id: String, name: String, workDir: String) throws {
         let statement = try prepare("UPDATE projects SET name = ?, work_dir = ? WHERE id = ?")
         defer { sqlite3_finalize(statement) }
         try bind(name, to: statement, index: 1)
         try bind(workDir, to: statement, index: 2)
         try bind(id, to: statement, index: 3)
+        guard sqlite3_step(statement) == SQLITE_DONE else { throw LocalProjectStoreError.writeFailed }
+    }
+
+    func updateProjectName(id: String, name: String) throws {
+        let statement = try prepare("UPDATE projects SET name = ? WHERE id = ?")
+        defer { sqlite3_finalize(statement) }
+        try bind(name, to: statement, index: 1)
+        try bind(id, to: statement, index: 2)
         guard sqlite3_step(statement) == SQLITE_DONE else { throw LocalProjectStoreError.writeFailed }
     }
 

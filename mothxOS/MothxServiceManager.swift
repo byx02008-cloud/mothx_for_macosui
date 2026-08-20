@@ -344,12 +344,22 @@ final class MothxServiceManager: ObservableObject {
         guard state == .connected else { return }
 
         var hadLocalProjectLoadError = false
+        var localProjects: [MothxProject] = []
         do {
             guard let localProjectStore else { throw LocalProjectStoreUnavailable() }
-            projects = try localProjectStore.projects()
+            localProjects = try localProjectStore.projects()
         } catch {
             hadLocalProjectLoadError = true
             settingsError = copy.loadLocalProjectsFailedPrefix(describe(error))
+        }
+
+        do {
+            projects = try await synchronizeProjects(localProjects: localProjects)
+        } catch {
+            if !hadLocalProjectLoadError {
+                settingsError = copy.loadLocalProjectsFailedPrefix(describe(error))
+            }
+            projects = localProjects
         }
 
         do {
@@ -364,25 +374,16 @@ final class MothxServiceManager: ObservableObject {
                 if page.isEmpty || page.count < 200 || (total > 0 && loadedSessions.count >= total) { break }
                 offset += page.count
             }
-            var projectIDsBySession = (try? localProjectStore?.projectIDsBySession()) ?? [:]
-            let linkedProjectIDs = Set(projectIDsBySession.values)
-            for project in projects where !project.workDir.isEmpty && !linkedProjectIDs.contains(project.id) {
-                let candidates = loadedSessions.filter {
-                    projectIDsBySession[$0.id] == nil && $0.workDir == project.workDir
-                }
-                // Repair only an unambiguous relationship that was created by
-                // the earlier database schema bug. Do not guess when several
-                // existing sessions share the same working directory.
-                if candidates.count == 1, let session = candidates.first {
-                    try? localProjectStore?.assign(sessionID: session.id, to: project.id)
-                    projectIDsBySession[session.id] = project.id
+            // Migrate the old desktop-only links once by projecting them into
+            // mothx metadata. From this point on, the server response is the
+            // only source of session/project membership.
+            if let localProjectStore {
+                let legacyLinks = (try? localProjectStore.projectIDsBySession()) ?? [:]
+                for (sessionID, projectID) in legacyLinks where projects.contains(where: { $0.id == projectID }) {
+                    _ = try? await setSessionProject(sessionID: sessionID, projectID: projectID)
                 }
             }
-            sessions = loadedSessions.map { session in
-                var session = session
-                session.projectID = projectIDsBySession[session.id]
-                return session
-            }
+            sessions = loadedSessions
             if !hadLocalProjectLoadError { settingsError = nil }
         } catch {
             settingsError = copy.loadSessionsFailedPrefix(describe(error))
@@ -399,6 +400,47 @@ final class MothxServiceManager: ObservableObject {
         await loadInstalledSkills()
     }
 
+    private func synchronizeProjects(localProjects: [MothxProject]) async throws -> [MothxProject] {
+        guard let localProjectStore else { throw LocalProjectStoreUnavailable() }
+        let remoteData = try await request(path: "api/projects", method: "GET")
+        var remoteProjects = decodeProjects(remoteData)
+        let remoteIDs = Set(remoteProjects.map(\.id))
+
+        // Legacy desktop projects have UUIDs that mothx does not know. Create
+        // their remote counterparts and retain their existing work directory.
+        for localProject in localProjects where !remoteIDs.contains(localProject.id) {
+            let body = try jsonData(["name": localProject.name])
+            let createdData = try await request(path: "api/projects", method: "POST", body: body)
+            guard let created = decodeProject(createdData) else { throw SettingsLoadError.invalidResponse }
+            try localProjectStore.replaceProjectID(oldID: localProject.id, newID: created.id)
+            remoteProjects.append(MothxProject(id: created.id, name: created.name, workDir: localProject.workDir))
+        }
+
+        // The previous loop changed IDs in SQLite; rebuild the map using the
+        // persisted rows so imported and migrated projects share one shape.
+        let localByID = Dictionary(uniqueKeysWithValues: try localProjectStore.projects().map { ($0.id, $0) })
+        for remoteProject in remoteProjects where localByID[remoteProject.id] == nil {
+            _ = try localProjectStore.createProject(id: remoteProject.id, name: remoteProject.name, workDir: "")
+        }
+
+        let persisted = try localProjectStore.projects()
+        for remoteProject in remoteProjects {
+            if let local = persisted.first(where: { $0.id == remoteProject.id }), local.name != remoteProject.name {
+                try localProjectStore.updateProjectName(id: remoteProject.id, name: remoteProject.name)
+            }
+        }
+        return remoteProjects.map { remote in
+            let local = persisted.first(where: { $0.id == remote.id })
+            return MothxProject(id: remote.id, name: remote.name, workDir: local?.workDir ?? "")
+        }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    @discardableResult
+    private func setSessionProject(sessionID: String, projectID: String?) async throws -> Data {
+        let body = try jsonData(["projectId": projectID ?? ""])
+        return try await request(path: "api/sessions/\(sessionID)/metadata", method: "PATCH", body: body)
+    }
+
     func fetchStats(path: String) async -> Data? {
         do {
             return try await request(path: path, method: "GET")
@@ -413,7 +455,10 @@ final class MothxServiceManager: ObservableObject {
               !workDir.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         do {
             guard let localProjectStore else { throw LocalProjectStoreUnavailable() }
-            let project = try localProjectStore.createProject(name: name, workDir: workDir)
+            let body = try jsonData(["name": name])
+            let data = try await request(path: "api/projects", method: "POST", body: body)
+            guard let remoteProject = decodeProject(data) else { throw SettingsLoadError.invalidResponse }
+            let project = try localProjectStore.createProject(id: remoteProject.id, name: remoteProject.name, workDir: workDir)
             projects.append(project)
             return project
         } catch {
@@ -425,6 +470,8 @@ final class MothxServiceManager: ObservableObject {
     func updateProject(id: String, name: String, workDir: String) async {
         do {
             guard let localProjectStore else { throw LocalProjectStoreUnavailable() }
+            let body = try jsonData(["name": name])
+            _ = try await request(path: "api/projects/\(id)", method: "PATCH", body: body)
             try localProjectStore.updateProject(id: id, name: name, workDir: workDir)
             guard let index = projects.firstIndex(where: { $0.id == id }) else { return }
             projects[index].name = name
@@ -437,6 +484,7 @@ final class MothxServiceManager: ObservableObject {
     func deleteProject(id: String) async {
         do {
             guard let localProjectStore else { throw LocalProjectStoreUnavailable() }
+            _ = try await request(path: "api/projects/\(id)", method: "DELETE")
             try localProjectStore.deleteProject(id: id)
             projects.removeAll { $0.id == id }
             sessions = sessions.map { session in
@@ -458,10 +506,6 @@ final class MothxServiceManager: ObservableObject {
         // mothx has no empty-session endpoint. The returned ID is submitted
         // with the first real run and becomes persistent at that point.
         let session = MothxSession(id: UUID().uuidString.lowercased(), title: "New session", projectID: projectID, updatedAt: nil, workDir: nil)
-        if let projectID {
-            do { try localProjectStore?.assign(sessionID: session.id, to: projectID) }
-            catch { settingsError = copy.saveSessionProjectLinkFailedPrefix(describe(error)) }
-        }
         pendingSessions[session.id] = session
         return session
     }
@@ -529,6 +573,7 @@ final class MothxServiceManager: ObservableObject {
         isRunning = true
         runExistingMessageIDs = Set((messagesBySession[sessionID] ?? []).map(\.id))
         runStartedAt = Date()
+        let pendingProjectID = pendingSessions[sessionID]?.projectID
         do {
             var payload: [String: Any] = ["message": message, "mode": mode, "transcript": true]
             if !model.isEmpty { payload["model"] = model }
@@ -551,6 +596,13 @@ final class MothxServiceManager: ObservableObject {
                 runStatus = "failed"
                 runError = copy.noRunIDReturned
                 return nil
+            }
+            if let projectID = pendingProjectID {
+                do {
+                    _ = try await setSessionProject(sessionID: sessionID, projectID: projectID)
+                } catch {
+                    settingsError = copy.saveSessionProjectLinkFailedPrefix(describe(error))
+                }
             }
             currentRunID = runID
             if cancelRequested {
