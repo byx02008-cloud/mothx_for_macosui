@@ -10,16 +10,11 @@ struct Sidebar: View {
     @Binding var appearanceMode: String
     @State private var expandedProjects: Set<String> = []
     @State private var pendingDelete: SidebarDelete?
-    @State private var showAllSessions = false
     @State private var showServiceLogs = false
     @State private var showStats = false
     @State private var showConnectionMenu = false
     @State private var showAppearanceMenu = false
     @State private var isRefreshing = false
-
-    private var allSessions: [MothxSession] {
-        (mothx.sessions + Array(mothx.pendingSessions.values)).sorted { ($0.updatedAt ?? "") > ($1.updatedAt ?? "") }
-    }
 
     var body: some View {
         let c = languageStore.copy
@@ -55,19 +50,7 @@ struct Sidebar: View {
                     ForEach(mothx.projects) { project in
                         ProjectTreeRow(project: project, expanded: expandedProjects.contains(project.id), selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID, showSettings: $showSettings, toggle: { toggle(project.id) }, addSession: { let session = mothx.prepareSession(projectID: project.id); selectedSessionID = session.id; selectedProjectID = project.id; showSettings = false }, delete: { pendingDelete = .project(project.id) })
                     }
-                    Divider().padding(.vertical, 12)
-                    HStack {
-                        Text(c.sessions.uppercased()).sectionLabel()
-                        Spacer()
-                        if allSessions.count > 10 { Button(showAllSessions ? c.showRecent : c.showMore) { showAllSessions.toggle() }.font(.caption).buttonStyle(.plain).hoverHighlight().foregroundStyle(.orange) }
-                    }
-                    ForEach(showAllSessions ? allSessions : Array(allSessions.prefix(10))) { session in
-                        SessionTreeRow(session: session, selected: selectedSessionID == session.id) {
-                            selectedSessionID = session.id
-                            selectedProjectID = session.projectID
-                            showSettings = false
-                        } delete: { pendingDelete = .session(session.id) }
-                    }
+                    UnassignedProjectTreeRow(selectedSessionID: $selectedSessionID, showSettings: $showSettings)
                 }
             }
             Spacer()
@@ -166,14 +149,47 @@ struct Sidebar: View {
         case .project(let id):
             await mothx.deleteProject(id: id)
             if selectedProjectID == id { selectedProjectID = nil; selectedSessionID = nil }
-        case .session(let id):
-            await mothx.deleteSession(id: id)
-            if selectedSessionID == id { selectedSessionID = nil }
         }
     }
 }
 
-enum SidebarDelete { case project(String); case session(String) }
+enum SidebarDelete { case project(String) }
+
+struct UnassignedProjectTreeRow: View {
+    @EnvironmentObject private var mothx: MothxServiceManager
+    @EnvironmentObject private var languageStore: LanguageStore
+    @Binding var selectedSessionID: String?
+    @Binding var showSettings: Bool
+    @State private var expanded = true
+
+    private var sessions: [MothxSession] {
+        (mothx.sessions + Array(mothx.pendingSessions.values))
+            .filter { $0.projectID == nil }
+            .sorted { ($0.updatedAt ?? "") > ($1.updatedAt ?? "") }
+            .prefix(10).map { $0 }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Button { expanded.toggle() } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right").font(.caption2).frame(width: 14)
+                    Label(languageStore.copy.unassignedProject, systemImage: "tray")
+                    Spacer()
+                }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+            }.buttonStyle(.plain).hoverHighlight().padding(.vertical, 6)
+            if expanded {
+                ForEach(sessions) { session in
+                    SessionTreeRow(session: session, selected: selectedSessionID == session.id, select: {
+                        selectedSessionID = session.id
+                        showSettings = false
+                    }, delete: { Task { await mothx.deleteSession(id: session.id) } })
+                }
+                if sessions.isEmpty { Text(languageStore.copy.noSessions).font(.caption).foregroundStyle(.tertiary).padding(.leading, 27).padding(.vertical, 4) }
+            }
+        }
+    }
+}
 
 
 struct ProjectTreeRow: View {

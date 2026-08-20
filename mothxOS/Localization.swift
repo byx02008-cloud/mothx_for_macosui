@@ -27,6 +27,12 @@ struct Copy {
     var providers: String { text("运营商", "Providers") }
     var skills: String { text("技能", "Skills") }
     var sessions: String { text("会话", "Sessions") }
+    var allSessions: String { text("所有会话", "All sessions") }
+    var allSessionsSubtitle: String { text("查看和删除 mothx 中的全部会话", "View and delete all mothx sessions") }
+    var noSessions: String { text("暂无会话", "No sessions") }
+    var unassignedSession: String { text("未归属项目", "No project") }
+    var projectSession: String { text("已归属项目", "Assigned to a project") }
+    var unassignedProject: String { text("未归属项目", "Unassigned") }
     var globalDefaults: String { text("全局默认", "Global defaults") }
     var defaultProvider: String { text("默认运营商", "Default provider") }
     var defaultModel: String { text("默认模型", "Default model") }
@@ -218,6 +224,8 @@ struct Copy {
     var envCheckChecking: String { text("正在检测…", "Checking…") }
     var envCheckNodeLabel: String { text("Node.js", "Node.js") }
     var envCheckMothxLabel: String { text("mothx", "mothx") }
+    var envCheckSyncLabel: String { text("同步项目与会话", "Sync projects and sessions") }
+    var envCheckSyncFailed: String { text("项目与会话同步失败，请重试。", "Project and session sync failed. Please retry.") }
     var envCheckPassed: String { text("环境检查通过", "Environment check passed") }
     var installNodeMissingTitle: String { text("未检测到 Node.js", "Node.js not found") }
     var installNodeMissingMessage: String { text("mothx 通过 npm 分发，需要先安装 Node.js（其中包含 npm）才能继续。", "mothx is distributed via npm, which requires Node.js. Install Node.js first to continue.") }

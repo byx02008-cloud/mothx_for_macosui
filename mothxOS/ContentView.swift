@@ -24,7 +24,7 @@ struct ContentView: View {
             Sidebar(selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID, showSettings: $showSettings, showNewProject: $showNewProject, appearanceMode: $appearanceMode)
             Divider()
             if showSettings {
-                SettingsView(showSettings: $showSettings)
+                SettingsView(showSettings: $showSettings, selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID)
             } else {
                 WorkspaceView(prompt: $prompt, sessionID: selectedSessionID)
             }

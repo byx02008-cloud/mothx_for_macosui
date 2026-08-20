@@ -5,6 +5,8 @@ struct SettingsView: View {
     @EnvironmentObject private var mothx: MothxServiceManager
     @EnvironmentObject private var languageStore: LanguageStore
     @Binding var showSettings: Bool
+    @Binding var selectedProjectID: String?
+    @Binding var selectedSessionID: String?
     @State private var providerID = ""
     @State private var draft = MothxProviderConfig()
     @State private var modelID = ""
@@ -49,7 +51,7 @@ struct SettingsView: View {
                 } else if section == "skills" {
                     SkillsSection(skillsDir: $skillsDir)
                 } else if section == "sessions" {
-                    SessionsSection(sessionDir: $sessionDir)
+                    SessionsSection(sessionDir: $sessionDir, showSettings: $showSettings, selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID)
                 } else {
                     AboutSection()
                 }
@@ -215,10 +217,52 @@ struct SkillsSection: View { @EnvironmentObject private var mothx: MothxServiceM
     var body: some View { let c = languageStore.copy; return SettingsCard(title: c.skills, subtitle: c.text("对应 settings.json 的 skillsDir 和 skillHub", "settings.json skillsDir and skillHub")) { SettingsField(title: c.skillsDirectory, text: $skillsDir, placeholder: c.defaultSkillsDir); Text(c.skillHubHint).font(.caption).foregroundStyle(.secondary); Button(c.saveSkills) { Task { await mothx.saveSkillsAndSession(skillsDir: skillsDir, sessionDir: mothx.sessionDir) } }.buttonStyle(.borderedProminent).tint(.orange) } }
 }
 
-struct SessionsSection: View { @EnvironmentObject private var mothx: MothxServiceManager; @EnvironmentObject private var languageStore: LanguageStore; @Binding var sessionDir: String
-    var body: some View { let c = languageStore.copy; return SettingsCard(title: c.sessions, subtitle: c.text("对应 settings.json 的 sessionDir", "settings.json sessionDir")) { SettingsField(title: c.sessionDirectory, text: $sessionDir, placeholder: c.defaultSessionDir); Button(c.saveSessions) { Task { await mothx.saveSkillsAndSession(skillsDir: mothx.skillsDir, sessionDir: sessionDir) } }.buttonStyle(.borderedProminent).tint(.orange) } }
-}
+struct SessionsSection: View {
+    @EnvironmentObject private var mothx: MothxServiceManager
+    @EnvironmentObject private var languageStore: LanguageStore
+    @Binding var sessionDir: String
+    @Binding var showSettings: Bool
+    @Binding var selectedProjectID: String?
+    @Binding var selectedSessionID: String?
 
+    private var allSessions: [MothxSession] { (mothx.sessions + Array(mothx.pendingSessions.values)).sorted { ($0.updatedAt ?? "") > ($1.updatedAt ?? "") } }
+
+    var body: some View {
+        let c = languageStore.copy
+        return VStack(alignment: .leading, spacing: 18) {
+            SettingsCard(title: c.sessions, subtitle: c.text("对应 settings.json 的 sessionDir", "settings.json sessionDir")) {
+                SettingsField(title: c.sessionDirectory, text: $sessionDir, placeholder: c.defaultSessionDir)
+                Button(c.saveSessions) { Task { await mothx.saveSkillsAndSession(skillsDir: mothx.skillsDir, sessionDir: sessionDir) } }.buttonStyle(.borderedProminent).tint(.orange)
+            }
+            SettingsCard(title: c.allSessions, subtitle: c.allSessionsSubtitle) {
+                if allSessions.isEmpty { Text(c.noSessions).font(.callout).foregroundStyle(.secondary) }
+                ForEach(allSessions) { session in
+                    HStack(spacing: 10) {
+                        Button {
+                            selectedSessionID = session.id
+                            selectedProjectID = session.projectID
+                            showSettings = false
+                        } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(session.title).lineLimit(1)
+                                Text(session.projectID == nil ? c.unassignedSession : c.projectSession).font(.caption).foregroundStyle(.secondary)
+                            }.frame(maxWidth: .infinity, alignment: .leading)
+                        }.buttonStyle(.plain)
+                        Button {
+                            Task {
+                                await mothx.deleteSession(id: session.id)
+                                if selectedSessionID == session.id {
+                                    selectedSessionID = nil
+                                    selectedProjectID = nil
+                                }
+                            }
+                        } label: { Image(systemName: "trash").foregroundStyle(.red.opacity(0.8)) }.buttonStyle(.plain)
+                    }.padding(10).background(Color.primary.opacity(0.08)).clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+            }
+        }
+    }
+}
 struct ProviderSection: View { @EnvironmentObject private var languageStore: LanguageStore; @Binding var provider: MothxProviderConfig
     var body: some View { let c = languageStore.copy; return SettingsCard(title: c.provider, subtitle: c.text("对应 providers.<providerId>", "providers.<providerId>")) { SettingsField(title: c.providerID, text: $provider.id, placeholder: "openai"); SettingsField(title: c.vendor, text: $provider.vendor, placeholder: "optional adapter name"); SettingsField(title: c.apiProtocol, text: $provider.api, placeholder: "openai-chat"); SettingsField(title: c.baseURL, text: $provider.baseUrl, placeholder: "https://api.example.com/v1"); SettingsField(title: c.apiKey, text: $provider.apiKey, placeholder: "${PROVIDER_API_KEY}", secure: true); SettingsField(title: c.httpProxy, text: $provider.httpProxy, placeholder: "optional"); Toggle(c.forceHTTP11, isOn: $provider.forceHTTP11); SettingsField(title: c.thinkingFormat, text: $provider.thinkingFormat, placeholder: "optional") } }
 }

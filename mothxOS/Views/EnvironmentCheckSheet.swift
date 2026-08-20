@@ -44,6 +44,7 @@ struct EnvironmentCheckSheet: View {
             VStack(alignment: .leading, spacing: 8) {
                 checklistRow(label: c.envCheckNodeLabel, state: nodeState)
                 checklistRow(label: c.envCheckMothxLabel, state: mothxState)
+                checklistRow(label: c.envCheckSyncLabel, state: syncCheckState)
             }
 
             switch phase {
@@ -68,9 +69,17 @@ struct EnvironmentCheckSheet: View {
             Spacer(minLength: 0)
         }
         .padding(24)
-        .frame(width: 520, height: 420)
+        .frame(width: 520, height: 450)
         .interactiveDismissDisabled()
         .task { await runChecklist() }
+    }
+
+    private var syncCheckState: CheckState {
+        switch mothx.workspaceSyncState {
+        case .pending: return .pending
+        case .passed: return .passed
+        case .failed: return .failed
+        }
     }
 
     @ViewBuilder
@@ -209,7 +218,13 @@ struct EnvironmentCheckSheet: View {
         await mothx.connectAtLaunch()
         languageStore.update(setting: mothx.tuilang)
         await mothx.loadWorkspace()
-        isPresented = false
+        if mothx.workspaceSyncState == .passed {
+            phase = .allPassed
+            try? await Task.sleep(for: .seconds(2))
+            isPresented = false
+        } else {
+            phase = .failed(languageStore.copy.envCheckSyncFailed)
+        }
     }
 
     private static func commandExists(_ command: String) async -> Bool {

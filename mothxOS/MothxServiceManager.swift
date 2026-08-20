@@ -1,6 +1,12 @@
 import Combine
 import Foundation
 
+enum WorkspaceSyncState: Equatable {
+    case pending
+    case passed
+    case failed
+}
+
 
 private struct MothxHealthResponse: Decodable {
     let status: String
@@ -49,6 +55,7 @@ final class MothxServiceManager: ObservableObject {
     @Published private(set) var sessionDir = ""
     @Published private(set) var projects: [MothxProject] = []
     @Published private(set) var sessions: [MothxSession] = []
+    @Published private(set) var workspaceSyncState: WorkspaceSyncState = .pending
     @Published private(set) var activeSessions: [MothxSession] = []
     @Published private(set) var messagesBySession: [String: [MothxMessage]] = [:]
     @Published private(set) var historicalRunsByMessage: [String: [String: MothxRunSummary]] = [:]
@@ -342,6 +349,8 @@ final class MothxServiceManager: ObservableObject {
 
     func loadWorkspace() async {
         guard state == .connected else { return }
+        workspaceSyncState = .pending
+        var syncSucceeded = true
 
         var hadLocalProjectLoadError = false
         var localProjects: [MothxProject] = []
@@ -349,6 +358,7 @@ final class MothxServiceManager: ObservableObject {
             guard let localProjectStore else { throw LocalProjectStoreUnavailable() }
             localProjects = try localProjectStore.projects()
         } catch {
+            syncSucceeded = false
             hadLocalProjectLoadError = true
             settingsError = copy.loadLocalProjectsFailedPrefix(describe(error))
         }
@@ -386,6 +396,7 @@ final class MothxServiceManager: ObservableObject {
             sessions = loadedSessions
             if !hadLocalProjectLoadError { settingsError = nil }
         } catch {
+            syncSucceeded = false
             settingsError = copy.loadSessionsFailedPrefix(describe(error))
         }
 
@@ -393,11 +404,13 @@ final class MothxServiceManager: ObservableObject {
             let data = try await request(path: "api/sessions/active", method: "GET")
             activeSessions = decodeSessions(data)
         } catch {
+            syncSucceeded = false
             activeSessions = []
             if settingsError == nil { settingsError = copy.loadActiveSessionFailedPrefix(describe(error)) }
         }
 
         await loadInstalledSkills()
+        workspaceSyncState = syncSucceeded ? .passed : .failed
     }
 
     private func synchronizeProjects(localProjects: [MothxProject]) async throws -> [MothxProject] {
