@@ -47,8 +47,10 @@ final class MothxServiceManager: ObservableObject {
     @Published private(set) var activeSessions: [MothxSession] = []
     @Published private(set) var messagesBySession: [String: [MothxMessage]] = [:]
     @Published private(set) var historicalRunsByMessage: [String: [String: MothxRunSummary]] = [:]
+    @Published private(set) var thinkingBySession: [String: String] = [:]
     @Published private(set) var pendingSessions: [String: MothxSession] = [:]
     @Published private(set) var isSubmittingRun = false
+    @Published private(set) var isStreaming = false
     @Published private(set) var runError: String?
     @Published private(set) var runStatus: String?
     @Published private(set) var runElapsed: TimeInterval = 0
@@ -65,6 +67,7 @@ final class MothxServiceManager: ObservableObject {
     private var runStartedAt: Date?
     private var runExistingMessageIDs: Set<String> = []
     private var cancelRequested = false
+    private var runEventTask: Task<Void, Never>?
     @Published private(set) var currentRunID: String?
     @Published private(set) var sessionModels: [String: String] = [:]
     @Published private(set) var serviceLog = ""
@@ -408,12 +411,14 @@ final class MothxServiceManager: ObservableObject {
         }
     }
 
-    func loadMessages(sessionID: String) async {
+    @discardableResult
+    func loadMessages(sessionID: String) async -> [MothxMessage] {
         do {
             let data = try await request(path: "api/sessions/\(sessionID)/messages?limit=200", method: "GET")
             let messages = decodeMessages(data)
             messagesBySession[sessionID] = messages
             await loadHistoricalRuns(sessionID: sessionID, messages: messages)
+            startRunEventStream(sessionID: sessionID)
             if sessionID == runSessionID {
                 runReplyMessageID = messages.first { message in
                     message.role != "user" && !runExistingMessageIDs.contains(message.id)
@@ -424,14 +429,17 @@ final class MothxServiceManager: ObservableObject {
                let plan = MothxPlan.parse(from: planMsg.arguments) {
                 currentPlan = plan
             }
+            return messages
         } catch {
             settingsError = "读取会话消息失败：\(error.localizedDescription)"
+            return []
         }
     }
 
     func submitRun(sessionID: String, message: String, images: [String], workDir: String = "", model: String = "", mode: String = "agent", tools: [String] = [], skills: [String] = []) async -> String? {
         guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !images.isEmpty else { return nil }
         isSubmittingRun = true
+        isStreaming = true
         cancelRequested = false
         runError = nil
         runStatus = "queued"
@@ -441,6 +449,7 @@ final class MothxServiceManager: ObservableObject {
         currentRunID = nil
         currentPlan = nil
         currentRunningMessageID = nil
+        thinkingBySession[sessionID] = ""
         isRunning = true
         runExistingMessageIDs = Set((messagesBySession[sessionID] ?? []).map(\.id))
         runStartedAt = Date()
@@ -483,10 +492,13 @@ final class MothxServiceManager: ObservableObject {
 
     func cancelRun() async {
         cancelRequested = true
+        isSubmittingRun = false
+        isStreaming = false
         guard let runID = currentRunID else { return }
         do {
             _ = try await request(path: "api/runs/\(runID)/cancel", method: "POST")
             runStatus = "cancelled"
+            runElapsed = elapsedSinceRunStart()
         } catch {
             runError = "停止运行失败：\(error.localizedDescription)"
             settingsError = runError
@@ -497,8 +509,15 @@ final class MothxServiceManager: ObservableObject {
         defer {
             runElapsed = elapsedSinceRunStart()
             isSubmittingRun = false
-            isRunning = false
             currentRunningMessageID = nil
+            // Keep isRunning and isStreaming for a grace period so the stop
+            // button and status indicators remain visible while the final
+            // response text appears via typewriter.
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(3))
+                isRunning = false
+                isStreaming = false
+            }
         }
         for _ in 0..<120 {
             runElapsed = elapsedSinceRunStart()
@@ -507,10 +526,14 @@ final class MothxServiceManager: ObservableObject {
                 let object = (try JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
                 let status = object["status"] as? String ?? object["state"] as? String ?? "running"
                 runStatus = status
-                await loadMessages(sessionID: sessionID)
+                let messages = await loadMessages(sessionID: sessionID)
                 // Track current running message for typewriter effect
                 if let replyID = runReplyMessageID {
                     currentRunningMessageID = replyID
+                }
+                // Also track the last assistant message explicitly
+                if let lastAssistant = messages.last(where: { $0.isAssistant }) {
+                    currentRunningMessageID = lastAssistant.id
                 }
                 if ["completed", "succeeded", "failed", "error", "cancelled", "canceled"].contains(status.lowercased()) {
                     if ["failed", "error"].contains(status.lowercased()) { runError = object["error"] as? String ?? object["errorMessage"] as? String ?? "Agent run failed" }
@@ -539,17 +562,43 @@ final class MothxServiceManager: ObservableObject {
             guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let values = object["runs"] as? [[String: Any]] else { return }
 
-            let runs = values.compactMap(decodeRunSummary).sorted {
+            // The API returns newest-first and may contain multiple attempts
+            // for one user turn. Keep only the latest attempt per intent, then
+            // restore chronological order before pairing with transcript turns.
+            let decodedRuns = values.compactMap(decodeRunSummary)
+            var latestByIntent: [String: MothxRunSummary] = [:]
+            var noIntentRuns: [MothxRunSummary] = []
+            for run in decodedRuns {
+                guard let intentID = run.intentID, !intentID.isEmpty else {
+                    noIntentRuns.append(run)
+                    continue
+                }
+                if latestByIntent[intentID] == nil { latestByIntent[intentID] = run }
+            }
+            let runs = (Array(latestByIntent.values) + noIntentRuns).sorted {
                 ($0.startedAt ?? .distantPast) < ($1.startedAt ?? .distantPast)
             }
-            let assistantMessages = messages.filter { $0.role.lowercased() == "assistant" }
-            guard runs.count == assistantMessages.count else {
-                // Without a run/message identifier, an unequal count is not
-                // safe to align; leave the historical status rows hidden.
-                historicalRunsByMessage[sessionID] = [:]
-                return
+            // A run maps to a user turn, not necessarily to an assistant
+            // message: cancelled/tool-only turns have no assistant result.
+            var turnMessageIDs: [String] = []
+            var seenUser = false
+            for message in messages {
+                if message.isUser {
+                    // The user entry is the stable anchor for every turn,
+                    // including cancelled runs with no assistant message.
+                    turnMessageIDs.append(message.id)
+                    seenUser = true
+                    continue
+                }
+                guard seenUser else { continue }
             }
-            historicalRunsByMessage[sessionID] = Dictionary(uniqueKeysWithValues: zip(assistantMessages, runs).map { ($0.0.id, $0.1) })
+            let pairCount = min(runs.count, turnMessageIDs.count)
+            guard pairCount > 0 else { return }
+            var mapping: [String: MothxRunSummary] = [:]
+            for i in 0..<pairCount {
+                mapping[turnMessageIDs[i]] = runs[i]
+            }
+            historicalRunsByMessage[sessionID] = mapping
         } catch {
             // Historical metadata is optional and must not prevent messages
             // from being displayed when an older server lacks this endpoint.
@@ -562,12 +611,44 @@ final class MothxServiceManager: ObservableObject {
               let status = (item["Status"] as? String) ?? (item["status"] as? String) else { return nil }
         return MothxRunSummary(
             id: id,
+            intentID: (item["IntentID"] as? String) ?? (item["intentId"] as? String) ?? (item["intentID"] as? String),
             status: status,
             startedAt: parseDate(item["StartedAt"] ?? item["startedAt"]),
             finishedAt: parseDate(item["FinishedAt"] ?? item["finishedAt"]),
             updatedAt: parseDate(item["UpdatedAt"] ?? item["updatedAt"]),
             error: (item["Error"] as? String) ?? (item["error"] as? String)
         )
+    }
+
+    private func startRunEventStream(sessionID: String) {
+        runEventTask?.cancel()
+        runEventTask = Task { [weak self] in
+            guard let self else { return }
+            var request = URLRequest(url: URL(string: "ws://127.0.0.1:7872/ws/runs")!)
+            request.setValue("http://127.0.0.1:7872/", forHTTPHeaderField: "Origin")
+            let socket = URLSession.shared.webSocketTask(with: request)
+            socket.resume()
+            defer { socket.cancel(with: .goingAway, reason: nil) }
+            do {
+                try await socket.send(.string("{\"type\":\"hello\",\"clientId\":\"mothxOS\"}"))
+                let subscription = "{\"type\":\"subscribe\",\"subscriptions\":[{\"sessionId\":\"\(sessionID)\",\"cursor\":{\"seq\":0}}]}"
+                try await socket.send(.string(subscription))
+                while !Task.isCancelled {
+                    let message = try await socket.receive()
+                    guard case .string(let text) = message,
+                          let data = text.data(using: .utf8),
+                          let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          object["stream"] as? String == "transcript",
+                          let eventData = object["data"] as? [String: Any],
+                          eventData["type"] as? String == "thinking_delta",
+                          let messageObject = eventData["message"] as? [String: Any],
+                          let delta = messageObject["content"] as? String else { continue }
+                    await MainActor.run {
+                        self.thinkingBySession[sessionID, default: ""] += delta
+                    }
+                }
+            } catch { }
+        }
     }
 
     private func parseDate(_ value: Any?) -> Date? {
@@ -638,7 +719,8 @@ final class MothxServiceManager: ObservableObject {
                 createdAt: item["createdAt"] as? String
             )
         }.filter { msg in
-            !msg.content.isEmpty || msg.isToolCall || msg.isToolResult
+            if msg.isToolCall || msg.isToolResult { return true }
+            return !msg.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
     }
 

@@ -185,6 +185,7 @@ struct ProjectTreeRow: View {
     @State private var showEditor = false
     @State private var editedName = ""
     @State private var editedWorkDir = ""
+    @State private var isHovered = false
     private var projectSessions: [MothxSession] {
         let pending = Array(mothx.pendingSessions.values)
         return (mothx.sessions + pending)
@@ -205,15 +206,20 @@ struct ProjectTreeRow: View {
                         Spacer(minLength: 0)
                     }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
                 }.buttonStyle(.plain).hoverHighlight()
-                Spacer()
-                Button(action: addSession) { Image(systemName: "plus") }.buttonStyle(.plain).hoverHighlight().help(languageStore.copy.addSession)
-                Button {
-                    editedName = project.name
-                    editedWorkDir = project.workDir
-                    showEditor = true
-                } label: { Image(systemName: "pencil") }.buttonStyle(.plain).hoverHighlight().help(languageStore.copy.text("编辑项目", "Edit project"))
-                Button(action: delete) { Image(systemName: "trash") }.buttonStyle(.plain).hoverHighlight().foregroundStyle(.red.opacity(0.75))
-            }.padding(.vertical, 6).foregroundStyle(.primary)
+                if isHovered {
+                    Spacer()
+                    Button(action: addSession) { Image(systemName: "plus") }.buttonStyle(.plain).hoverHighlight().help(languageStore.copy.addSession)
+                    Button {
+                        editedName = project.name
+                        editedWorkDir = project.workDir
+                        showEditor = true
+                    } label: { Image(systemName: "pencil") }.buttonStyle(.plain).hoverHighlight().help(languageStore.copy.text("编辑项目", "Edit project"))
+                    Button(action: delete) { Image(systemName: "trash") }.buttonStyle(.plain).hoverHighlight().foregroundStyle(.red.opacity(0.75))
+                }
+            }
+            .padding(.vertical, 6)
+            .foregroundStyle(.primary)
+            .onHover { isHovered = $0 }
             if expanded {
                 ForEach(projectSessions) { session in
                     SessionTreeRow(session: session, selected: selectedSessionID == session.id, select: {
@@ -266,10 +272,38 @@ struct ProjectTreeRow: View {
 
 struct SessionTreeRow: View {
     let session: MothxSession; let selected: Bool; let select: () -> Void; let delete: () -> Void
-    var body: some View { HStack { Button(action: select) { Label(session.title, systemImage: "bubble.left").lineLimit(1).frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle()) }.buttonStyle(.plain).hoverHighlight(); Button(action: delete) { Image(systemName: "trash").font(.caption).foregroundStyle(.red.opacity(0.7)) }.buttonStyle(.plain).hoverHighlight() }.padding(.leading, 24).padding(.vertical, 5).padding(.horizontal, 7).background(selected ? Color.primary.opacity(0.1) : .clear).clipShape(RoundedRectangle(cornerRadius: 6)).foregroundStyle(selected ? .primary : .secondary) }
+    @State private var isHovered = false
+
+    var body: some View {
+        HStack {
+            Button(action: select) {
+                Label(session.title, systemImage: "bubble.left")
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .hoverHighlight()
+            if isHovered {
+                Button(action: delete) {
+                    Image(systemName: "trash")
+                        .font(.caption)
+                        .foregroundStyle(.red.opacity(0.7))
+                }
+                .buttonStyle(.plain)
+                .hoverHighlight()
+            }
+        }
+        .padding(.leading, 24)
+        .padding(.vertical, 5)
+        .padding(.horizontal, 7)
+        .background(selected ? Color.primary.opacity(0.1) : .clear)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .foregroundStyle(selected ? .primary : .secondary)
+        .onHover { isHovered = $0 }
+    }
 }
 
 struct SidebarItem: View { let title: String; let icon: String; let selected: Bool; let action: () -> Void
     var body: some View { Button(action: action) { Label(title, systemImage: icon).font(.system(size: 13)).frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 8).padding(.horizontal, 10).background(selected ? Color.primary.opacity(0.1) : .clear).clipShape(RoundedRectangle(cornerRadius: 6)).contentShape(Rectangle()) }.buttonStyle(.plain).frame(maxWidth: .infinity, alignment: .leading).hoverHighlight().foregroundStyle(selected ? .primary : .secondary) }
 }
-

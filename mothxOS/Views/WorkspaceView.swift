@@ -13,6 +13,9 @@ struct WorkspaceView: View {
     @State private var attachmentError: String?
     @State private var currentTurns: [Turn] = []
     @State private var expandedTurnIDs: Set<UUID> = []
+    @State private var isConversationAtBottom = true
+
+    private let conversationBottomID = "conversation-bottom"
 
     private var currentModels: [MothxModelConfig] {
         let provider = mothx.providers.first(where: { $0.id == mothx.defaultProvider }) ?? mothx.providers.first
@@ -31,49 +34,81 @@ struct WorkspaceView: View {
             Divider()
 
             if let sessionID {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 14) {
-                        let isRunActive = mothx.runSessionID == sessionID && mothx.isRunning
+                GeometryReader { viewport in
+                    ScrollViewReader { reader in
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 6) {
+                                let isRunActive = mothx.runSessionID == sessionID && mothx.isRunning
 
-                        ForEach(currentTurns) { turn in
-                            TurnBlock(
-                                turn: turn,
-                                sessionID: sessionID,
-                                isExpanded: expandedTurnIDs.contains(turn.id),
-                                onToggle: { toggleTurn(turn) }
+                                ForEach(currentTurns) { turn in
+                                    TurnBlock(
+                                        turn: turn,
+                                        sessionID: sessionID,
+                                        isExpanded: expandedTurnIDs.contains(turn.id),
+                                        onToggle: { toggleTurn(turn) }
+                                    )
+                                }
+
+                                // Thinking indicator + status when running but no messages yet
+                                if isRunActive, currentTurns.isEmpty {
+                                    if mothx.runStatus == "queued" || mothx.runStatus == "running" {
+                                        ThinkingIndicator(isActive: true)
+                                    }
+                                    if mothx.runStatus != nil,
+                                       let status = mothx.runStatus {
+                                        StatusInline(
+                                            status: status,
+                                            elapsed: mothx.runElapsed,
+                                            error: mothx.runError
+                                        )
+                                    }
+                                }
+
+                                if isRunActive,
+                                   let thinking = mothx.thinkingBySession[sessionID],
+                                   !thinking.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                    ThinkingContentView(text: thinking)
+                                }
+
+                                Color.clear
+                                    .frame(height: 1)
+                                    .id(conversationBottomID)
+                            }
+                            .frame(maxWidth: 760, alignment: .leading)
+                            .padding(28)
+                            .frame(maxWidth: .infinity)
+                            .background(
+                                ConversationScrollObserver { atBottom in
+                                    isConversationAtBottom = atBottom
+                                }
                             )
                         }
-
-                        // Thinking indicator + status when running but no messages yet
-                        if isRunActive, currentTurns.isEmpty {
-                            if mothx.runReplyMessageID == nil, mothx.runStatus == "running" {
-                                ThinkingIndicator(isActive: true)
-                            }
-                            if mothx.runStatus != nil, mothx.runReplyMessageID == nil,
-                               let status = mothx.runStatus {
-                                StatusInline(
-                                    status: status,
-                                    elapsed: mothx.runElapsed,
-                                    error: mothx.runError
-                                )
+                        .coordinateSpace(name: "conversation-scroll")
+                        .onChange(of: mothx.messagesBySession[sessionID] ?? []) { _, _ in
+                            scrollToBottom(reader, animated: false)
+                        }
+                        .onChange(of: mothx.thinkingBySession[sessionID] ?? "") { _, _ in
+                            if mothx.runSessionID == sessionID, mothx.isRunning {
+                                scrollToBottom(reader, animated: true)
                             }
                         }
-
-                        // Status when run active but no reply in last turn
-                        if isRunActive,
-                           mothx.runStatus != nil,
-                           mothx.runReplyMessageID == nil,
-                           !currentTurns.isEmpty {
-                            StatusInline(
-                                status: mothx.runStatus ?? "",
-                                elapsed: mothx.runElapsed,
-                                error: mothx.runError
-                            )
+                        .onChange(of: mothx.runStatus) { _, _ in
+                            if mothx.runSessionID == sessionID, mothx.isRunning {
+                                scrollToBottom(reader, animated: true)
+                            }
+                        }
+                        .onAppear {
+                            scrollToBottom(reader, animated: false)
+                        }
+                        .overlay(alignment: .bottom) {
+                            if !isConversationAtBottom {
+                                ConversationScrollButton(isRunning: mothx.runSessionID == sessionID && mothx.isRunning) {
+                                    scrollToBottom(reader, animated: true)
+                                }
+                                .padding(.bottom, 12)
+                            }
                         }
                     }
-                    .frame(maxWidth: 760, alignment: .leading)
-                    .padding(28)
-                    .frame(maxWidth: .infinity)
                 }
 
                 // PlanCard pinned above composer (conditionally shown)
@@ -98,7 +133,7 @@ struct WorkspaceView: View {
                 selectedSkills: $selectedSkills,
                 selectedTools: $selectedTools,
                 models: currentModels,
-                isRunning: mothx.isSubmittingRun,
+                isRunning: mothx.isSubmittingRun || mothx.isStreaming,
                 chooseFiles: chooseFiles,
                 submit: submit,
                 stop: { Task { await mothx.cancelRun() } }
@@ -129,6 +164,27 @@ struct WorkspaceView: View {
                 if let lastID = currentTurns.last?.id {
                     expandedTurnIDs.insert(lastID)
                 }
+            }
+        }
+    }
+
+    private func scrollToBottom(_ reader: ScrollViewProxy, animated: Bool) {
+        let action = {
+            reader.scrollTo(conversationBottomID, anchor: .bottom)
+        }
+        if animated {
+            withAnimation(.easeOut(duration: 0.2), action)
+        } else {
+            action()
+        }
+        // ScrollViewReader can receive the request before LazyVStack has
+        // committed its new document height. Repeat after the layout pass so
+        // the native scrollbar and the SwiftUI target agree on the same bottom.
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: 0.2), action)
+            } else {
+                action()
             }
         }
     }
@@ -384,19 +440,19 @@ struct PromptComposer: View {
                     Button { attachments.removeAll() } label: { Image(systemName: "xmark") }.buttonStyle(.plain).hoverHighlight()
                 }.padding(.horizontal, 12).padding(.top, 10)
             }
-            TextEditor(text: $prompt)
-                .font(.body)
-                .scrollContentBackground(.hidden)
+            RetSubmitTextEditor(text: $prompt, placeholder: c.askAnything, isRunning: isRunning, onSubmit: submit)
                 .frame(height: editorHeight)
                 .padding(.horizontal, 12)
                 .padding(.top, 12)
-                .onKeyPress(.return, phases: .down) { keyPress in
-                    guard keyPress.modifiers.isEmpty else { return .ignored }
-                    guard !isRunning else { return .handled }
-                    submit()
-                    return .handled
+                .overlay(alignment: .topLeading) {
+                    if prompt.isEmpty {
+                        Text(c.askAnything)
+                            .foregroundStyle(.tertiary)
+                            .padding(.leading, 17)
+                            .padding(.top, 11)
+                            .allowsHitTesting(false)
+                    }
                 }
-                .overlay(alignment: .topLeading) { if prompt.isEmpty { Text(c.askAnything).foregroundStyle(.tertiary).padding(.leading, 17).padding(.top, 11).allowsHitTesting(false) } }
             HStack(spacing: 10) {
                 Button {
                     plusSubmenu = nil
@@ -535,4 +591,220 @@ struct PromptComposer: View {
 
 struct Suggestion: View { let title: String; let icon: String
     var body: some View { Label(title, systemImage: icon).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 12).padding(.vertical, 8).background(Color.primary.opacity(0.06)).clipShape(Capsule()) }
+}
+
+private struct ThinkingContentView: View {
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label("思考中", systemImage: "brain.head.profile")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.orange)
+            Text(text)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(10)
+        .background(Color.orange.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct ConversationScrollObserver: NSViewRepresentable {
+    let onBottomChanged: (Bool) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onBottomChanged: onBottomChanged)
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        view.postsFrameChangedNotifications = false
+        context.coordinator.attach(to: view)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.onBottomChanged = onBottomChanged
+        context.coordinator.attach(to: nsView)
+    }
+
+    final class Coordinator {
+        var onBottomChanged: (Bool) -> Void
+        weak var observedScrollView: NSScrollView?
+        var boundsObserver: NSObjectProtocol?
+
+        init(onBottomChanged: @escaping (Bool) -> Void) {
+            self.onBottomChanged = onBottomChanged
+        }
+
+        func attach(to view: NSView) {
+            DispatchQueue.main.async { [weak self, weak view] in
+                guard let self, let view,
+                      let scrollView = Self.findScrollView(from: view) else { return }
+                guard self.observedScrollView !== scrollView else {
+                    self.updateBottomState()
+                    return
+                }
+                if let boundsObserver = self.boundsObserver {
+                    NotificationCenter.default.removeObserver(boundsObserver)
+                }
+                self.observedScrollView = scrollView
+                scrollView.contentView.postsBoundsChangedNotifications = true
+                self.boundsObserver = NotificationCenter.default.addObserver(
+                    forName: NSView.boundsDidChangeNotification,
+                    object: scrollView.contentView,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.updateBottomState()
+                }
+                self.updateBottomState()
+            }
+        }
+
+        func updateBottomState() {
+            guard let scrollView = observedScrollView,
+                  let documentView = scrollView.documentView else { return }
+            // Convert the visible rect into document coordinates. Comparing
+            // contentView.bounds directly with documentView.bounds is wrong
+            // when the scroll view is flipped or has a non-zero origin.
+            let visibleRect = documentView.convert(
+                scrollView.contentView.bounds,
+                from: scrollView.contentView
+            )
+            let visibleBottom = visibleRect.maxY
+            let documentBottom = documentView.bounds.maxY
+            // Account for the bottom content inset and sub-pixel rounding.
+            let atBottom = documentBottom - visibleBottom <= 50
+            onBottomChanged(atBottom)
+        }
+
+        static func findScrollView(from view: NSView) -> NSScrollView? {
+            var current: NSView? = view
+            while let candidate = current {
+                if let scrollView = candidate as? NSScrollView { return scrollView }
+                current = candidate.superview
+            }
+            return nil
+        }
+
+        deinit {
+            if let boundsObserver {
+                NotificationCenter.default.removeObserver(boundsObserver)
+            }
+        }
+    }
+}
+
+private struct ConversationScrollButton: View {
+    let isRunning: Bool
+    let action: () -> Void
+    @State private var animationPhase = false
+
+    var body: some View {
+        Button(action: action) {
+            if isRunning {
+                HStack(spacing: 5) {
+                    ForEach(0..<3, id: \.self) { index in
+                        Circle()
+                            .fill(Color.secondary)
+                            .frame(width: 6, height: 6)
+                            .scaleEffect(animationPhase ? 1.0 : 0.62)
+                            .opacity(animationPhase ? 1.0 : 0.45)
+                            .animation(
+                                .easeInOut(duration: 0.65)
+                                    .repeatForever(autoreverses: true)
+                                    .delay(Double(index) * 0.13),
+                                value: animationPhase
+                            )
+                    }
+                }
+            } else {
+                Image(systemName: "arrow.down")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .buttonStyle(.plain)
+        .frame(width: 44, height: 44)
+        .background(.regularMaterial, in: Circle())
+        .overlay(Circle().stroke(Color.primary.opacity(0.12), lineWidth: 1))
+        .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+        .help(isRunning ? "正在输出，滚动到底部" : "滚动到底部")
+        .onAppear {
+            if isRunning { animationPhase = true }
+        }
+        .onChange(of: isRunning) { _, running in
+            animationPhase = running
+        }
+    }
+}
+// MARK: - TextEditor that submits on Enter (Shift+Enter for newline)
+
+private struct RetSubmitTextEditor: NSViewRepresentable {
+    @Binding var text: String
+    let placeholder: String
+    let isRunning: Bool
+    let onSubmit: () -> Void
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSTextView.scrollableTextView()
+        guard let textView = scrollView.documentView as? NSTextView else { return scrollView }
+        textView.delegate = context.coordinator
+        textView.isRichText = false
+        textView.font = .preferredFont(forTextStyle: .body)
+        textView.drawsBackground = false
+        textView.autoresizingMask = [.width]
+        textView.isVerticallyResizable = true
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.lineBreakMode = .byWordWrapping
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? NSTextView else { return }
+        context.coordinator.parent = self
+        if textView.string != text {
+            textView.string = text
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: RetSubmitTextEditor
+        var isInternalUpdate = false
+
+        init(_ parent: RetSubmitTextEditor) {
+            self.parent = parent
+        }
+
+        func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            let commandName = NSStringFromSelector(commandSelector)
+            if commandName == "insertNewline:" ||
+                commandName == "insertNewlineIgnoringFieldEditor:" ||
+                commandName == "insertLineBreak:" {
+                // Shift+Enter → insert newline
+                if let event = NSApp.currentEvent, event.modifierFlags.contains(.shift) {
+                    return false
+                }
+                guard !parent.isRunning else { return true }
+                parent.text = textView.string
+                parent.onSubmit()
+                return true
+            }
+            return false
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            guard !isInternalUpdate else { return }
+            parent.text = textView.string
+        }
+    }
 }

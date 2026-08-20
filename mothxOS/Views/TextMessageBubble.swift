@@ -42,8 +42,11 @@ struct TextMessageBubble: View {
             else { displayedCharCount = message.displayText.count }
         }
         .onChange(of: message.displayText) { _, newText in
-            if isCurrentRunning && displayedCharCount < newText.count { displayedCharCount = newText.count }
-            else if !isCurrentRunning { displayedCharCount = newText.count }
+            // When running, let the typewriter timer naturally catch up.
+            // Only jump to end when not running or when the run is done.
+            if !isCurrentRunning {
+                displayedCharCount = newText.count
+            }
         }
         .onDisappear { typewriterTimer?.invalidate(); typewriterTimer = nil }
     }
