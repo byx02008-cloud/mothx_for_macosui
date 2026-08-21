@@ -10,6 +10,7 @@ struct MothxMessage: Identifiable, Hashable {
     let toolCallId: String?    // toolCall & toolResult
     let toolName: String?      // toolCall & toolResult
     let arguments: String      // JSON string (toolCall)
+    let plan: MothxPlan?       // structured plan projection (toolCall)
     let summary: String?       // toolResult summary (short)
     let hasDetail: Bool        // toolResult: whether full content is available via API
     let createdAt: String?
@@ -39,20 +40,48 @@ struct MothxMessage: Identifiable, Hashable {
 // MARK: - Plan
 
 struct MothxPlanStep: Identifiable, Hashable {
-    let id = UUID()
+    let id: String
     let title: String
     let status: String
 }
 
 struct MothxPlan: Identifiable, Hashable {
-    let id = UUID()
+    let id: String
     let title: String
     let steps: [MothxPlanStep]
     let note: String?
+
+    var isComplete: Bool { !steps.isEmpty && steps.allSatisfy { $0.status == "done" } }
+    var hasFailedStep: Bool { steps.contains { $0.status == "failed" } }
 }
 
 extension MothxPlan {
+    static func parse(from object: Any) -> MothxPlan? {
+        guard JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        return parse(from: text)
+    }
+
     static func parse(from text: String) -> MothxPlan? {
+        // Plan tool arguments are persisted as structured JSON. Keep the
+        // line-based parser below for older transcript projections.
+        if let data = text.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let rawSteps = object["steps"] as? [[String: Any]], !rawSteps.isEmpty {
+            let title = (object["title"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let note = (object["note"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let steps = rawSteps.enumerated().compactMap { index, raw -> MothxPlanStep? in
+                guard let stepTitle = raw["title"] as? String,
+                      let rawStatus = raw["status"] as? String else { return nil }
+                let status = rawStatus.lowercased()
+                guard !stepTitle.isEmpty, ["pending", "running", "done", "failed"].contains(status) else { return nil }
+                return MothxPlanStep(id: "\(index)-\(stepTitle)", title: stepTitle, status: status)
+            }
+            guard !steps.isEmpty else { return nil }
+            return MothxPlan(id: title + "|" + steps.map(\.title).joined(separator: "|"), title: title, steps: steps, note: note?.isEmpty == true ? nil : note)
+        }
+
         let lines = text.components(separatedBy: .newlines)
         var title = ""
         var steps: [MothxPlanStep] = []
@@ -71,10 +100,10 @@ extension MothxPlan {
                 let stepTitle = String(trimmed[statusEnd.upperBound...]).trimmingCharacters(in: .whitespaces)
                 let status = String(statusPart).lowercased()
                 guard !stepTitle.isEmpty, ["pending","running","done","failed"].contains(status) else { continue }
-                steps.append(MothxPlanStep(title: stepTitle, status: status))
+                steps.append(MothxPlanStep(id: "\(steps.count)-\(stepTitle)", title: stepTitle, status: status))
             }
         }
         guard !steps.isEmpty else { return nil }
-        return MothxPlan(title: title, steps: steps, note: note)
+        return MothxPlan(id: title + "|" + steps.map(\.title).joined(separator: "|"), title: title, steps: steps, note: note)
     }
 }

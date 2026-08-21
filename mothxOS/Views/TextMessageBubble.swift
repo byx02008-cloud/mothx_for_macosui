@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 struct TextMessageBubble: View {
@@ -27,8 +28,13 @@ struct TextMessageBubble: View {
             HStack(alignment: .top, spacing: 10) {
                 if !isUser { Image("MothxLogo").resizable().scaledToFit().frame(width: 18, height: 18) }
                 VStack(alignment: .leading, spacing: 0) {
-                    Text(displayText.isEmpty ? (isUser ? "…" : "Thinking…") : displayText)
-                        .textSelection(.enabled).frame(maxWidth: 560, alignment: .leading)
+                    if !isUser && !isCurrentRunning && !displayText.isEmpty {
+                        MarkdownMessageText(markdown: displayText)
+                    } else {
+                        Text(displayText.isEmpty ? (isUser ? "…" : "Thinking…") : displayText)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: 560, alignment: .leading)
+                    }
                     if isTyping {
                         Rectangle().fill(Color.primary.opacity(0.6)).frame(width: 8, height: 16)
                             .opacity(blinkOpacity).padding(.leading, 2).padding(.top, -16)
@@ -91,4 +97,148 @@ struct TextMessageBubble: View {
 
     private var assistantBackground: Color { colorScheme == .light ? .white : .codexCard }
     private var userBackground: Color { colorScheme == .light ? Color(red: 0.94, green: 0.94, blue: 0.95) : Color.orange.opacity(0.18) }
+}
+
+/// Renders a completed assistant response as Markdown while keeping a plain-text
+/// fallback for malformed or unsupported Markdown input.
+private struct MarkdownMessageText: View {
+    let markdown: String
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(segments) { segment in
+                if segment.isCodeBlock {
+                    Text(segment.content)
+                        .font(.system(.body, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                        .background(codeBackground)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                } else if !segment.content.isEmpty {
+                    if let attributedString = attributedString(for: segment.content) {
+                        Text(attributedString)
+                    } else {
+                        Text(segment.content)
+                    }
+                }
+            }
+        }
+        .textSelection(.enabled)
+        .frame(maxWidth: 560, alignment: .leading)
+    }
+
+    private var codeBackground: Color {
+        colorScheme == .light ? Color.black.opacity(0.06) : Color.white.opacity(0.09)
+    }
+
+    private var segments: [MarkdownSegment] {
+        let pattern = "```[\\s\\S]*?```"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return [MarkdownSegment(content: markdown, isCodeBlock: false)]
+        }
+
+        let matches = regex.matches(in: markdown, range: NSRange(markdown.startIndex..., in: markdown))
+        var result: [MarkdownSegment] = []
+        var cursor = markdown.startIndex
+        for match in matches {
+            guard let range = Range(match.range, in: markdown) else { continue }
+            if cursor < range.lowerBound {
+                result.append(MarkdownSegment(content: String(markdown[cursor..<range.lowerBound]), isCodeBlock: false))
+            }
+            result.append(MarkdownSegment(content: codeContent(from: String(markdown[range])), isCodeBlock: true))
+            cursor = range.upperBound
+        }
+        if cursor < markdown.endIndex {
+            result.append(MarkdownSegment(content: String(markdown[cursor...]), isCodeBlock: false))
+        }
+        return result.isEmpty ? [MarkdownSegment(content: markdown, isCodeBlock: false)] : result
+    }
+
+    private func codeContent(from fencedBlock: String) -> String {
+        var lines = fencedBlock.components(separatedBy: "\n")
+        if !lines.isEmpty { lines.removeFirst() }
+        if lines.last?.trimmingCharacters(in: .whitespacesAndNewlines) == "```" {
+            lines.removeLast()
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func attributedString(for markdown: String) -> AttributedString? {
+        let normalized = normalizedMarkdown(for: markdown)
+        if let parsed = try? AttributedString(
+            markdown: normalized,
+            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
+        ) {
+            return parsed
+        }
+
+        // A malformed fragment should not make the entire historical message
+        // fall back to raw Markdown. Parse each line independently so valid
+        // formatting in the rest of the response is still rendered.
+        let lines = normalized.components(separatedBy: "\n")
+        var result = AttributedString()
+        for (index, line) in lines.enumerated() {
+            if let parsedLine = try? AttributedString(
+                markdown: line,
+                options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
+            ) {
+                result += parsedLine
+            } else {
+                result += AttributedString(line)
+            }
+            if index < lines.count - 1 { result += AttributedString("\n") }
+        }
+        return result
+    }
+
+    /// Some model responses put whitespace inside emphasis delimiters, for
+    /// example `** text **`. Normalize those delimiters before parsing while
+    /// leaving code spans and fenced code blocks byte-for-byte unchanged.
+    private func normalizedMarkdown(for markdown: String) -> String {
+        let protectedCodePattern = "```[\\s\\S]*?```|`[^`\\n]*`"
+        guard let protectedCodeRegex = try? NSRegularExpression(pattern: protectedCodePattern) else {
+            return normalizeEmphasis(in: markdown)
+        }
+
+        let matches = protectedCodeRegex.matches(in: markdown, range: NSRange(markdown.startIndex..., in: markdown))
+        var output = ""
+        var cursor = markdown.startIndex
+        for match in matches {
+            guard let range = Range(match.range, in: markdown) else { continue }
+            output += normalizeEmphasis(in: String(markdown[cursor..<range.lowerBound]))
+            output += String(markdown[range])
+            cursor = range.upperBound
+        }
+        output += normalizeEmphasis(in: String(markdown[cursor...]))
+        return output
+    }
+
+    private func normalizeEmphasis(in text: String) -> String {
+        let patternsAndTemplates = [
+            (#"\*\*[\t\p{Zs}]+([^*\n]*?[^\s\p{Zs}])[\t\p{Zs}]+\*\*"#, "**$1**"),
+            (#"__[\t\p{Zs}]+([^_\n]*?[^\s\p{Zs}])[\t\p{Zs}]+__"#, "__$1__"),
+            (#"(?<!\*)\*[\t\p{Zs}]+([^*\n]*?[^\s\p{Zs}])[\t\p{Zs}]+\*(?!\*)"#, "*$1*"),
+            (#"(?<![_A-Za-z0-9])_[\t\p{Zs}]+([^_\n]*?[^\s\p{Zs}])[\t\p{Zs}]+_(?![_A-Za-z0-9])"#, "_$1_")
+        ]
+
+        var normalized = text
+        for (pattern, template) in patternsAndTemplates {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(normalized.startIndex..., in: normalized)
+            normalized = regex.stringByReplacingMatches(
+                in: normalized,
+                range: range,
+                withTemplate: template
+            )
+        }
+        return normalized
+    }
+}
+
+private struct MarkdownSegment: Identifiable {
+    let id = UUID()
+    let content: String
+    let isCodeBlock: Bool
 }

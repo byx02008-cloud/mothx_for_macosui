@@ -25,7 +25,7 @@ struct Turn: Identifiable {
                 id: msg.id, seq: msg.seq, role: msg.role,
                 content: msg.content.trimmingCharacters(in: .whitespacesAndNewlines),
                 toolCallId: msg.toolCallId, toolName: msg.toolName,
-                arguments: msg.arguments, summary: msg.summary,
+                arguments: msg.arguments, plan: msg.plan, summary: msg.summary,
                 hasDetail: msg.hasDetail, createdAt: msg.createdAt
             )
         }

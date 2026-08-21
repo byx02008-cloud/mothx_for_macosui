@@ -25,6 +25,7 @@ struct Copy {
     var settings: String { text("设置", "Settings") }
     var general: String { text("常规", "General") }
     var providers: String { text("运营商", "Providers") }
+    var imageGeneration: String { text("图片生成", "Image Generation") }
     var skills: String { text("技能", "Skills") }
     var sessions: String { text("会话", "Sessions") }
     var allSessions: String { text("所有会话", "All sessions") }
@@ -54,6 +55,15 @@ struct Copy {
     var apiProtocol: String { text("API 协议", "API protocol") }
     var baseURL: String { "Base URL" }
     var apiKey: String { text("API 密钥", "API key") }
+    var imageGenerationEnabled: String { text("启用图片生成", "Enable image generation") }
+    var imageGenerationProvider: String { text("图片生成 Provider", "Image generation provider") }
+    var imageGenerationAPIType: String { text("图片生成 API 类型", "Image generation API type") }
+    var imageGenerationToken: String { text("图片生成 Token", "Image generation token") }
+    var imageGenerationModel: String { text("图片生成模型", "Image generation model") }
+    var imageGenerationSubtitle: String { text("对应 settings.json 的 imageGeneration", "settings.json imageGeneration") }
+    var imageGenerationSave: String { text("保存图片生成设置", "Save image generation settings") }
+    var imageGenerationAPIImages: String { "openai-images" }
+    var imageGenerationAPIResponses: String { "openai-responses" }
     var httpProxy: String { "HTTP proxy" }
     var thinkingFormat: String { text("思考格式", "Thinking format") }
     var modelID: String { text("模型 ID", "Model ID") }
@@ -68,6 +78,8 @@ struct Copy {
     var cancel: String { text("取消", "Cancel") }
     var searchProviders: String { text("搜索运营商", "Search providers") }
     var searchModels: String { text("搜索模型", "Search models") }
+    var noProvidersFound: String { text("没有匹配的运营商", "No matching providers") }
+    var noModelsFound: String { text("没有匹配的模型", "No matching models") }
     func deleteProjectMessage(_ name: String) -> String { text("删除项目 \(name)？项目及其关联关系将在确认后删除。", "Delete project \(name)? The project and its associations will be removed after confirmation.") }
     func deleteSessionMessage(_ id: String?) -> String {
         guard let id, !id.isEmpty else { return text("删除此会话？会话记录将在确认后删除。", "Delete this session? Its conversation history will be removed after confirmation.") }
@@ -78,6 +90,8 @@ struct Copy {
     var projects: String { text("项目", "Projects") }
     var addProject: String { text("添加项目", "Add project") }
     var addSession: String { text("添加会话", "Add session") }
+    var editProject: String { text("编辑项目", "Edit project") }
+    var moveToProject: String { text("移入项目", "Move to project") }
     var showMore: String { text("更多", "More") }
     var showRecent: String { text("最近会话", "Recent") }
     var newProject: String { text("新建项目", "New project") }
@@ -142,6 +156,8 @@ struct Copy {
     var statusFailed: String { text("失败", "Failed") }
     var statusCancelled: String { text("已取消", "Cancelled") }
     var statusTimeout: String { text("超时", "Timed out") }
+    var statusWaitingApproval: String { text("等待确认", "Waiting for approval") }
+    var statusWaitingQuestion: String { text("等待回答", "Waiting for answer") }
     var runRowRunning: String { text("模型处理中", "Model is processing") }
     var runRowFailed: String { text("处理失败", "Failed") }
     var runRowTimeout: String { text("等待超时", "Timed out waiting") }

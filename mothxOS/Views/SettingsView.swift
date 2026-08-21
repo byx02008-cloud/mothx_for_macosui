@@ -19,6 +19,7 @@ struct SettingsView: View {
     @State private var defaultMode = "agent"
     @State private var skillsDir = ""
     @State private var sessionDir = ""
+    @State private var imageGeneration = MothxImageGenerationConfig()
     @State private var language = "auto"
     @State private var section = "providers"
     @State private var pendingDeletion: DeletionRequest?
@@ -49,6 +50,8 @@ struct SettingsView: View {
                     }
                 } else if section == "general" {
                     GeneralSection(language: $language)
+                } else if section == "imageGeneration" {
+                    ImageGenerationSection(config: $imageGeneration)
                 } else if section == "skills" {
                     SkillsSection(skillsDir: $skillsDir)
                 } else if section == "sessions" {
@@ -85,7 +88,7 @@ struct SettingsView: View {
         } message: {
             Text(pendingDeletion?.message(using: languageStore.copy) ?? languageStore.copy.text("此操作无法撤销。", "This action cannot be undone."))
         }
-        .task { await mothx.loadSettings(); defaultProviderID = mothx.defaultProvider; defaultModelID = mothx.defaultModel; defaultThinkingLevel = mothx.defaultThinkingLevel; defaultMode = mothx.defaultMode; language = mothx.tuilang; skillsDir = mothx.skillsDir; sessionDir = mothx.sessionDir; providerID = "" }
+        .task { await mothx.loadSettings(); defaultProviderID = mothx.defaultProvider; defaultModelID = mothx.defaultModel; defaultThinkingLevel = mothx.defaultThinkingLevel; defaultMode = mothx.defaultMode; language = mothx.tuilang; skillsDir = mothx.skillsDir; sessionDir = mothx.sessionDir; imageGeneration = mothx.imageGeneration; providerID = "" }
     }
     func select(_ provider: MothxProviderConfig) { providerID = provider.id; draft = provider; modelID = provider.models.first?.id ?? ""; saved = false }
     func save() async { await mothx.saveProvider(draft, asDefault: false); saved = true }
@@ -175,7 +178,7 @@ struct SettingsNavigation: View {
     @Environment(\.colorScheme) private var colorScheme
     @EnvironmentObject private var languageStore: LanguageStore
     @Binding var section: String
-    var body: some View { let c = languageStore.copy; return VStack(alignment: .leading, spacing: 8) { Text(c.settings.uppercased()).sectionLabel().padding(.bottom, 10); SettingsNavItem(title: c.general, icon: "gearshape", id: "general", section: $section); SettingsNavItem(title: c.providers, icon: "server.rack", id: "providers", section: $section); SettingsNavItem(title: c.skills, icon: "sparkles", id: "skills", section: $section); SettingsNavItem(title: c.sessions, icon: "clock", id: "sessions", section: $section); SettingsNavItem(title: c.advancedSettings, icon: "wrench.and.screwdriver", id: "advanced", section: $section); SettingsNavItem(title: c.about, icon: "info.circle", id: "about", section: $section); Spacer() }.padding(22).frame(width: 230).background(colorScheme == .light ? .white : .codexSidebar) }
+    var body: some View { let c = languageStore.copy; return VStack(alignment: .leading, spacing: 8) { Text(c.settings.uppercased()).sectionLabel().padding(.bottom, 10); SettingsNavItem(title: c.general, icon: "gearshape", id: "general", section: $section); SettingsNavItem(title: c.providers, icon: "server.rack", id: "providers", section: $section); SettingsNavItem(title: c.imageGeneration, icon: "photo", id: "imageGeneration", section: $section); SettingsNavItem(title: c.skills, icon: "sparkles", id: "skills", section: $section); SettingsNavItem(title: c.sessions, icon: "clock", id: "sessions", section: $section); SettingsNavItem(title: c.advancedSettings, icon: "wrench.and.screwdriver", id: "advanced", section: $section); SettingsNavItem(title: c.about, icon: "info.circle", id: "about", section: $section); Spacer() }.padding(22).frame(width: 230).background(colorScheme == .light ? .white : .codexSidebar) }
 }
 
 struct SettingsNavItem: View { let title: String; let icon: String; let id: String; @Binding var section: String
@@ -256,6 +259,40 @@ struct GeneralSection: View {
                 Button(c.save) { Task { await mothx.saveLanguage(language); languageStore.update(setting: language) } }.buttonStyle(.borderedProminent).tint(.orange)
             }
             Text(c.text("语言值会保存到 mothx settings.json 的 tuilang 字段。", "The language value is saved to mothx settings.json as tuilang.")).font(.caption).foregroundStyle(.secondary)
+        }
+    }
+}
+
+struct ImageGenerationSection: View {
+    @EnvironmentObject private var mothx: MothxServiceManager
+    @EnvironmentObject private var languageStore: LanguageStore
+    @Binding var config: MothxImageGenerationConfig
+
+    var body: some View {
+        let c = languageStore.copy
+        return SettingsCard(title: c.imageGeneration, subtitle: c.imageGenerationSubtitle) {
+            Toggle(c.imageGenerationEnabled, isOn: $config.enabled)
+            SettingsField(title: c.imageGenerationProvider, text: $config.provider, placeholder: "openai")
+            HStack {
+                Text(c.imageGenerationAPIType).frame(width: 150, alignment: .leading)
+                Picker(c.imageGenerationAPIType, selection: $config.apiType) {
+                    Text(c.imageGenerationAPIImages).tag("openai-images")
+                    Text(c.imageGenerationAPIResponses).tag("openai-responses")
+                }
+                .labelsHidden()
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(10)
+            .background(Color.primary.opacity(0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            SettingsField(title: c.baseURL, text: $config.baseUrl, placeholder: "https://api.openai.com/v1")
+            SettingsField(title: c.imageGenerationToken, text: $config.token, placeholder: "${OPENAI_API_KEY}", secure: true)
+            SettingsField(title: c.imageGenerationModel, text: $config.model, placeholder: "gpt-image-1")
+            Button(c.imageGenerationSave) {
+                Task { await mothx.saveImageGeneration(config) }
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.orange)
         }
     }
 }

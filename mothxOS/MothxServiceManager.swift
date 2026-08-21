@@ -53,6 +53,7 @@ final class MothxServiceManager: ObservableObject {
     @Published private(set) var tuilang = "auto"
     @Published private(set) var skillsDir = ""
     @Published private(set) var sessionDir = ""
+    @Published private(set) var imageGeneration = MothxImageGenerationConfig()
     @Published private(set) var projects: [MothxProject] = []
     @Published private(set) var sessions: [MothxSession] = []
     @Published private(set) var workspaceSyncState: WorkspaceSyncState = .pending
@@ -342,6 +343,7 @@ final class MothxServiceManager: ObservableObject {
             tuilang = root["tuilang"] as? String ?? "auto"
             skillsDir = root["skillsDir"] as? String ?? ""
             sessionDir = root["sessionDir"] as? String ?? ""
+            imageGeneration = decodeImageGeneration(object: root["imageGeneration"] as? [String: Any])
             if providers.isEmpty && !providerObjects.isEmpty {
                 throw SettingsLoadError.noProvidersDecoded
             }
@@ -458,6 +460,24 @@ final class MothxServiceManager: ObservableObject {
         return try await request(path: "api/sessions/\(sessionID)/metadata", method: "PATCH", body: body)
     }
 
+    func moveSessionToProject(sessionID: String, projectID: String) async {
+        do {
+            _ = try await setSessionProject(sessionID: sessionID, projectID: projectID)
+            sessions = sessions.map { session in
+                var session = session
+                if session.id == sessionID { session.projectID = projectID }
+                return session
+            }
+            if let pending = pendingSessions[sessionID] {
+                var pending = pending
+                pending.projectID = projectID
+                pendingSessions[sessionID] = pending
+            }
+        } catch {
+            settingsError = copy.saveSessionProjectLinkFailedPrefix(describe(error))
+        }
+    }
+
     func fetchStats(path: String) async -> Data? {
         do {
             return try await request(path: path, method: "GET")
@@ -561,10 +581,14 @@ final class MothxServiceManager: ObservableObject {
                     message.role != "user" && !runExistingMessageIDs.contains(message.id)
                 }?.id
             }
-            // Extract plan from toolCall messages
-            if let planMsg = messages.last(where: { $0.isPlan }),
-               let plan = MothxPlan.parse(from: planMsg.arguments) {
+            // Plans are transient run UI state. Do not restore a historical
+            // plan after the server has reported a terminal Run state.
+            let terminalStatuses = ["completed", "succeeded", "failed", "error", "cancelled", "canceled", "timed_out", "timeout", "expired", "incomplete"]
+            if sessionID == runSessionID, isRunning, !terminalStatuses.contains((runStatus ?? "").lowercased()),
+               let plan = messages.last(where: { $0.isPlan && !runExistingMessageIDs.contains($0.id) })?.plan {
                 currentPlan = plan
+            } else if sessionID == runSessionID, terminalStatuses.contains((runStatus ?? "").lowercased()) {
+                currentPlan = nil
             }
             return messages
         } catch {
@@ -601,7 +625,7 @@ final class MothxServiceManager: ObservableObject {
             // Show the submitted question immediately. The API returns 202 and
             // runs the agent in the background, so the assistant message is not
             // available in the first history response yet.
-            let localMessage = MothxMessage(id: "local-\(UUID().uuidString)", seq: nil, role: "user", content: message, toolCallId: nil, toolName: nil, arguments: "", summary: nil, hasDetail: false, createdAt: nil)
+            let localMessage = MothxMessage(id: "local-\(UUID().uuidString)", seq: nil, role: "user", content: message, toolCallId: nil, toolName: nil, arguments: "", plan: nil, summary: nil, hasDetail: false, createdAt: nil)
             messagesBySession[sessionID, default: []].append(localMessage)
             let body = try jsonData(payload)
             let response = try await request(path: "api/sessions/\(sessionID)/runs", method: "POST", body: body, headers: ["Idempotency-Key": UUID().uuidString])
@@ -611,6 +635,7 @@ final class MothxServiceManager: ObservableObject {
             guard let runID else {
                 isSubmittingRun = false
                 runStatus = "failed"
+                currentPlan = nil
                 runError = copy.noRunIDReturned
                 return nil
             }
@@ -629,6 +654,7 @@ final class MothxServiceManager: ObservableObject {
         } catch {
             isSubmittingRun = false
             runStatus = "failed"
+            currentPlan = nil
             runError = describe(error)
             settingsError = copy.submitRunFailedPrefix(describe(error))
             return nil
@@ -643,11 +669,18 @@ final class MothxServiceManager: ObservableObject {
         do {
             _ = try await request(path: "api/runs/\(runID)/cancel", method: "POST")
             runStatus = "cancelled"
+            currentPlan = nil
             runElapsed = elapsedSinceRunStart()
         } catch {
             runError = copy.stopRunFailedPrefix(describe(error))
             settingsError = runError
         }
+    }
+
+    /// Plans are transient run UI state and must not be restored from history
+    /// after a run reaches any terminal state.
+    func clearCurrentPlan() {
+        currentPlan = nil
     }
 
     func pollRun(runID: String, sessionID: String) async {
@@ -664,7 +697,10 @@ final class MothxServiceManager: ObservableObject {
                 isStreaming = false
             }
         }
-        for _ in 0..<120 {
+        // The server owns the run deadline. Keep polling until the server
+        // reports a terminal state instead of applying a shorter client-side
+        // timeout that can mislabel a still-running Agent Run.
+        while !Task.isCancelled {
             runElapsed = elapsedSinceRunStart()
             do {
                 let data = try await request(path: "api/runs/\(runID)", method: "GET")
@@ -680,20 +716,22 @@ final class MothxServiceManager: ObservableObject {
                 if let lastAssistant = messages.last(where: { $0.isAssistant }) {
                     currentRunningMessageID = lastAssistant.id
                 }
-                if ["completed", "succeeded", "failed", "error", "cancelled", "canceled"].contains(status.lowercased()) {
-                    if ["failed", "error"].contains(status.lowercased()) { runError = object["error"] as? String ?? object["errorMessage"] as? String ?? copy.runFailedFallback }
+                if ["completed", "succeeded", "failed", "error", "cancelled", "canceled", "timed_out", "timeout", "expired", "incomplete"].contains(status.lowercased()) {
+                    currentPlan = nil
+                    if ["failed", "error", "timed_out", "timeout", "expired", "incomplete"].contains(status.lowercased()) {
+                        runError = object["error"] as? String ?? object["errorMessage"] as? String ?? (status.lowercased() == "incomplete" ? copy.runFailedFallback : copy.waitReplyTimeout)
+                    }
                     await loadWorkspace()
                     return
                 }
             } catch {
-                runStatus = "failed"
-                runError = describe(error)
-                return
+                // A transient polling failure is not a Run failure. The
+                // server remains the source of truth, so retry on the next
+                // tick and let the server's terminal status decide the UI.
+                settingsError = describe(error)
             }
             try? await Task.sleep(for: .milliseconds(500))
         }
-        runStatus = "timeout"
-        runError = copy.waitReplyTimeout
     }
 
     private func elapsedSinceRunStart() -> TimeInterval {
@@ -805,11 +843,20 @@ final class MothxServiceManager: ObservableObject {
                     }
                     guard object["stream"] as? String == "transcript",
                           let eventData = object["data"] as? [String: Any],
-                          eventData["type"] as? String == "thinking_delta",
-                          let messageObject = eventData["message"] as? [String: Any],
-                          let delta = messageObject["content"] as? String else { continue }
-                    await MainActor.run {
-                        self.thinkingBySession[sessionID, default: ""] += delta
+                          let messageObject = eventData["message"] as? [String: Any] else { continue }
+                    if eventData["type"] as? String == "thinking_delta",
+                       let delta = messageObject["content"] as? String {
+                        await MainActor.run {
+                            self.thinkingBySession[sessionID, default: ""] += delta
+                        }
+                    } else if eventData["type"] as? String == "plan_update",
+                              let planObject = messageObject["plan"],
+                              let plan = MothxPlan.parse(from: planObject) {
+                        await MainActor.run {
+                            if self.runSessionID == sessionID, self.isRunning {
+                                self.currentPlan = plan
+                            }
+                        }
                     }
                 }
             } catch { }
@@ -839,6 +886,7 @@ final class MothxServiceManager: ObservableObject {
             let toolCallId: String?
             let toolName: String?
             let arguments: String
+            var plan: MothxPlan?
             let summary: String?
             let hasDetail: Bool
 
@@ -857,12 +905,14 @@ final class MothxServiceManager: ObservableObject {
                             let argsStr = String(data: argsData, encoding: .utf8) { arguments = argsStr }
                     else { arguments = "\(args)" }
                 } else { arguments = "" }
+                plan = MothxPlan.parse(from: item["plan"] ?? arguments)
 
             case "toolResult":
                 content = ""
                 toolCallId = item["toolCallId"] as? String
                 toolName = item["toolName"] as? String
                 arguments = ""
+                plan = nil
                 summary = item["summary"] as? String
                 hasDetail = item["hasDetail"] as? Bool ?? false
 
@@ -872,6 +922,7 @@ final class MothxServiceManager: ObservableObject {
                 toolCallId = nil
                 toolName = nil
                 arguments = ""
+                plan = nil
                 summary = nil
                 hasDetail = false
             }
@@ -880,6 +931,7 @@ final class MothxServiceManager: ObservableObject {
                 id: id, seq: seq, role: role,
                 content: content, toolCallId: toolCallId,
                 toolName: toolName, arguments: arguments,
+                plan: plan,
                 summary: summary, hasDetail: hasDetail,
                 createdAt: item["createdAt"] as? String
             )
@@ -1000,6 +1052,17 @@ final class MothxServiceManager: ObservableObject {
         await saveGlobalSettings(["skillsDir": skillsDir, "sessionDir": sessionDir])
     }
 
+    func saveImageGeneration(_ config: MothxImageGenerationConfig) async {
+        var imageJSON = (rawSettings["imageGeneration"] as? [String: Any]) ?? [:]
+        imageJSON["enabled"] = config.enabled
+        imageJSON["provider"] = config.provider
+        imageJSON["apiType"] = config.apiType
+        imageJSON["baseUrl"] = config.baseUrl
+        imageJSON["token"] = config.token
+        imageJSON["model"] = config.model
+        await saveGlobalSettings(["imageGeneration": imageJSON])
+    }
+
     func deleteProvider(id: String) async {
         var providersJSON = (rawSettings["providers"] as? [String: Any]) ?? [:]
         providersJSON.removeValue(forKey: id)
@@ -1091,6 +1154,18 @@ final class MothxServiceManager: ObservableObject {
             throw MothxAPIError(statusCode: http.statusCode, detail: detail)
         }
         return data
+    }
+
+    private func decodeImageGeneration(object: [String: Any]?) -> MothxImageGenerationConfig {
+        guard let object else { return MothxImageGenerationConfig() }
+        return MothxImageGenerationConfig(
+            enabled: object["enabled"] as? Bool ?? false,
+            provider: object["provider"] as? String ?? "openai",
+            apiType: object["apiType"] as? String ?? "openai-images",
+            baseUrl: object["baseUrl"] as? String ?? "https://api.openai.com/v1",
+            token: object["token"] as? String ?? "",
+            model: object["model"] as? String ?? "gpt-image-1"
+        )
     }
 
     private func decodeProvider(id: String, object: [String: Any]) -> MothxProviderConfig? {

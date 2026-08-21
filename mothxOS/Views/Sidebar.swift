@@ -50,7 +50,13 @@ struct Sidebar: View {
                     ForEach(mothx.projects) { project in
                         ProjectTreeRow(project: project, expanded: expandedProjects.contains(project.id), selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID, showSettings: $showSettings, toggle: { toggle(project.id) }, addSession: { let session = mothx.prepareSession(projectID: project.id); selectedSessionID = session.id; selectedProjectID = project.id; showSettings = false }, delete: { pendingDelete = .project(project.id) }, requestDeleteSession: { pendingDelete = .session($0) })
                     }
-                    UnassignedProjectTreeRow(selectedSessionID: $selectedSessionID, showSettings: $showSettings, requestDelete: { pendingDelete = .session($0) })
+                    UnassignedProjectTreeRow(selectedSessionID: $selectedSessionID, showSettings: $showSettings, requestDelete: { pendingDelete = .session($0) }, moveToProject: { sessionID, projectID in
+                        Task {
+                            await mothx.moveSessionToProject(sessionID: sessionID, projectID: projectID)
+                            selectedProjectID = projectID
+                            expandedProjects.insert(projectID)
+                        }
+                    })
                 }
             }
             Spacer()
@@ -175,6 +181,7 @@ struct UnassignedProjectTreeRow: View {
     @Binding var selectedSessionID: String?
     @Binding var showSettings: Bool
     let requestDelete: (String) -> Void
+    let moveToProject: (String, String) -> Void
     @State private var expanded = true
     @State private var isHovered = false
 
@@ -206,7 +213,9 @@ struct UnassignedProjectTreeRow: View {
                     SessionTreeRow(session: session, selected: selectedSessionID == session.id, select: {
                         selectedSessionID = session.id
                         showSettings = false
-                    }, delete: { requestDelete(session.id) })
+                    }, delete: { requestDelete(session.id) }, moveToProject: { projectID in
+                        moveToProject(session.id, projectID)
+                    })
                 }
                 if sessions.isEmpty { Text(languageStore.copy.noSessions).font(.caption).foregroundStyle(.tertiary).padding(.leading, 27).padding(.vertical, 4) }
             }
@@ -248,12 +257,26 @@ struct ProjectTreeRow: View {
                 if isHovered {
                     Spacer()
                     Button(action: addSession) { Image(systemName: "plus") }.buttonStyle(.plain).hoverHighlight().help(languageStore.copy.addSession)
-                    Button {
-                        editedName = project.name
-                        editedWorkDir = project.workDir
-                        showEditor = true
-                    } label: { Image(systemName: "pencil") }.buttonStyle(.plain).hoverHighlight().help(languageStore.copy.text("编辑项目", "Edit project"))
-                    Button(action: delete) { Image(systemName: "trash") }.buttonStyle(.plain).hoverHighlight().foregroundStyle(.red.opacity(0.75))
+                    Menu {
+                        Button {
+                            editedName = project.name
+                            editedWorkDir = project.workDir
+                            showEditor = true
+                        } label: {
+                            Label(languageStore.copy.editProject, systemImage: "pencil")
+                        }
+                        Button(role: .destructive, action: delete) {
+                            Label(languageStore.copy.delete, systemImage: "trash")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .font(.caption)
+                            .foregroundStyle(.white)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .buttonStyle(.plain)
+                    .hoverHighlight()
+                    .help(languageStore.copy.showMore)
                 }
             }
             .padding(.vertical, 6)
@@ -269,7 +292,7 @@ struct ProjectTreeRow: View {
                         selectedProjectID = project.id
                         selectedSessionID = session.id
                         showSettings = false
-                    }, delete: { requestDeleteSession(session.id) })
+                    }, delete: { requestDeleteSession(session.id) }, moveToProject: nil)
                 }
                 if projectSessions.isEmpty {
                     Text(languageStore.copy.text("暂无会话", "No sessions yet"))
@@ -314,7 +337,10 @@ struct ProjectTreeRow: View {
 }
 
 struct SessionTreeRow: View {
+    @EnvironmentObject private var mothx: MothxServiceManager
+    @EnvironmentObject private var languageStore: LanguageStore
     let session: MothxSession; let selected: Bool; let select: () -> Void; let delete: () -> Void
+    let moveToProject: ((String) -> Void)?
     @State private var isHovered = false
 
     var body: some View {
@@ -327,13 +353,33 @@ struct SessionTreeRow: View {
             }
             .buttonStyle(.plain)
             if isHovered {
-                Button(action: delete) {
-                    Image(systemName: "trash")
+                Menu {
+                    if let moveToProject {
+                        Menu {
+                            ForEach(mothx.projects) { project in
+                                Button {
+                                    moveToProject(project.id)
+                                } label: {
+                                    Label(project.name, systemImage: "folder")
+                                }
+                            }
+                        } label: {
+                            Label(languageStore.copy.moveToProject, systemImage: "folder.badge.plus")
+                        }
+                        Divider()
+                    }
+                    Button(role: .destructive, action: delete) {
+                        Label(languageStore.copy.delete, systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
                         .font(.caption)
-                        .foregroundStyle(.red.opacity(0.7))
+                        .foregroundStyle(.white)
                 }
+                .menuStyle(.borderlessButton)
                 .buttonStyle(.plain)
                 .hoverHighlight()
+                .help(languageStore.copy.showMore)
             }
         }
         .padding(.leading, 24)

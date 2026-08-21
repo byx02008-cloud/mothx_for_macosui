@@ -5,8 +5,10 @@ struct PlanCard: View {
     @EnvironmentObject private var languageStore: LanguageStore
     let plan: MothxPlan
     let isRunning: Bool
+    let runStatus: String
+    @Binding var isCollapsed: Bool
 
-    @State private var visibleSteps: Set<UUID> = []
+    @State private var visibleSteps: Set<String> = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -27,54 +29,67 @@ struct PlanCard: View {
                             .fill(.blue)
                             .frame(width: 6, height: 6)
                             .opacity(blinkOpacity)
-                        Text(languageStore.copy.planRunning)
+                        Text(statusLabel)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondary)
                     }
-                } else {
-                    Text(languageStore.copy.statusCompleted)
-                        .font(.caption)
-                        .foregroundStyle(.green)
                 }
+
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isCollapsed.toggle()
+                    }
+                } label: {
+                    Image(systemName: isCollapsed ? "chevron.down" : "chevron.up")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(isCollapsed ? "展开计划" : "收起计划")
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
 
-            Divider()
+            if !isCollapsed {
+                Divider()
 
-            // Steps
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(Array(plan.steps.enumerated()), id: \.element.id) { index, step in
-                    if visibleSteps.contains(step.id) {
-                        PlanStepRow(step: step)
-                            .transition(
-                                .move(edge: .bottom).combined(with: .opacity)
-                            )
-                            .animation(
-                                .easeOut(duration: 0.3).delay(Double(index) * 0.08),
-                                value: visibleSteps
-                            )
+                // Steps
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(plan.steps.enumerated()), id: \.element.id) { index, step in
+                        let isVisible = visibleSteps.contains(step.id)
+                        if isVisible {
+                            PlanStepRow(step: step)
+                                .transition(
+                                    .move(edge: .bottom).combined(with: .opacity)
+                                )
+                                .animation(
+                                    .easeOut(duration: 0.3).delay(Double(index) * 0.08),
+                                    value: visibleSteps
+                                )
 
-                        if index < plan.steps.count - 1 {
-                            Divider().padding(.leading, 42)
+                            if index < plan.steps.count - 1 {
+                                Divider().padding(.leading, 42)
+                            }
                         }
                     }
                 }
-            }
 
-            // Note
-            if let note = plan.note, !note.isEmpty {
-                Divider()
-                HStack(spacing: 6) {
-                    Image(systemName: "info.circle")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                    Text(note)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                // Note
+                if let note = plan.note, !note.isEmpty {
+                    Divider()
+                    HStack(spacing: 6) {
+                        Image(systemName: "info.circle")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                        Text(note)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
             }
         }
         .background(
@@ -105,6 +120,17 @@ struct PlanCard: View {
                     _ = visibleSteps.insert(step.id)
                 }
             }
+        }
+    }
+
+    private var statusLabel: String {
+        let copy = languageStore.copy
+        switch runStatus.lowercased() {
+        case "queued": return copy.statusQueued
+        case "waiting_for_approval": return copy.statusWaitingApproval
+        case "waiting_for_question": return copy.statusWaitingQuestion
+        case "running", "in_progress": return copy.planRunning
+        default: return copy.planRunning
         }
     }
 }

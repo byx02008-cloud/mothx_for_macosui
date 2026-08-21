@@ -112,15 +112,6 @@ struct WorkspaceView: View {
                     }
                 }
 
-                // PlanCard pinned above composer (conditionally shown)
-                if mothx.runSessionID == sessionID,
-                   mothx.isRunning,
-                   let plan = mothx.currentPlan {
-                    PlanCard(plan: plan, isRunning: true)
-                        .padding(.horizontal, 25)
-                        .frame(maxWidth: 760)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
             } else {
                 Spacer(); Text(c.workspaceHint).foregroundStyle(.secondary); Spacer()
             }
@@ -258,6 +249,7 @@ struct WorkspaceView: View {
                 await mothx.pollRun(runID: runID, sessionID: sessionID)
                 await mothx.updateSessionTitle(id: sessionID, title: String((question.components(separatedBy: .newlines).first ?? question).prefix(48)))
                 await mothx.loadMessages(sessionID: sessionID)
+                mothx.clearCurrentPlan()
             }
         }
     }
@@ -448,6 +440,10 @@ struct PromptComposer: View {
     @State private var showModeMenu = false
     @State private var showProviderMenu = false
     @State private var showModelMenu = false
+    @State private var planPanelHeight: CGFloat = 0
+    @State private var planPanelCollapsed = false
+    @State private var providerSearchText = ""
+    @State private var modelSearchText = ""
 
     private let toolOptions = [("browser", "browser"), ("delegate", "delegate"), ("multi-agent", "muti-agent"), ("workflow", "workflow")]
 
@@ -458,6 +454,18 @@ struct PromptComposer: View {
 
     private var selectedProviderLabel: String {
         providerID.isEmpty ? languageStore.copy.selectProvider : providerID
+    }
+
+    private var filteredProviders: [MothxProviderConfig] {
+        let query = providerSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return providers }
+        return providers.filter { $0.id.localizedCaseInsensitiveContains(query) || $0.vendor.localizedCaseInsensitiveContains(query) }
+    }
+
+    private var filteredModels: [MothxModelConfig] {
+        let query = modelSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return models }
+        return models.filter { $0.id.localizedCaseInsensitiveContains(query) || $0.displayName.localizedCaseInsensitiveContains(query) }
     }
 
     var body: some View {
@@ -515,7 +523,10 @@ struct PromptComposer: View {
 
                 Spacer()
 
-                Button { showProviderMenu.toggle() } label: {
+                Button {
+                    providerSearchText = ""
+                    showProviderMenu.toggle()
+                } label: {
                     Text(selectedProviderLabel).font(.callout).lineLimit(1).foregroundStyle(.secondary)
                         .padding(.horizontal, 8).frame(minHeight: 42).contentShape(Rectangle())
                 }.buttonStyle(.plain).hoverHighlight()
@@ -524,9 +535,12 @@ struct PromptComposer: View {
                             if providers.isEmpty {
                                 Text(c.selectProvider).foregroundStyle(.secondary).padding(8)
                             } else {
+                                TextField(c.searchProviders, text: $providerSearchText)
+                                    .textFieldStyle(.roundedBorder)
+                                    .padding(.bottom, 4)
                                 ScrollView {
                                     VStack(alignment: .leading, spacing: 3) {
-                                        ForEach(providers) { provider in
+                                        ForEach(filteredProviders) { provider in
                                             Button {
                                                 providerID = provider.id
                                                 let preferredModel = provider.models.first?.id ?? ""
@@ -549,6 +563,9 @@ struct PromptComposer: View {
                                             .hoverHighlight()
                                             .foregroundStyle(.primary)
                                         }
+                                        if filteredProviders.isEmpty {
+                                            Text(c.noProvidersFound).foregroundStyle(.secondary).padding(8)
+                                        }
                                     }
                                 }
                                 .frame(maxHeight: 300)
@@ -556,7 +573,10 @@ struct PromptComposer: View {
                         }.padding(10).frame(width: 220, alignment: .leading)
                     }
 
-                Button { showModelMenu.toggle() } label: {
+                Button {
+                    modelSearchText = ""
+                    showModelMenu.toggle()
+                } label: {
                     Text(selectedModelLabel).font(.callout).lineLimit(1).foregroundStyle(.secondary)
                         .padding(.horizontal, 8).frame(minHeight: 42).contentShape(Rectangle())
                 }.buttonStyle(.plain).hoverHighlight()
@@ -565,9 +585,12 @@ struct PromptComposer: View {
                             if models.isEmpty {
                                 Text(c.noModelsForProvider).foregroundStyle(.secondary).padding(8)
                             } else {
+                                TextField(c.searchModels, text: $modelSearchText)
+                                    .textFieldStyle(.roundedBorder)
+                                    .padding(.bottom, 4)
                                 ScrollView {
                                     VStack(alignment: .leading, spacing: 3) {
-                                        ForEach(models) { model in
+                                        ForEach(filteredModels) { model in
                                             Button {
                                                 modelID = model.id
                                                 showModelMenu = false
@@ -575,6 +598,9 @@ struct PromptComposer: View {
                                                 HStack { Text(model.displayName).lineLimit(1); Spacer(); if modelID == model.id { Image(systemName: "checkmark") } }
                                                     .padding(.horizontal, 8).frame(maxWidth: .infinity, minHeight: 36, alignment: .leading).contentShape(Rectangle())
                                             }.buttonStyle(.plain).hoverHighlight().foregroundStyle(.primary)
+                                        }
+                                        if filteredModels.isEmpty {
+                                            Text(c.noModelsFound).foregroundStyle(.secondary).padding(8)
                                         }
                                     }
                                 }.frame(maxHeight: 300)
@@ -593,7 +619,33 @@ struct PromptComposer: View {
                     }
                 }.buttonStyle(.plain).hoverHighlight().help(isRunning ? c.stop : c.send)
             }.padding(.horizontal, 10).padding(.top, 4).padding(.bottom, 8)
-        }.background(composerBackground).clipShape(RoundedRectangle(cornerRadius: 12)).overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.12)))
+        }
+        .background(composerBackground)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.12)))
+        .overlay(alignment: .topLeading) {
+            if isRunning, let plan = mothx.currentPlan {
+                PlanCard(plan: plan, isRunning: true, runStatus: mothx.runStatus ?? "running", isCollapsed: $planPanelCollapsed)
+                    .frame(width: 380)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .background {
+                        GeometryReader { proxy in
+                            Color.clear
+                                .onAppear { planPanelHeight = proxy.size.height }
+                                .onChange(of: proxy.size.height) { _, height in
+                                    planPanelHeight = height
+                                }
+                        }
+                    }
+                    // Keep the card's bottom just above the composer. The
+                    // measured height prevents an empty fixed-height tail.
+                    .offset(y: -(planPanelHeight > 0 ? planPanelHeight + 8 : 338))
+                    .onChange(of: plan.id) { _, _ in
+                        planPanelCollapsed = false
+                    }
+                .zIndex(10)
+            }
+        }
     }
 
     private var composerBackground: Color {
