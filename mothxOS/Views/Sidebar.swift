@@ -48,9 +48,9 @@ struct Sidebar: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 3) {
                     ForEach(mothx.projects) { project in
-                        ProjectTreeRow(project: project, expanded: expandedProjects.contains(project.id), selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID, showSettings: $showSettings, toggle: { toggle(project.id) }, addSession: { let session = mothx.prepareSession(projectID: project.id); selectedSessionID = session.id; selectedProjectID = project.id; showSettings = false }, delete: { pendingDelete = .project(project.id) })
+                        ProjectTreeRow(project: project, expanded: expandedProjects.contains(project.id), selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID, showSettings: $showSettings, toggle: { toggle(project.id) }, addSession: { let session = mothx.prepareSession(projectID: project.id); selectedSessionID = session.id; selectedProjectID = project.id; showSettings = false }, delete: { pendingDelete = .project(project.id) }, requestDeleteSession: { pendingDelete = .session($0) })
                     }
-                    UnassignedProjectTreeRow(selectedSessionID: $selectedSessionID, showSettings: $showSettings)
+                    UnassignedProjectTreeRow(selectedSessionID: $selectedSessionID, showSettings: $showSettings, requestDelete: { pendingDelete = .session($0) })
                 }
             }
             Spacer()
@@ -126,6 +126,8 @@ struct Sidebar: View {
         .confirmationDialog(c.deleteTitle, isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }), titleVisibility: .visible) {
             Button(c.delete, role: .destructive) { if let pendingDelete { Task { await delete(pendingDelete) } }; pendingDelete = nil }
             Button(c.cancel, role: .cancel) { pendingDelete = nil }
+        } message: {
+            Text(pendingDelete?.message(using: c) ?? c.text("此操作无法撤销。", "This action cannot be undone."))
         }
         .sheet(isPresented: $showServiceLogs) {
             ServiceLogView()
@@ -149,18 +151,32 @@ struct Sidebar: View {
         case .project(let id):
             await mothx.deleteProject(id: id)
             if selectedProjectID == id { selectedProjectID = nil; selectedSessionID = nil }
+        case .session(let id):
+            await mothx.deleteSession(id: id)
+            if selectedSessionID == id { selectedSessionID = nil; selectedProjectID = nil }
         }
     }
 }
 
-enum SidebarDelete { case project(String) }
+enum SidebarDelete {
+    case project(String); case session(String)
+
+    func message(using copy: Copy) -> String {
+        switch self {
+        case .project(let id): return copy.deleteProjectMessage(id)
+        case .session(let id): return copy.deleteSessionMessage(id)
+        }
+    }
+}
 
 struct UnassignedProjectTreeRow: View {
     @EnvironmentObject private var mothx: MothxServiceManager
     @EnvironmentObject private var languageStore: LanguageStore
     @Binding var selectedSessionID: String?
     @Binding var showSettings: Bool
+    let requestDelete: (String) -> Void
     @State private var expanded = true
+    @State private var isHovered = false
 
     private var sessions: [MothxSession] {
         (mothx.sessions + Array(mothx.pendingSessions.values))
@@ -177,13 +193,20 @@ struct UnassignedProjectTreeRow: View {
                     Label(languageStore.copy.unassignedProject, systemImage: "tray")
                     Spacer()
                 }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
-            }.buttonStyle(.plain).hoverHighlight().padding(.vertical, 6)
+            }
+            .buttonStyle(.plain)
+            .padding(.vertical, 6)
+            .padding(.horizontal, 7)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(isHovered ? Color.primary.opacity(0.1) : .clear)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .onHover { isHovered = $0 }
             if expanded {
                 ForEach(sessions) { session in
                     SessionTreeRow(session: session, selected: selectedSessionID == session.id, select: {
                         selectedSessionID = session.id
                         showSettings = false
-                    }, delete: { Task { await mothx.deleteSession(id: session.id) } })
+                    }, delete: { requestDelete(session.id) })
                 }
                 if sessions.isEmpty { Text(languageStore.copy.noSessions).font(.caption).foregroundStyle(.tertiary).padding(.leading, 27).padding(.vertical, 4) }
             }
@@ -197,7 +220,7 @@ struct ProjectTreeRow: View {
     @EnvironmentObject private var languageStore: LanguageStore
     let project: MothxProject; let expanded: Bool
     @Binding var selectedProjectID: String?; @Binding var selectedSessionID: String?; @Binding var showSettings: Bool
-    let toggle: () -> Void; let addSession: () -> Void; let delete: () -> Void
+    let toggle: () -> Void; let addSession: () -> Void; let delete: () -> Void; let requestDeleteSession: (String) -> Void
     @State private var showEditor = false
     @State private var editedName = ""
     @State private var editedWorkDir = ""
@@ -221,7 +244,7 @@ struct ProjectTreeRow: View {
                         Label(project.name, systemImage: "folder").lineLimit(1)
                         Spacer(minLength: 0)
                     }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
-                }.buttonStyle(.plain).hoverHighlight()
+                }.buttonStyle(.plain)
                 if isHovered {
                     Spacer()
                     Button(action: addSession) { Image(systemName: "plus") }.buttonStyle(.plain).hoverHighlight().help(languageStore.copy.addSession)
@@ -234,6 +257,10 @@ struct ProjectTreeRow: View {
                 }
             }
             .padding(.vertical, 6)
+            .padding(.horizontal, 7)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(isHovered ? Color.primary.opacity(0.1) : .clear)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
             .foregroundStyle(.primary)
             .onHover { isHovered = $0 }
             if expanded {
@@ -242,7 +269,7 @@ struct ProjectTreeRow: View {
                         selectedProjectID = project.id
                         selectedSessionID = session.id
                         showSettings = false
-                    }, delete: { Task { await mothx.deleteSession(id: session.id) } })
+                    }, delete: { requestDeleteSession(session.id) })
                 }
                 if projectSessions.isEmpty {
                     Text(languageStore.copy.text("暂无会话", "No sessions yet"))
@@ -299,7 +326,6 @@ struct SessionTreeRow: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .hoverHighlight()
             if isHovered {
                 Button(action: delete) {
                     Image(systemName: "trash")
@@ -313,7 +339,8 @@ struct SessionTreeRow: View {
         .padding(.leading, 24)
         .padding(.vertical, 5)
         .padding(.horizontal, 7)
-        .background(selected ? Color.primary.opacity(0.1) : .clear)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(selected || isHovered ? Color.primary.opacity(0.1) : .clear)
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .foregroundStyle(selected ? .primary : .secondary)
         .onHover { isHovered = $0 }

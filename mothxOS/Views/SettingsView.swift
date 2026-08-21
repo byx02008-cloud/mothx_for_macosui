@@ -51,7 +51,7 @@ struct SettingsView: View {
                 } else if section == "skills" {
                     SkillsSection(skillsDir: $skillsDir)
                 } else if section == "sessions" {
-                    SessionsSection(sessionDir: $sessionDir, showSettings: $showSettings, selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID)
+                    SessionsSection(sessionDir: $sessionDir, showSettings: $showSettings, selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID, pendingDeletion: $pendingDeletion)
                 } else {
                     AboutSection()
                 }
@@ -60,7 +60,7 @@ struct SettingsView: View {
         }
         .background(settingsBackground)
         .onAppear { providerID = "" }
-        .confirmationDialog("Confirm deletion", isPresented: Binding(get: { pendingDeletion != nil }, set: { if !$0 { pendingDeletion = nil } }), titleVisibility: .visible) {
+        .confirmationDialog(languageStore.copy.deleteTitle, isPresented: Binding(get: { pendingDeletion != nil }, set: { if !$0 { pendingDeletion = nil } }), titleVisibility: .visible) {
             Button(languageStore.copy.delete, role: .destructive) {
                 guard let deletion = pendingDeletion else { return }
                 pendingDeletion = nil
@@ -68,11 +68,19 @@ struct SettingsView: View {
                 case .provider(let id): Task { await mothx.deleteProvider(id: id) }
                 case .model(let id):
                     if let index = draft.models.firstIndex(where: { $0.id == id }) { draft.models.remove(at: index); if modelID == id { modelID = "" } }
+                case .session(let id):
+                    Task {
+                        await mothx.deleteSession(id: id)
+                        if selectedSessionID == id {
+                            selectedSessionID = nil
+                            selectedProjectID = nil
+                        }
+                    }
                 }
             }
             Button(languageStore.copy.cancel, role: .cancel) { pendingDeletion = nil }
         } message: {
-            Text(pendingDeletion?.message ?? "This action cannot be undone.")
+            Text(pendingDeletion?.message(using: languageStore.copy) ?? languageStore.copy.text("此操作无法撤销。", "This action cannot be undone."))
         }
         .task { await mothx.loadSettings(); defaultProviderID = mothx.defaultProvider; defaultModelID = mothx.defaultModel; defaultThinkingLevel = mothx.defaultThinkingLevel; defaultMode = mothx.defaultMode; language = mothx.tuilang; skillsDir = mothx.skillsDir; sessionDir = mothx.sessionDir; providerID = "" }
     }
@@ -85,10 +93,9 @@ struct SettingsView: View {
 }
 
 enum DeletionRequest: Identifiable {
-    case provider(String)
-    case model(String)
-    var id: String { switch self { case .provider(let id): return "provider-\(id)"; case .model(let id): return "model-\(id)" } }
-    var message: String { switch self { case .provider(let id): return "Delete provider \(id)? Its configuration will be removed after confirmation."; case .model(let id): return "Delete model \(id)? It will be removed from the current provider after confirmation." } }
+    case provider(String); case model(String); case session(String)
+    var id: String { switch self { case .provider(let id): return "provider-\(id)"; case .model(let id): return "model-\(id)"; case .session(let id): return "session-\(id)" } }
+    func message(using copy: Copy) -> String { switch self { case .provider(let id): return copy.deleteProviderMessage(id); case .model(let id): return copy.deleteModelMessage(id); case .session(let id): return copy.deleteSessionMessage(id) } }
 }
 
 struct ProviderList: View {
@@ -224,6 +231,7 @@ struct SessionsSection: View {
     @Binding var showSettings: Bool
     @Binding var selectedProjectID: String?
     @Binding var selectedSessionID: String?
+    @Binding var pendingDeletion: DeletionRequest?
 
     private var allSessions: [MothxSession] { (mothx.sessions + Array(mothx.pendingSessions.values)).sorted { ($0.updatedAt ?? "") > ($1.updatedAt ?? "") } }
 
@@ -237,30 +245,61 @@ struct SessionsSection: View {
             SettingsCard(title: c.allSessions, subtitle: c.allSessionsSubtitle) {
                 if allSessions.isEmpty { Text(c.noSessions).font(.callout).foregroundStyle(.secondary) }
                 ForEach(allSessions) { session in
-                    HStack(spacing: 10) {
-                        Button {
-                            selectedSessionID = session.id
-                            selectedProjectID = session.projectID
-                            showSettings = false
-                        } label: {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(session.title).lineLimit(1)
-                                Text(session.projectID == nil ? c.unassignedSession : c.projectSession).font(.caption).foregroundStyle(.secondary)
-                            }.frame(maxWidth: .infinity, alignment: .leading)
-                        }.buttonStyle(.plain)
-                        Button {
-                            Task {
-                                await mothx.deleteSession(id: session.id)
-                                if selectedSessionID == session.id {
-                                    selectedSessionID = nil
-                                    selectedProjectID = nil
-                                }
-                            }
-                        } label: { Image(systemName: "trash").foregroundStyle(.red.opacity(0.8)) }.buttonStyle(.plain)
-                    }.padding(10).background(Color.primary.opacity(0.08)).clipShape(RoundedRectangle(cornerRadius: 8))
+                    SessionRecordRow(
+                        session: session,
+                        subtitle: session.projectID == nil ? c.unassignedSession : c.projectSession,
+                        viewTitle: c.text("查看", "View"),
+                        deleteTitle: c.delete
+                    ) {
+                        selectedSessionID = session.id
+                        selectedProjectID = session.projectID
+                        showSettings = false
+                    } delete: { pendingDeletion = .session(session.id) }
                 }
             }
         }
+    }
+}
+
+private struct SessionRecordRow: View {
+    let session: MothxSession
+    let subtitle: String
+    let viewTitle: String
+    let deleteTitle: String
+    let view: () -> Void
+    let delete: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(session.title).lineLimit(1)
+                Text(subtitle).font(.caption).foregroundStyle(.secondary)
+            }.frame(maxWidth: .infinity, alignment: .leading)
+
+            if isHovered {
+                Button(action: view) {
+                    Image(systemName: "eye")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .hoverHighlight()
+                .help(viewTitle)
+
+                Button(action: delete) {
+                    Image(systemName: "trash").foregroundStyle(.red.opacity(0.8))
+                }
+                .buttonStyle(.plain)
+                .hoverHighlight()
+                .help(deleteTitle)
+                .transition(.opacity)
+            }
+        }
+        .padding(10)
+        .background(Color.primary.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .onHover { isHovered = $0 }
+        .animation(.easeInOut(duration: 0.12), value: isHovered)
     }
 }
 struct ProviderSection: View { @EnvironmentObject private var languageStore: LanguageStore; @Binding var provider: MothxProviderConfig
