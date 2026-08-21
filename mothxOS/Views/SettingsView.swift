@@ -44,7 +44,7 @@ struct SettingsView: View {
                         HStack { Button { providerID = "" } label: { Label(c.backToProviders, systemImage: "chevron.left") }.buttonStyle(.plain).foregroundStyle(.secondary); Spacer(); if saved { Text(c.saved).font(.caption).foregroundStyle(.green) }; Button(c.saveProvider) { Task { await save() } }.buttonStyle(.borderedProminent).tint(.orange).disabled(draft.id.isEmpty) }
                         Text(draft.id).font(.system(size: 26, weight: .semibold))
                         ProviderSection(provider: $draft)
-                        ModelSection(provider: $draft, selectedID: $modelID, discovering: $discovering) { id in pendingDeletion = .model(id) }
+                        ModelSection(provider: $draft, selectedID: $modelID, discovering: $discovering) { id, name in pendingDeletion = .model(id: id, name: name) }
                     }
                 } else if section == "general" {
                     GeneralSection(language: $language)
@@ -66,7 +66,7 @@ struct SettingsView: View {
                 pendingDeletion = nil
                 switch deletion {
                 case .provider(let id): Task { await mothx.deleteProvider(id: id) }
-                case .model(let id):
+                case .model(let id, _):
                     if let index = draft.models.firstIndex(where: { $0.id == id }) { draft.models.remove(at: index); if modelID == id { modelID = "" } }
                 case .session(let id):
                     Task {
@@ -93,9 +93,9 @@ struct SettingsView: View {
 }
 
 enum DeletionRequest: Identifiable {
-    case provider(String); case model(String); case session(String)
-    var id: String { switch self { case .provider(let id): return "provider-\(id)"; case .model(let id): return "model-\(id)"; case .session(let id): return "session-\(id)" } }
-    func message(using copy: Copy) -> String { switch self { case .provider(let id): return copy.deleteProviderMessage(id); case .model(let id): return copy.deleteModelMessage(id); case .session(let id): return copy.deleteSessionMessage(id) } }
+    case provider(String); case model(id: String, name: String); case session(String)
+    var id: String { switch self { case .provider(let id): return "provider-\(id)"; case .model(let id, _): return "model-\(id)"; case .session(let id): return "session-\(id)" } }
+    func message(using copy: Copy) -> String { switch self { case .provider(let name): return copy.deleteProviderMessage(name); case .model(_, let name): return copy.deleteModelMessage(name); case .session(let id): return copy.deleteSessionMessage(id.isEmpty ? nil : id) } }
 }
 
 struct ProviderList: View {
@@ -306,9 +306,9 @@ struct ProviderSection: View { @EnvironmentObject private var languageStore: Lan
     var body: some View { let c = languageStore.copy; return SettingsCard(title: c.provider, subtitle: c.text("对应 providers.<providerId>", "providers.<providerId>")) { SettingsField(title: c.providerID, text: $provider.id, placeholder: "openai"); SettingsField(title: c.vendor, text: $provider.vendor, placeholder: "optional adapter name"); SettingsField(title: c.apiProtocol, text: $provider.api, placeholder: "openai-chat"); SettingsField(title: c.baseURL, text: $provider.baseUrl, placeholder: "https://api.example.com/v1"); SettingsField(title: c.apiKey, text: $provider.apiKey, placeholder: "${PROVIDER_API_KEY}", secure: true); SettingsField(title: c.httpProxy, text: $provider.httpProxy, placeholder: "optional"); Toggle(c.forceHTTP11, isOn: $provider.forceHTTP11); SettingsField(title: c.thinkingFormat, text: $provider.thinkingFormat, placeholder: "optional") } }
 }
 
-struct ModelSection: View { @EnvironmentObject private var mothx: MothxServiceManager; @EnvironmentObject private var languageStore: LanguageStore; @Binding var provider: MothxProviderConfig; @Binding var selectedID: String; @Binding var discovering: Bool; let delete: (String) -> Void
+struct ModelSection: View { @EnvironmentObject private var mothx: MothxServiceManager; @EnvironmentObject private var languageStore: LanguageStore; @Binding var provider: MothxProviderConfig; @Binding var selectedID: String; @Binding var discovering: Bool; let delete: (String, String) -> Void
     @State private var selectedIndex: Int?
-    var body: some View { let c = languageStore.copy; return SettingsCard(title: c.models, subtitle: c.text("对应 providers.<providerId>.models", "providers.<providerId>.models")) { HStack { Text(c.configuredModels).font(.headline); Spacer(); Button { provider.models.insert(MothxModelConfig(id: "new-model", name: "New model"), at: 0); selectedIndex = 0 } label: { Label(c.addModel, systemImage: "plus") }.buttonStyle(.bordered); Button { Task { discovering = true; let models = await mothx.discoverModels(provider: provider); if !models.isEmpty { provider.models = models; selectedIndex = models.count > 1 ? 1 : 0 }; discovering = false } } label: { Label(discovering ? c.text("获取中…", "Discovering…") : c.discover, systemImage: "arrow.triangle.2.circlepath") }.buttonStyle(.bordered).disabled(provider.baseUrl.isEmpty) }; if provider.models.isEmpty { Text(c.noModelsHint).font(.callout).foregroundStyle(.secondary) } else { ForEach(provider.models.indices, id: \.self) { index in ModelRow(model: $provider.models[index], selected: selectedIndex == index) { selectedIndex = index } delete: { if selectedIndex == index { selectedIndex = nil }; delete(provider.models[index].id) } } } } }
+    var body: some View { let c = languageStore.copy; return SettingsCard(title: c.models, subtitle: c.text("对应 providers.<providerId>.models", "providers.<providerId>.models")) { HStack { Text(c.configuredModels).font(.headline); Spacer(); Button { provider.models.insert(MothxModelConfig(id: "new-model", name: "New model"), at: 0); selectedIndex = 0 } label: { Label(c.addModel, systemImage: "plus") }.buttonStyle(.bordered); Button { Task { discovering = true; let models = await mothx.discoverModels(provider: provider); if !models.isEmpty { provider.models = models; selectedIndex = models.count > 1 ? 1 : 0 }; discovering = false } } label: { Label(discovering ? c.text("获取中…", "Discovering…") : c.discover, systemImage: "arrow.triangle.2.circlepath") }.buttonStyle(.bordered).disabled(provider.baseUrl.isEmpty) }; if provider.models.isEmpty { Text(c.noModelsHint).font(.callout).foregroundStyle(.secondary) } else { ForEach(provider.models.indices, id: \.self) { index in ModelRow(model: $provider.models[index], selected: selectedIndex == index) { selectedIndex = index } delete: { if selectedIndex == index { selectedIndex = nil }; delete(provider.models[index].id, provider.models[index].displayName) } } } } }
 }
 
 struct ModelRow: View {

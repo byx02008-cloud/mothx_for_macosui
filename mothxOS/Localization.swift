@@ -66,10 +66,13 @@ struct Copy {
     var deleteTitle: String { text("确认删除", "Confirm deletion") }
     var delete: String { text("删除", "Delete") }
     var cancel: String { text("取消", "Cancel") }
-    func deleteProjectMessage(_ id: String) -> String { text("删除项目 (id)？项目及其关联关系将在确认后删除。", "Delete project \(id)? The project and its associations will be removed after confirmation.") }
-    func deleteSessionMessage(_ id: String) -> String { text("删除会话 (id)？会话记录将在确认后删除。", "Delete session \(id)? Its conversation history will be removed after confirmation.") }
-    func deleteProviderMessage(_ id: String) -> String { text("删除运营商 (id)？其配置将在确认后删除。", "Delete provider \(id)? Its configuration will be removed after confirmation.") }
-    func deleteModelMessage(_ id: String) -> String { text("删除模型 (id)？它将在确认后从当前运营商中移除。", "Delete model \(id)? It will be removed from the current provider after confirmation.") }
+    func deleteProjectMessage(_ name: String) -> String { text("删除项目 \(name)？项目及其关联关系将在确认后删除。", "Delete project \(name)? The project and its associations will be removed after confirmation.") }
+    func deleteSessionMessage(_ id: String?) -> String {
+        guard let id, !id.isEmpty else { return text("删除此会话？会话记录将在确认后删除。", "Delete this session? Its conversation history will be removed after confirmation.") }
+        return text("删除会话 \(id)？会话记录将在确认后删除。", "Delete session \(id)? Its conversation history will be removed after confirmation.")
+    }
+    func deleteProviderMessage(_ name: String) -> String { text("删除运营商 \(name)？其配置将在确认后删除。", "Delete provider \(name)? Its configuration will be removed after confirmation.") }
+    func deleteModelMessage(_ name: String) -> String { text("删除模型 \(name)？它将在确认后从当前运营商中移除。", "Delete model \(name)? It will be removed from the current provider after confirmation.") }
     var projects: String { text("项目", "Projects") }
     var addProject: String { text("添加项目", "Add project") }
     var addSession: String { text("添加会话", "Add session") }
