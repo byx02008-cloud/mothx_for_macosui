@@ -67,6 +67,9 @@ final class MothxServiceManager: ObservableObject {
     @Published private(set) var runError: String?
     @Published private(set) var runStatus: String?
     @Published private(set) var runElapsed: TimeInterval = 0
+    /// Portion of the current run's input context served from the provider cache.
+    /// This is nil until the provider reports usage for the first turn.
+    @Published private(set) var runCacheHitRate: Double?
     @Published private(set) var runSessionID: String?
     @Published private(set) var runReplyMessageID: String?
     @Published var settingsError: String?
@@ -605,6 +608,7 @@ final class MothxServiceManager: ObservableObject {
         runError = nil
         runStatus = "queued"
         runElapsed = 0
+        runCacheHitRate = nil
         runSessionID = sessionID
         runReplyMessageID = nil
         currentRunID = nil
@@ -625,7 +629,7 @@ final class MothxServiceManager: ObservableObject {
             // Show the submitted question immediately. The API returns 202 and
             // runs the agent in the background, so the assistant message is not
             // available in the first history response yet.
-            let localMessage = MothxMessage(id: "local-\(UUID().uuidString)", seq: nil, role: "user", content: message, toolCallId: nil, toolName: nil, arguments: "", plan: nil, summary: nil, hasDetail: false, createdAt: nil)
+            let localMessage = MothxMessage(id: "local-\(UUID().uuidString)", seq: nil, role: "user", content: message, toolCallId: nil, toolName: nil, arguments: "", plan: nil, summary: nil, hasDetail: false, createdAt: ISO8601DateFormatter().string(from: Date()))
             messagesBySession[sessionID, default: []].append(localMessage)
             let body = try jsonData(payload)
             let response = try await request(path: "api/sessions/\(sessionID)/runs", method: "POST", body: body, headers: ["Idempotency-Key": UUID().uuidString])
@@ -707,6 +711,7 @@ final class MothxServiceManager: ObservableObject {
                 let object = (try JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
                 let status = object["status"] as? String ?? object["state"] as? String ?? "running"
                 runStatus = status
+                updateRunCacheHitRate(from: object["usage"])
                 let messages = await loadMessages(sessionID: sessionID)
                 // Track current running message for typewriter effect
                 if let replyID = runReplyMessageID {
@@ -737,6 +742,25 @@ final class MothxServiceManager: ObservableObject {
     private func elapsedSinceRunStart() -> TimeInterval {
         guard let runStartedAt else { return runElapsed }
         return max(0, Date().timeIntervalSince(runStartedAt))
+    }
+
+    /// Usage is persisted in mothx's provider-native shape. The denominator
+    /// includes uncached input plus cache reads and writes, matching mothx's
+    /// CacheInfo calculation.
+    private func updateRunCacheHitRate(from rawUsage: Any?) {
+        guard let usage = rawUsage as? [String: Any] else { return }
+        let input = integerValue(usage["input"] ?? usage["inputTokens"] ?? usage["prompt_tokens"])
+        let cacheRead = integerValue(usage["cacheRead"] ?? usage["cache_read_tokens"] ?? usage["cached_tokens"])
+        let cacheWrite = integerValue(usage["cacheWrite"] ?? usage["cache_write_tokens"])
+        let denominator = input + cacheRead + cacheWrite
+        guard denominator > 0 else { return }
+        runCacheHitRate = min(1, max(0, Double(cacheRead) / Double(denominator)))
+    }
+
+    private func integerValue(_ value: Any?) -> Int {
+        if let value = value as? Int { return value }
+        if let value = value as? NSNumber { return value.intValue }
+        return 0
     }
 
     private func loadHistoricalRuns(sessionID: String, messages: [MothxMessage]) async {
@@ -933,7 +957,10 @@ final class MothxServiceManager: ObservableObject {
                 toolName: toolName, arguments: arguments,
                 plan: plan,
                 summary: summary, hasDetail: hasDetail,
-                createdAt: item["createdAt"] as? String
+                createdAt: (item["createdAt"] as? String)
+                    ?? (item["created_at"] as? String)
+                    ?? (item["timestamp"] as? String)
+                    ?? (item["createdAt"] as? NSNumber).map { ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: $0.doubleValue)) }
             )
         }.filter { msg in
             if msg.isToolCall || msg.isToolResult { return true }

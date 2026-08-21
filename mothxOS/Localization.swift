@@ -110,6 +110,7 @@ struct Copy {
     var runTests: String { text("运行测试", "Run the tests") }
     var findBug: String { text("查找问题", "Find a bug") }
     var askAnything: String { text("请输入任务…", "Ask anything…") }
+    var cacheHitRate: String { text("命中率", "Cache hit rate") }
     var attach: String { text("附件", "Attach") }
     var defaultMode: String { text("Agent 模式", "Agent mode") }
     var selectProvider: String { text("选择运营商", "Select provider") }

@@ -14,6 +14,7 @@ struct WorkspaceView: View {
     @State private var attachmentError: String?
     @State private var currentTurns: [Turn] = []
     @State private var expandedTurnIDs: Set<UUID> = []
+    @State private var showAllHistory = false
     @State private var isConversationAtBottom = true
 
     private let conversationBottomID = "conversation-bottom"
@@ -40,8 +41,9 @@ struct WorkspaceView: View {
                         ScrollView {
                             LazyVStack(alignment: .leading, spacing: 6) {
                                 let isRunActive = mothx.runSessionID == sessionID && mothx.isRunning
+                                let visibleTurns = showAllHistory ? currentTurns : Array(currentTurns.suffix(3))
 
-                                ForEach(currentTurns) { turn in
+                                ForEach(visibleTurns) { turn in
                                     TurnBlock(
                                         turn: turn,
                                         sessionID: sessionID,
@@ -101,6 +103,31 @@ struct WorkspaceView: View {
                         .onAppear {
                             scrollToBottom(reader, animated: false)
                         }
+                        .overlay(alignment: .topTrailing) {
+                            if currentTurns.count > 3 {
+                                Button {
+                                    withAnimation(.easeInOut(duration: 0.2)) {
+                                        showAllHistory.toggle()
+                                        if let lastID = currentTurns.last?.id {
+                                            expandedTurnIDs = [lastID]
+                                        }
+                                    }
+                                } label: {
+                                    Image(systemName: "ellipsis")
+                                        .font(.system(size: 15, weight: .semibold))
+                                        .frame(width: 34, height: 30)
+                                        .contentShape(RoundedRectangle(cornerRadius: 8))
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(.secondary)
+                                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.12), lineWidth: 1))
+                                .shadow(color: .black.opacity(0.12), radius: 5, y: 2)
+                                .padding(.top, 10)
+                                .padding(.trailing, 18)
+                                .help(showAllHistory ? "隐藏历史对话 / Hide history" : "显示历史对话 / Show history")
+                            }
+                        }
                         .overlay(alignment: .bottom) {
                             if !isConversationAtBottom {
                                 ConversationScrollButton(isRunning: mothx.runSessionID == sessionID && mothx.isRunning) {
@@ -128,6 +155,7 @@ struct WorkspaceView: View {
                 selectedTools: $selectedTools,
                 models: currentModels,
                 isRunning: mothx.isSubmittingRun || mothx.isStreaming,
+                cacheHitRate: mothx.runCacheHitRate,
                 chooseFiles: chooseFiles,
                 submit: submit,
                 stop: { Task { await mothx.cancelRun() } }
@@ -151,12 +179,14 @@ struct WorkspaceView: View {
                 selectedSkills = mothx.activeSkillsBySession[sessionID] ?? []
                 await mothx.loadMessages(sessionID: sessionID)
                 currentTurns = computeTurns(mothx.messagesBySession[sessionID] ?? [])
+                showAllHistory = false
                 expandedTurnIDs = currentTurns.last.map { [$0.id] } ?? []
             }
         }
         .onChange(of: mothx.messagesBySession) { _, _ in
             if let sessionID {
                 currentTurns = computeTurns(mothx.messagesBySession[sessionID] ?? [])
+                if currentTurns.count <= 3 { showAllHistory = false }
                 // Keep last turn expanded, preserve other expanded
                 if let lastID = currentTurns.last?.id {
                     expandedTurnIDs.insert(lastID)
@@ -432,6 +462,7 @@ struct PromptComposer: View {
     @Binding var selectedTools: Set<String>
     let models: [MothxModelConfig]
     let isRunning: Bool
+    let cacheHitRate: Double?
     let chooseFiles: () -> Void
     let submit: () -> Void
     let stop: () -> Void
@@ -442,6 +473,8 @@ struct PromptComposer: View {
     @State private var showModelMenu = false
     @State private var planPanelHeight: CGFloat = 0
     @State private var planPanelCollapsed = false
+    @State private var planPanelOffset: CGSize = .zero
+    @GestureState private var planPanelDragTranslation: CGSize = .zero
     @State private var providerSearchText = ""
     @State private var modelSearchText = ""
 
@@ -454,6 +487,11 @@ struct PromptComposer: View {
 
     private var selectedProviderLabel: String {
         providerID.isEmpty ? languageStore.copy.selectProvider : providerID
+    }
+
+    private var cacheHitRateLabel: String {
+        guard let cacheHitRate else { return "—" }
+        return String(format: "%.0f%%", cacheHitRate * 100)
     }
 
     private var filteredProviders: [MothxProviderConfig] {
@@ -623,6 +661,17 @@ struct PromptComposer: View {
         .background(composerBackground)
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.12)))
+        // Keep the metric outside the composer border, aligned to its upper-right corner.
+        .overlay(alignment: .topTrailing) {
+            if isRunning {
+                Text("\(c.cacheHitRate)  \(cacheHitRateLabel)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .padding(.horizontal, 10)
+                    .offset(y: -22)
+            }
+        }
         .overlay(alignment: .topLeading) {
             if isRunning, let plan = mothx.currentPlan {
                 PlanCard(plan: plan, isRunning: true, runStatus: mothx.runStatus ?? "running", isCollapsed: $planPanelCollapsed)
@@ -639,9 +688,33 @@ struct PromptComposer: View {
                     }
                     // Keep the card's bottom just above the composer. The
                     // measured height prevents an empty fixed-height tail.
-                    .offset(y: -(planPanelHeight > 0 ? planPanelHeight + 8 : 338))
+                    .offset(
+                        x: planPanelOffset.width + planPanelDragTranslation.width,
+                        y: -(planPanelHeight > 0 ? planPanelHeight + 8 : 338)
+                            + planPanelOffset.height + planPanelDragTranslation.height
+                    )
+                    // The card remains anchored to the composer by default,
+                    // but can be freely repositioned anywhere in the
+                    // conversation area with a drag.
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 4)
+                            .updating($planPanelDragTranslation) { value, state, _ in
+                                state = value.translation
+                            }
+                            .onEnded { value in
+                                planPanelOffset.width += value.translation.width
+                                planPanelOffset.height += value.translation.height
+                            }
+                    )
                     .onChange(of: plan.id) { _, _ in
                         planPanelCollapsed = false
+                        planPanelOffset = .zero
+                    }
+                    .onChange(of: isRunning) { _, running in
+                        if !running {
+                            planPanelCollapsed = false
+                            planPanelOffset = .zero
+                        }
                     }
                 .zIndex(10)
             }

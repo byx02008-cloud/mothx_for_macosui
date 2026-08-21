@@ -16,6 +16,8 @@ struct TextMessageBubble: View {
     // snapshot from whenever the closure was created), so newly polled
     // content keeps getting typed out instead of appearing in one jump.
     @State private var typingTarget: String = ""
+    @State private var isHovered = false
+    @State private var didCopy = false
 
     private var displayText: String {
         if isCurrentRunning { return String(typingTarget.prefix(displayedCharCount)) }
@@ -25,29 +27,37 @@ struct TextMessageBubble: View {
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             if isUser { Spacer(minLength: 70) }
-            HStack(alignment: .top, spacing: 10) {
-                if !isUser { Image("MothxLogo").resizable().scaledToFit().frame(width: 18, height: 18) }
-                VStack(alignment: .leading, spacing: 0) {
-                    if !isUser && !isCurrentRunning && !displayText.isEmpty {
-                        MarkdownMessageText(markdown: displayText)
-                    } else {
-                        Text(displayText.isEmpty ? (isUser ? "…" : "Thinking…") : displayText)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: 560, alignment: .leading)
+            VStack(alignment: isUser ? .trailing : .leading, spacing: 0) {
+                HStack(alignment: .top, spacing: 10) {
+                    if !isUser { Image("MothxLogo").resizable().scaledToFit().frame(width: 18, height: 18) }
+                    VStack(alignment: .leading, spacing: 0) {
+                        if !isUser && !isCurrentRunning && !displayText.isEmpty {
+                            MarkdownMessageText(markdown: displayText)
+                        } else {
+                            Text(displayText.isEmpty ? (isUser ? "…" : "Thinking…") : displayText)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: 560, alignment: .leading)
+                        }
+                        if isTyping {
+                            Rectangle().fill(Color.primary.opacity(0.6)).frame(width: 8, height: 16)
+                                .opacity(blinkOpacity).padding(.leading, 2).padding(.top, -16)
+                        }
                     }
-                    if isTyping {
-                        Rectangle().fill(Color.primary.opacity(0.6)).frame(width: 8, height: 16)
-                            .opacity(blinkOpacity).padding(.leading, 2).padding(.top, -16)
-                    }
+                    if isUser { Image(systemName: "person.circle").foregroundStyle(Color.secondary) }
                 }
-                if isUser { Image(systemName: "person.circle").foregroundStyle(Color.secondary) }
+                .padding(14)
+                .background(isUser ? userBackground : assistantBackground)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+
+                if isUser {
+                    userMetadata
+                        .frame(height: 22, alignment: .topTrailing)
+                }
             }
-            .padding(14)
-            .background(isUser ? userBackground : assistantBackground)
-            .clipShape(RoundedRectangle(cornerRadius: 10))
             if !isUser { Spacer(minLength: 70) }
         }
         .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
+        .onHover { isHovered = $0 }
         .onAppear {
             if isCurrentRunning && !message.displayText.isEmpty {
                 typingTarget = message.displayText
@@ -95,6 +105,36 @@ struct TextMessageBubble: View {
         withAnimation(.easeInOut(duration: 0.6).repeatForever()) { blinkOpacity = 0.0 }
     }
 
+    private var userMetadata: some View {
+        HStack(spacing: 8) {
+            if isHovered {
+                Button {
+                    copyQuestion()
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(didCopy ? "已复制" : "复制主题")
+                        Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(didCopy ? "已复制 / Copied" : "复制主题 / Copy topic")
+            }
+        }
+        .opacity(isHovered ? 1 : 0)
+    }
+
+    private func copyQuestion() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(message.displayText, forType: .string)
+        didCopy = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            didCopy = false
+        }
+    }
+
     private var assistantBackground: Color { colorScheme == .light ? .white : .codexCard }
     private var userBackground: Color { colorScheme == .light ? Color(red: 0.94, green: 0.94, blue: 0.95) : Color.orange.opacity(0.18) }
 }
@@ -109,13 +149,19 @@ private struct MarkdownMessageText: View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(segments) { segment in
                 if segment.isCodeBlock {
-                    Text(segment.content)
-                        .font(.system(.body, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(10)
-                        .background(codeBackground)
-                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                    Group {
+                        if let attributedString = attributedString(for: segment.content) {
+                            Text(attributedString)
+                        } else {
+                            Text(segment.content)
+                        }
+                    }
+                    .font(.system(.body, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+                    .background(codeBackground)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
                 } else if !segment.content.isEmpty {
                     if let attributedString = attributedString(for: segment.content) {
                         Text(attributedString)
