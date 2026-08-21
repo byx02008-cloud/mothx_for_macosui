@@ -7,6 +7,7 @@ struct WorkspaceView: View {
     let sessionID: String?
     @State private var attachments: [ComposerAttachment] = []
     @State private var selectedMode = "agent"
+    @State private var selectedProviderID = ""
     @State private var selectedModelID = ""
     @State private var selectedSkills: Set<String> = []
     @State private var selectedTools: Set<String> = []
@@ -18,7 +19,7 @@ struct WorkspaceView: View {
     private let conversationBottomID = "conversation-bottom"
 
     private var currentModels: [MothxModelConfig] {
-        let provider = mothx.providers.first(where: { $0.id == mothx.defaultProvider }) ?? mothx.providers.first
+        let provider = mothx.providers.first(where: { $0.id == selectedProviderID }) ?? mothx.providers.first(where: { $0.id == mothx.defaultProvider }) ?? mothx.providers.first
         return provider?.models ?? []
     }
 
@@ -128,7 +129,9 @@ struct WorkspaceView: View {
                 prompt: $prompt,
                 attachments: $attachments,
                 mode: $selectedMode,
+                providerID: $selectedProviderID,
                 modelID: $selectedModelID,
+                providers: mothx.providers,
                 skills: mothx.installedSkills,
                 selectedSkills: $selectedSkills,
                 selectedTools: $selectedTools,
@@ -147,7 +150,10 @@ struct WorkspaceView: View {
         .task(id: sessionID) {
             if let sessionID {
                 selectedMode = ["plan", "agent", "yolo"].contains(mothx.defaultMode) ? mothx.defaultMode : "agent"
-                selectedModelID = mothx.modelForSession(sessionID) ?? mothx.defaultModel
+                selectedProviderID = mothx.providers.first(where: { $0.id == mothx.defaultProvider })?.id ?? mothx.providers.first?.id ?? ""
+                let providerModels = mothx.providers.first(where: { $0.id == selectedProviderID })?.models ?? []
+                let savedModel = mothx.modelForSession(sessionID) ?? mothx.defaultModel
+                selectedModelID = providerModels.contains(where: { $0.id == savedModel }) ? savedModel : providerModels.first?.id ?? ""
                 selectedSkills = mothx.activeSkillsBySession[sessionID] ?? []
                 selectedTools = []
                 await mothx.loadSkills(for: sessionID)
@@ -165,6 +171,18 @@ struct WorkspaceView: View {
                     expandedTurnIDs.insert(lastID)
                 }
             }
+        }
+        .onChange(of: mothx.defaultProvider) { _, providerID in
+            guard selectedProviderID.isEmpty else { return }
+            selectedProviderID = providerID
+            selectedModelID = mothx.providers.first(where: { $0.id == providerID })?.models.first?.id ?? ""
+        }
+        .onChange(of: mothx.providers) { _, providers in
+            guard !providers.isEmpty else { return }
+            guard selectedProviderID.isEmpty || !providers.contains(where: { $0.id == selectedProviderID }) else { return }
+            let provider = providers.first(where: { $0.id == mothx.defaultProvider }) ?? providers.first
+            selectedProviderID = provider?.id ?? ""
+            selectedModelID = provider?.models.first?.id ?? ""
         }
     }
 
@@ -233,6 +251,9 @@ struct WorkspaceView: View {
         prompt = ""; attachments = []
         mothx.setSessionModel(selectedModel, for: sessionID)
         Task {
+            // The Run API resolves the provider from mothx's global default.
+            // Persist the current selection before submitting the run.
+            await mothx.saveDefaults(provider: selectedProviderID, model: selectedModel, thinkingLevel: mothx.defaultThinkingLevel, mode: selectedMode)
             if let runID = await mothx.submitRun(sessionID: sessionID, message: question, images: imageAttachments, workDir: workDir(for: sessionID), model: selectedModel, mode: selectedMode, tools: selectedTools, skills: selectedSkills) {
                 await mothx.pollRun(runID: runID, sessionID: sessionID)
                 await mothx.updateSessionTitle(id: sessionID, title: String((question.components(separatedBy: .newlines).first ?? question).prefix(48)))
@@ -405,12 +426,15 @@ struct ComposerAttachment: Identifiable, Hashable {
 
 struct PromptComposer: View {
     enum PlusSubmenu { case skills, tools }
+    @EnvironmentObject private var mothx: MothxServiceManager
     @Environment(\.colorScheme) private var colorScheme
     @EnvironmentObject private var languageStore: LanguageStore
     @Binding var prompt: String
     @Binding var attachments: [ComposerAttachment]
     @Binding var mode: String
+    @Binding var providerID: String
     @Binding var modelID: String
+    let providers: [MothxProviderConfig]
     let skills: [MothxSkill]
     @Binding var selectedSkills: Set<String>
     @Binding var selectedTools: Set<String>
@@ -422,6 +446,7 @@ struct PromptComposer: View {
     @State private var plusMenuOpen = false
     @State private var plusSubmenu: PlusSubmenu?
     @State private var showModeMenu = false
+    @State private var showProviderMenu = false
     @State private var showModelMenu = false
 
     private let toolOptions = [("browser", "browser"), ("delegate", "delegate"), ("multi-agent", "muti-agent"), ("workflow", "workflow")]
@@ -429,6 +454,10 @@ struct PromptComposer: View {
     private var selectedModelLabel: String {
         if let model = models.first(where: { $0.id == modelID }) { return model.displayName }
         return modelID.isEmpty ? languageStore.copy.selectModel : modelID
+    }
+
+    private var selectedProviderLabel: String {
+        providerID.isEmpty ? languageStore.copy.selectProvider : providerID
     }
 
     var body: some View {
@@ -485,6 +514,48 @@ struct PromptComposer: View {
                     }
 
                 Spacer()
+
+                Button { showProviderMenu.toggle() } label: {
+                    Text(selectedProviderLabel).font(.callout).lineLimit(1).foregroundStyle(.secondary)
+                        .padding(.horizontal, 8).frame(minHeight: 42).contentShape(Rectangle())
+                }.buttonStyle(.plain).hoverHighlight()
+                    .popover(isPresented: $showProviderMenu, arrowEdge: .bottom) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            if providers.isEmpty {
+                                Text(c.selectProvider).foregroundStyle(.secondary).padding(8)
+                            } else {
+                                ScrollView {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        ForEach(providers) { provider in
+                                            Button {
+                                                providerID = provider.id
+                                                let preferredModel = provider.models.first?.id ?? ""
+                                                modelID = preferredModel
+                                                showProviderMenu = false
+                                                Task {
+                                                    await mothx.saveDefaults(provider: provider.id, model: preferredModel, thinkingLevel: mothx.defaultThinkingLevel, mode: mode)
+                                                }
+                                            } label: {
+                                                HStack {
+                                                    Text(provider.id).lineLimit(1)
+                                                    Spacer()
+                                                    if providerID == provider.id { Image(systemName: "checkmark") }
+                                                }
+                                                .padding(.horizontal, 8)
+                                                .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+                                                .contentShape(Rectangle())
+                                            }
+                                            .buttonStyle(.plain)
+                                            .hoverHighlight()
+                                            .foregroundStyle(.primary)
+                                        }
+                                    }
+                                }
+                                .frame(maxHeight: 300)
+                            }
+                        }.padding(10).frame(width: 220, alignment: .leading)
+                    }
+
                 Button { showModelMenu.toggle() } label: {
                     Text(selectedModelLabel).font(.callout).lineLimit(1).foregroundStyle(.secondary)
                         .padding(.horizontal, 8).frame(minHeight: 42).contentShape(Rectangle())

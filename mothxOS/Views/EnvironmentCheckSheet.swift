@@ -66,6 +66,11 @@ struct EnvironmentCheckSheet: View {
                 }
             }
 
+            // Keep the log area mounted for every phase. A fixed height keeps
+            // the sheet layout stable while checks and installation progress
+            // update asynchronously.
+            logView(c: c)
+
             Spacer(minLength: 0)
         }
         .padding(24)
@@ -126,16 +131,22 @@ struct EnvironmentCheckSheet: View {
                 ProgressView().controlSize(.small)
                 Text(stageLabel(c)).font(.subheadline).foregroundStyle(.secondary)
             }
-            ScrollView {
-                Text(log.isEmpty ? c.installWaitingForOutput : log)
-                    .font(.system(.caption, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
-            }
-            .background(Color.primary.opacity(0.06))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
         }
+    }
+
+    @ViewBuilder
+    private func logView(c: Copy) -> some View {
+        ScrollView {
+            Text(log.isEmpty ? c.installWaitingForOutput : log)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(log.isEmpty ? .secondary : .primary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, minHeight: 108, alignment: .topLeading)
+                .padding(10)
+        }
+        .frame(height: 130)
+        .background(Color.primary.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     private func stageLabel(_ c: Copy) -> String {

@@ -76,15 +76,32 @@ struct ContentView: View {
         .onChange(of: mothx.activeSessions) { _, _ in
             selectDefaultSessionIfNeeded()
         }
+        .onChange(of: mothx.sessions) { _, _ in
+            // The active-session endpoint can legitimately be empty while
+            // persisted sessions are available. Re-evaluate after the full
+            // session list finishes loading so the workspace is not blank.
+            selectDefaultSessionIfNeeded()
+        }
     }
 
     func selectDefaultSessionIfNeeded() {
         guard selectedSessionID == nil else { return }
-        // The service identifies the current active session. Do not infer it
-        // from the local history order, which can differ from the runtime.
-        let session = mothx.activeSessions.first
+        // Prefer the service's active session. If none is active, restore the
+        // most recently updated persisted session instead.
+        let session = mothx.activeSessions.first ?? mostRecentSession
         selectedSessionID = session?.id
         selectedProjectID = session?.projectID
+    }
+
+    private var mostRecentSession: MothxSession? {
+        mothx.sessions.max { lhs, rhs in
+            sessionDate(lhs) < sessionDate(rhs)
+        }
+    }
+
+    private func sessionDate(_ session: MothxSession) -> Date {
+        guard let value = session.updatedAt else { return .distantPast }
+        return ISO8601DateFormatter().date(from: value) ?? .distantPast
     }
 
     func chooseWorkDirectory() {
