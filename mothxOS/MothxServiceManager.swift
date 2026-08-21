@@ -71,6 +71,10 @@ final class MothxServiceManager: ObservableObject {
     @Published var settingsError: String?
     private var rawSettings: [String: Any] = [:]
     let baseURL = URL(string: "http://127.0.0.1:7872")!
+    /// Browser links are derived from the same endpoint used for health checks
+    /// and API requests, rather than maintaining a separate UI-only URL.
+    var webUIURL: URL { baseURL.appendingPathComponent("/") }
+    var advancedTestURL: URL { URL(string: baseURL.absoluteString + "/#/settings")! }
     private var process: Process?
     private var startupPipe: Pipe?
     private static var cachedLoginShellEnvironment: [String: String]?

@@ -199,6 +199,9 @@ struct Copy {
 
     // MARK: - About
     var about: String { text("关于软件", "About") }
+    var advancedSettings: String { text("高级设置", "Advanced settings") }
+    var advancedSettingsSubtitle: String { text("打开 mothx WebUI 的高级设置页面", "Open mothx WebUI advanced settings") }
+    var openAdvancedSettings: String { text("打开高级设置", "Open advanced settings") }
     var aboutSubtitle: String { text("Mothx UI for MacOS 的版本信息与更新", "Version info and updates for Mothx UI for MacOS") }
     var appNameLabel: String { text("应用名称", "App Name") }
     var appVersionLabel: String { text("App 版本", "App Version") }

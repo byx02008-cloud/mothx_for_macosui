@@ -84,7 +84,7 @@ struct Sidebar: View {
                             Label(mothx.state == .connected ? c.restartService : c.startService, systemImage: mothx.state == .connected ? "arrow.clockwise" : "play.fill")
                                 .padding(.horizontal, 10).frame(maxWidth: .infinity, minHeight: 40, alignment: .leading).contentShape(Rectangle())
                         }.buttonStyle(.plain).hoverHighlight().frame(maxWidth: .infinity)
-                        Button { showConnectionMenu = false; NSWorkspace.shared.open(URL(string: "http://127.0.0.1:7872/")!) } label: {
+                        Button { showConnectionMenu = false; NSWorkspace.shared.open(mothx.webUIURL) } label: {
                             Label(c.openWebUI, systemImage: "safari")
                                 .padding(.horizontal, 10).frame(maxWidth: .infinity, minHeight: 40, alignment: .leading).contentShape(Rectangle())
                         }.buttonStyle(.plain).hoverHighlight().frame(maxWidth: .infinity)
