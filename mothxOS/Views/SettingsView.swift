@@ -105,24 +105,61 @@ struct ProviderList: View {
     let select: (MothxProviderConfig) -> Void
     let add: () -> Void
     let delete: (String) -> Void
+    @State private var searchText = ""
+
+    private var filteredProviders: [MothxProviderConfig] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return providers }
+        return providers.filter { provider in
+            [provider.id, provider.vendor, provider.api].contains { $0.lowercased().contains(query) }
+        }
+    }
 
     var body: some View {
         let c = languageStore.copy
         return SettingsCard(title: c.providers, subtitle: c.providerListSubtitle) {
             HStack { Text(c.allProviders).font(.headline); Spacer(); Button(action: add) { Label(c.addProvider, systemImage: "plus") }.buttonStyle(.borderedProminent).tint(.orange) }
-            ForEach(providers) { provider in
-                Button { select(provider) } label: {
-                    HStack(spacing: 14) {
-                        Image(systemName: provider.id == defaultID ? "star.circle.fill" : "server.rack").font(.title3).foregroundStyle(provider.id == defaultID ? .orange : .secondary)
-                        VStack(alignment: .leading, spacing: 4) { Text(provider.id).font(.system(size: 14, weight: .medium)); Text(provider.vendor.isEmpty ? provider.api : provider.vendor).font(.caption).foregroundStyle(.secondary) }
-                        Spacer()
-                        Text("\(provider.models.count) models").font(.caption).foregroundStyle(.secondary)
-                        Button { delete(provider.id) } label: { Image(systemName: "trash").foregroundStyle(.red.opacity(0.8)) }.buttonStyle(.plain)
-                        Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
-                    }.padding(12).background(Color.primary.opacity(0.16)).clipShape(RoundedRectangle(cornerRadius: 8))
-                }.buttonStyle(.plain).foregroundStyle(.primary)
+            SearchField(text: $searchText, placeholder: c.searchProviders)
+            ForEach(filteredProviders) { provider in
+                ProviderRow(provider: provider, defaultID: defaultID, select: { select(provider) }, delete: { delete(provider.id) })
             }
         }
+    }
+}
+
+private struct ProviderRow: View {
+    let provider: MothxProviderConfig
+    let defaultID: String
+    let select: () -> Void
+    let delete: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Image(systemName: provider.id == defaultID ? "star.circle.fill" : "server.rack")
+                .font(.title3)
+                .foregroundStyle(provider.id == defaultID ? .orange : .secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(provider.id).font(.system(size: 14, weight: .medium))
+                Text(provider.vendor.isEmpty ? provider.api : provider.vendor).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Text("\(provider.models.count) models").font(.caption).foregroundStyle(.secondary)
+            if isHovered {
+                Button(action: delete) {
+                    Image(systemName: "trash").foregroundStyle(.red.opacity(0.8))
+                }.buttonStyle(.plain).hoverHighlight()
+            }
+            Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(isHovered ? Color.primary.opacity(0.22) : Color.primary.opacity(0.16))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .contentShape(Rectangle())
+        .foregroundStyle(.primary)
+        .onHover { isHovered = $0 }
+        .onTapGesture(perform: select)
     }
 }
 
@@ -308,7 +345,34 @@ struct ProviderSection: View { @EnvironmentObject private var languageStore: Lan
 
 struct ModelSection: View { @EnvironmentObject private var mothx: MothxServiceManager; @EnvironmentObject private var languageStore: LanguageStore; @Binding var provider: MothxProviderConfig; @Binding var selectedID: String; @Binding var discovering: Bool; let delete: (String, String) -> Void
     @State private var selectedIndex: Int?
-    var body: some View { let c = languageStore.copy; return SettingsCard(title: c.models, subtitle: c.text("对应 providers.<providerId>.models", "providers.<providerId>.models")) { HStack { Text(c.configuredModels).font(.headline); Spacer(); Button { provider.models.insert(MothxModelConfig(id: "new-model", name: "New model"), at: 0); selectedIndex = 0 } label: { Label(c.addModel, systemImage: "plus") }.buttonStyle(.bordered); Button { Task { discovering = true; let models = await mothx.discoverModels(provider: provider); if !models.isEmpty { provider.models = models; selectedIndex = models.count > 1 ? 1 : 0 }; discovering = false } } label: { Label(discovering ? c.text("获取中…", "Discovering…") : c.discover, systemImage: "arrow.triangle.2.circlepath") }.buttonStyle(.bordered).disabled(provider.baseUrl.isEmpty) }; if provider.models.isEmpty { Text(c.noModelsHint).font(.callout).foregroundStyle(.secondary) } else { ForEach(provider.models.indices, id: \.self) { index in ModelRow(model: $provider.models[index], selected: selectedIndex == index) { selectedIndex = index } delete: { if selectedIndex == index { selectedIndex = nil }; delete(provider.models[index].id, provider.models[index].displayName) } } } } }
+    @State private var searchText = ""
+    private var filteredIndices: [Int] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return Array(provider.models.indices) }
+        return provider.models.indices.filter { index in
+            let model = provider.models[index]
+            return model.id.lowercased().contains(query) || model.displayName.lowercased().contains(query)
+        }
+    }
+    var body: some View { let c = languageStore.copy; return SettingsCard(title: c.models, subtitle: c.text("对应 providers.<providerId>.models", "providers.<providerId>.models")) { HStack { Text(c.configuredModels).font(.headline); Spacer(); Button { provider.models.insert(MothxModelConfig(id: "new-model", name: "New model"), at: 0); selectedIndex = 0 } label: { Label(c.addModel, systemImage: "plus") }.buttonStyle(.bordered); Button { Task { discovering = true; let discovered = await mothx.discoverModels(provider: provider); let existingIDs = Set(provider.models.map { $0.id.trimmingCharacters(in: .whitespacesAndNewlines) }); let newModels = discovered.filter { model in let id = model.id.trimmingCharacters(in: .whitespacesAndNewlines); return !id.isEmpty && !existingIDs.contains(id) }; if !newModels.isEmpty { provider.models.append(contentsOf: newModels); await mothx.saveProvider(provider, asDefault: false); selectedIndex = provider.models.firstIndex(where: { $0.id == newModels.first?.id }) }; discovering = false } } label: { Label(discovering ? c.text("获取中…", "Discovering…") : c.discover, systemImage: "arrow.triangle.2.circlepath") }.buttonStyle(.bordered).disabled(provider.baseUrl.isEmpty) }; if provider.models.isEmpty { Text(c.noModelsHint).font(.callout).foregroundStyle(.secondary) } else { SearchField(text: $searchText, placeholder: c.searchModels); ForEach(filteredIndices, id: \.self) { index in ModelRow(model: $provider.models[index], selected: selectedIndex == index) { selectedIndex = index } delete: { if selectedIndex == index { selectedIndex = nil }; delete(provider.models[index].id, provider.models[index].displayName) } } } } }
+}
+
+private struct SearchField: View {
+    @Binding var text: String
+    let placeholder: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            TextField(placeholder, text: $text).textFieldStyle(.plain)
+            if !text.isEmpty {
+                Button { text = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }.buttonStyle(.plain)
+            }
+        }
+        .padding(9)
+        .background(Color.primary.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 7))
+    }
 }
 
 struct ModelRow: View {
@@ -317,8 +381,9 @@ struct ModelRow: View {
     let selected: Bool
     let select: () -> Void
     let delete: () -> Void
+    @State private var isHovered = false
 
-    var body: some View { VStack(alignment: .leading, spacing: 12) { Button(action: select) { HStack { Image(systemName: selected ? "chevron.down" : "chevron.right").font(.caption); Text(model.displayName).font(.system(size: 14, weight: .medium)); Text(model.id).font(.caption).foregroundStyle(.secondary); Spacer(); if model.reasoning { Text("Reasoning").font(.caption2).foregroundStyle(.orange) }; Button(action: delete) { Image(systemName: "trash").foregroundStyle(.red.opacity(0.8)) }.buttonStyle(.plain) }.foregroundStyle(.primary) }.buttonStyle(.plain); if selected { HStack { SettingsField(title: "Model ID", text: $model.id); SettingsField(title: "Name", text: $model.name) }; HStack { NumberField(title: "Context window", value: $model.contextWindow); NumberField(title: "Max tokens", value: $model.maxTokens) }; Toggle("Reasoning", isOn: $model.reasoning); Text("Input: \(model.input.isEmpty ? "text" : model.input.joined(separator: ", "))").font(.caption).foregroundStyle(.secondary) } }.padding(14).background(selected ? Color.primary.opacity(0.08) : (colorScheme == .light ? .white : .codexCard)).clipShape(RoundedRectangle(cornerRadius: 9)) }
+    var body: some View { VStack(alignment: .leading, spacing: 12) { HStack { Image(systemName: selected ? "chevron.down" : "chevron.right").font(.caption); Text(model.displayName).font(.system(size: 14, weight: .medium)); Text(model.id).font(.caption).foregroundStyle(.secondary); Spacer(); if model.reasoning { Text("Reasoning").font(.caption2).foregroundStyle(.orange) }; Button(action: delete) { Image(systemName: "trash").foregroundStyle(.red.opacity(0.8)) }.buttonStyle(.plain) }.foregroundStyle(.primary); if selected { HStack { SettingsField(title: "Model ID", text: $model.id); SettingsField(title: "Name", text: $model.name) }; HStack { NumberField(title: "Context window", value: $model.contextWindow); NumberField(title: "Max tokens", value: $model.maxTokens) }; Toggle("Reasoning", isOn: $model.reasoning); Text("Input: \(model.input.isEmpty ? "text" : model.input.joined(separator: ", "))").font(.caption).foregroundStyle(.secondary) } }.padding(14).frame(maxWidth: .infinity, alignment: .leading).background(selected ? Color.primary.opacity(0.08) : (isHovered ? Color.primary.opacity(0.08) : (colorScheme == .light ? .white : .codexCard))).clipShape(RoundedRectangle(cornerRadius: 9)).contentShape(Rectangle()).onHover { isHovered = $0 }.onTapGesture(perform: select) }
 }
 
 struct NumberField: View { let title: String; @Binding var value: Int

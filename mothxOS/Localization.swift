@@ -66,6 +66,8 @@ struct Copy {
     var deleteTitle: String { text("确认删除", "Confirm deletion") }
     var delete: String { text("删除", "Delete") }
     var cancel: String { text("取消", "Cancel") }
+    var searchProviders: String { text("搜索运营商", "Search providers") }
+    var searchModels: String { text("搜索模型", "Search models") }
     func deleteProjectMessage(_ name: String) -> String { text("删除项目 \(name)？项目及其关联关系将在确认后删除。", "Delete project \(name)? The project and its associations will be removed after confirmation.") }
     func deleteSessionMessage(_ id: String?) -> String {
         guard let id, !id.isEmpty else { return text("删除此会话？会话记录将在确认后删除。", "Delete this session? Its conversation history will be removed after confirmation.") }

@@ -1034,11 +1034,36 @@ final class MothxServiceManager: ObservableObject {
         do {
             let body = try jsonData(["api": provider.api, "baseUrl": provider.baseUrl, "apiKey": provider.apiKey, "httpProxy": provider.httpProxy, "forceHTTP11": provider.forceHTTP11, "headers": provider.headers])
             let data = try await request(path: "api/provider/models", method: "POST", body: body)
-            let result = try JSONDecoder().decode(DiscoveredModelsResponse.self, from: data)
-            return result.data.map { MothxModelConfig(id: $0.id, name: $0.name, reasoning: $0.reasoning, contextWindow: $0.contextWindow, maxTokens: $0.maxTokens, input: $0.input) }
+            return decodeDiscoveredModels(data)
         } catch {
             settingsError = copy.discoverModelsFailedPrefix(describe(error))
             return []
+        }
+    }
+
+    private func decodeDiscoveredModels(_ data: Data) -> [MothxModelConfig] {
+        guard let object = try? JSONSerialization.jsonObject(with: data) else { return [] }
+        let items: [[String: Any]?]
+        if let array = object as? [[String: Any]] {
+            items = array.map(Optional.some)
+        } else if let envelope = object as? [String: Any],
+                  let values = (envelope["data"] as? [[String: Any]]) ?? (envelope["models"] as? [[String: Any]]) {
+            items = values.map(Optional.some)
+        } else {
+            return []
+        }
+
+        var seen = Set<String>()
+        return items.compactMap { item in
+            guard let item else { return nil }
+            let rawID = (item["id"] as? String) ?? (item["name"] as? String) ?? (item["model"] as? String) ?? ""
+            let id = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty, seen.insert(id).inserted else { return nil }
+            let name = ((item["name"] as? String) ?? (item["displayName"] as? String) ?? id).trimmingCharacters(in: .whitespacesAndNewlines)
+            let contextWindow = (item["contextWindow"] as? Int) ?? (item["context_length"] as? Int) ?? 0
+            let maxTokens = (item["maxTokens"] as? Int) ?? (item["max_output_tokens"] as? Int) ?? (item["max_tokens"] as? Int) ?? 0
+            let input = (item["input"] as? [String]) ?? (item["input_modalities"] as? [String]) ?? ["text"]
+            return MothxModelConfig(id: id, name: name.isEmpty ? id : name, reasoning: item["reasoning"] as? Bool ?? false, contextWindow: contextWindow, maxTokens: maxTokens, input: input)
         }
     }
 
