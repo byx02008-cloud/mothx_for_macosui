@@ -6,12 +6,12 @@ import Charts
 struct ContentView: View {
     @EnvironmentObject private var mothx: MothxServiceManager
     @EnvironmentObject private var languageStore: LanguageStore
+    @Binding var showEnvironmentCheck: Bool
     @State private var selectedSessionID: String?
     @State private var prompt = ""
     @State private var showSettings = false
     @State private var selectedProjectID: String?
     @State private var showNewProject = false
-    @State private var showEnvironmentCheck = true
     @State private var newProjectName = ""
     @State private var newProjectWorkDir = ""
     @State private var appearanceNow = Date()

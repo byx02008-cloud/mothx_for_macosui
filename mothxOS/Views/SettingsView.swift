@@ -88,7 +88,7 @@ struct SettingsView: View {
         } message: {
             Text(pendingDeletion?.message(using: languageStore.copy) ?? languageStore.copy.text("此操作无法撤销。", "This action cannot be undone."))
         }
-        .task { await mothx.loadSettings(); defaultProviderID = mothx.defaultProvider; defaultModelID = mothx.defaultModel; defaultThinkingLevel = mothx.defaultThinkingLevel; defaultMode = mothx.defaultMode; language = mothx.tuilang; skillsDir = mothx.skillsDir; sessionDir = mothx.sessionDir; imageGeneration = mothx.imageGeneration; providerID = "" }
+        .task { await mothx.loadSettings(); defaultProviderID = mothx.defaultProvider; defaultModelID = mothx.defaultModel; defaultThinkingLevel = mothx.defaultThinkingLevel; defaultMode = mothx.defaultMode; language = languageStore.setting; skillsDir = mothx.skillsDir; sessionDir = mothx.sessionDir; imageGeneration = mothx.imageGeneration; providerID = "" }
     }
     func select(_ provider: MothxProviderConfig) { providerID = provider.id; draft = provider; modelID = provider.models.first?.id ?? ""; saved = false }
     func save() async { await mothx.saveProvider(draft, asDefault: false); saved = true }
@@ -256,9 +256,15 @@ struct GeneralSection: View {
                     Text("Auto").tag("auto")
                     Text("Global").tag("global")
                 }.frame(width: 180)
-                Button(c.save) { Task { await mothx.saveLanguage(language); languageStore.update(setting: language) } }.buttonStyle(.borderedProminent).tint(.orange)
+                Button(c.save) {
+                    Task {
+                        if await mothx.saveLanguage(language) {
+                            languageStore.update(setting: language)
+                        }
+                    }
+                }.buttonStyle(.borderedProminent).tint(.orange)
             }
-            Text(c.text("语言值会保存到 mothx settings.json 的 tuilang 字段。", "The language value is saved to mothx settings.json as tuilang.")).font(.caption).foregroundStyle(.secondary)
+            Text(c.text("语言值会同时保存到本地配置和 mothx settings.json 的 tuilang 字段。", "The language value is saved to the local app settings and mothx settings.json as tuilang.")).font(.caption).foregroundStyle(.secondary)
         }
     }
 }

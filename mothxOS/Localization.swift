@@ -338,13 +338,62 @@ func formatElapsedShort(_ elapsed: TimeInterval, language: AppLanguage) -> Strin
 
 @MainActor
 final class LanguageStore: ObservableObject {
-    @Published private(set) var setting = "auto"
-    @Published private(set) var language: AppLanguage = .en
+    @Published private(set) var setting: String
+    @Published private(set) var language: AppLanguage
+    private(set) var hasStoredSetting: Bool
+
+    private static let localSettingsURL: URL = {
+        let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("mothxOS", isDirectory: true)
+        return directory.appendingPathComponent("app-settings.json")
+    }()
+
+    init() {
+        let storedSetting = Self.readStoredSetting()
+        let initialSetting = storedSetting ?? "auto"
+        setting = initialSetting
+        language = AppLanguage.resolve(setting: initialSetting)
+        hasStoredSetting = storedSetting != nil
+    }
 
     var copy: Copy { Copy(resolvedLanguage: language) }
 
     func update(setting: String) {
-        self.setting = setting
-        self.language = AppLanguage.resolve(setting: setting)
+        let value = setting.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "auto" : setting
+        self.setting = value
+        self.language = AppLanguage.resolve(setting: value)
+        self.hasStoredSetting = true
+        Self.writeStoredSetting(value)
+    }
+
+    /// Imports the server setting only for an existing installation that has
+    /// no local language copy yet. After this, the local copy is authoritative
+    /// for the app's startup UI.
+    func adoptServerSettingIfNeeded(_ serverSetting: String) {
+        guard !hasStoredSetting else { return }
+        guard !serverSetting.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        update(setting: serverSetting)
+    }
+
+    private static func readStoredSetting() -> String? {
+        guard let data = try? Data(contentsOf: localSettingsURL),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let value = object["tuilang"] as? String,
+              !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return value
+    }
+
+    private static func writeStoredSetting(_ value: String) {
+        do {
+            let directory = localSettingsURL.deletingLastPathComponent()
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let data = try JSONSerialization.data(withJSONObject: ["tuilang": value], options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: localSettingsURL, options: .atomic)
+        } catch {
+            // The service settings remain the source of truth for persistence
+            // failures; a local file failure must not block the UI.
+        }
     }
 }

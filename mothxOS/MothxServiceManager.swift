@@ -711,7 +711,11 @@ final class MothxServiceManager: ObservableObject {
                 let object = (try JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
                 let status = object["status"] as? String ?? object["state"] as? String ?? "running"
                 runStatus = status
-                updateRunCacheHitRate(from: object["usage"])
+                // mothx versions may expose the raw run view with Go's
+                // exported field names ("Usage") or the documented JSON
+                // names ("usage"). Accept both while the service rolls
+                // between those response shapes.
+                updateRunCacheHitRate(from: object["usage"] ?? object["Usage"])
                 let messages = await loadMessages(sessionID: sessionID)
                 // Track current running message for typewriter effect
                 if let replyID = runReplyMessageID {
@@ -744,17 +748,32 @@ final class MothxServiceManager: ObservableObject {
         return max(0, Date().timeIntervalSince(runStartedAt))
     }
 
-    /// Usage is persisted in mothx's provider-native shape. The denominator
-    /// includes uncached input plus cache reads and writes, matching mothx's
-    /// CacheInfo calculation.
+    /// Usage may arrive in mothx's OpenAI `CompletionUsage` shape
+    /// (prompt_tokens / completion_tokens / total_tokens / cache_read_tokens /
+    /// cache_write_tokens) or the normalized provider shape (input / output /
+    /// totalTokens / cacheRead / cacheWrite). Both are handled here.
+    ///
+    /// The denominator mirrors mothx's `Usage.TotalInputTokens()`: use
+    /// `total - output` when a total is reported (so `prompt_tokens` already
+    /// includes the cached portion and must NOT be inflated again), otherwise
+    /// fall back to `input + cacheRead + cacheWrite`. The ratio therefore means
+    /// "what portion of this turn's full prompt came from cache", matching the
+    /// TUI's `CacheInfo` display.
     private func updateRunCacheHitRate(from rawUsage: Any?) {
         guard let usage = rawUsage as? [String: Any] else { return }
-        let input = integerValue(usage["input"] ?? usage["inputTokens"] ?? usage["prompt_tokens"])
-        let cacheRead = integerValue(usage["cacheRead"] ?? usage["cache_read_tokens"] ?? usage["cached_tokens"])
-        let cacheWrite = integerValue(usage["cacheWrite"] ?? usage["cache_write_tokens"])
-        let denominator = input + cacheRead + cacheWrite
-        guard denominator > 0 else { return }
-        runCacheHitRate = min(1, max(0, Double(cacheRead) / Double(denominator)))
+        let input = integerValue(usage["input"] ?? usage["Input"] ?? usage["inputTokens"] ?? usage["input_tokens"] ?? usage["prompt_tokens"])
+        let output = integerValue(usage["output"] ?? usage["Output"] ?? usage["outputTokens"] ?? usage["completion_tokens"])
+        let total = integerValue(usage["totalTokens"] ?? usage["TotalTokens"] ?? usage["total_tokens"])
+        let cacheRead = integerValue(usage["cacheRead"] ?? usage["CacheRead"] ?? usage["cache_read_tokens"] ?? usage["cached_tokens"])
+        let cacheWrite = integerValue(usage["cacheWrite"] ?? usage["CacheWrite"] ?? usage["cache_write_tokens"])
+        let totalInput: Int
+        if total > 0 {
+            totalInput = max(0, total - output)
+        } else {
+            totalInput = input + cacheRead + cacheWrite
+        }
+        guard totalInput > 0 else { return }
+        runCacheHitRate = min(1, max(0, Double(cacheRead) / Double(totalInput)))
     }
 
     private func integerValue(_ value: Any?) -> Int {
@@ -1056,18 +1075,22 @@ final class MothxServiceManager: ObservableObject {
         }
     }
 
-    func saveLanguage(_ value: String) async {
+    @discardableResult
+    func saveLanguage(_ value: String) async -> Bool {
         await saveGlobalSettings(["tuilang": value])
     }
 
-    func saveGlobalSettings(_ values: [String: Any]) async {
+    @discardableResult
+    func saveGlobalSettings(_ values: [String: Any]) async -> Bool {
         do {
             for (key, value) in values { rawSettings[key] = value }
             let data = try JSONSerialization.data(withJSONObject: rawSettings)
             _ = try await request(path: "api/settings", method: "PUT", body: data)
             await loadSettings()
+            return true
         } catch {
             settingsError = copy.saveGlobalSettingsFailedPrefix(describe(error))
+            return false
         }
     }
 

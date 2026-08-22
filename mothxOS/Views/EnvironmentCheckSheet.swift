@@ -227,7 +227,9 @@ struct EnvironmentCheckSheet: View {
         try? await Task.sleep(for: .seconds(2))
         phase = .connecting
         await mothx.connectAtLaunch()
-        languageStore.update(setting: mothx.tuilang)
+        if mothx.state == .connected {
+            languageStore.adoptServerSettingIfNeeded(mothx.tuilang)
+        }
         await mothx.loadWorkspace()
         if mothx.workspaceSyncState == .passed {
             phase = .allPassed
