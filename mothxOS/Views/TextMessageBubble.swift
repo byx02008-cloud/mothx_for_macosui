@@ -29,13 +29,13 @@ struct TextMessageBubble: View {
             if isUser { Spacer(minLength: 70) }
             VStack(alignment: isUser ? .trailing : .leading, spacing: 0) {
                 HStack(alignment: .top, spacing: 10) {
-                    if !isUser { Image("MothxLogo").resizable().scaledToFit().frame(width: 18, height: 18) }
                     VStack(alignment: .leading, spacing: 0) {
                         if !isUser && !isCurrentRunning && !displayText.isEmpty {
                             MarkdownMessageText(markdown: displayText)
                         } else {
                             Text(displayText.isEmpty ? (isUser ? "…" : "Thinking…") : displayText)
                                 .textSelection(.enabled)
+                                .lineSpacing(4)
                                 .frame(maxWidth: 560, alignment: .leading)
                         }
                         if isTyping {
@@ -43,7 +43,6 @@ struct TextMessageBubble: View {
                                 .opacity(blinkOpacity).padding(.leading, 2).padding(.top, -16)
                         }
                     }
-                    if isUser { Image(systemName: "person.circle").foregroundStyle(Color.secondary) }
                 }
                 .padding(14)
                 .background(isUser ? userBackground : assistantBackground)
@@ -164,9 +163,9 @@ private struct MarkdownMessageText: View {
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                 } else if !segment.content.isEmpty {
                     if let attributedString = attributedString(for: segment.content) {
-                        Text(attributedString)
+                        Text(attributedString).lineSpacing(4)
                     } else {
-                        Text(segment.content)
+                        Text(segment.content).lineSpacing(4)
                     }
                 }
             }
@@ -211,32 +210,63 @@ private struct MarkdownMessageText: View {
         return lines.joined(separator: "\n")
     }
 
+    /// AttributedString.MarkdownParsingOptions(interpretedSyntax: .full) collapses
+    /// every newline in the source — soft breaks become spaces and paragraph breaks
+    /// are dropped entirely — so a multi-line response would render as one unbroken
+    /// run of text. Parse line-by-line instead (inline formatting such as **bold**,
+    /// `code`, and links is preserved) and re-insert the breaks the author typed.
     private func attributedString(for markdown: String) -> AttributedString? {
         let normalized = normalizedMarkdown(for: markdown)
-        if let parsed = try? AttributedString(
-            markdown: normalized,
-            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
-        ) {
-            return parsed
-        }
-
-        // A malformed fragment should not make the entire historical message
-        // fall back to raw Markdown. Parse each line independently so valid
-        // formatting in the rest of the response is still rendered.
         let lines = normalized.components(separatedBy: "\n")
         var result = AttributedString()
-        for (index, line) in lines.enumerated() {
-            if let parsedLine = try? AttributedString(
-                markdown: line,
-                options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
-            ) {
-                result += parsedLine
-            } else {
-                result += AttributedString(line)
+        var needParagraphBreak = false
+        for rawLine in lines {
+            let line = rawLine.hasSuffix("\r") ? String(rawLine.dropLast()) : rawLine
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty {
+                needParagraphBreak = true
+                continue
             }
-            if index < lines.count - 1 { result += AttributedString("\n") }
+            if !result.characters.isEmpty {
+                result += AttributedString(needParagraphBreak ? "\n\n" : "\n")
+            }
+            needParagraphBreak = false
+            result += parsedInlineLine(trimmed)
         }
         return result
+    }
+
+    /// Parse one line with full inline syntax. Block markers such as `- `, `* `,
+    /// or `1. ` are stripped by the parser when the block is a single line, so
+    /// restore them to keep lists readable.
+    private func parsedInlineLine(_ line: String) -> AttributedString {
+        let marker = listMarkerPrefix(of: line)
+        let content = marker.map { String(line.dropFirst($0.count)) } ?? line
+        if let parsed = try? AttributedString(
+            markdown: content,
+            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
+        ) {
+            if let marker {
+                var result = AttributedString(marker)
+                result += parsed
+                return result
+            }
+            return parsed
+        }
+        // A malformed fragment should not make the entire message fall back to
+        // raw Markdown; keep this line literal so the rest still renders.
+        return AttributedString(line)
+    }
+
+    private func listMarkerPrefix(of line: String) -> String? {
+        let patterns = [#"^([-*+])\s+"#, #"^(\d+[.)])\s+"#]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern),
+                  let match = regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
+                  let range = Range(match.range(at: 1), in: line) else { continue }
+            return String(line[range]) + " "
+        }
+        return nil
     }
 
     /// Some model responses put whitespace inside emphasis delimiters, for
