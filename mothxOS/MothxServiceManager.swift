@@ -542,6 +542,16 @@ final class MothxServiceManager: ObservableObject {
         }
     }
 
+    /// Resolves the working directory for a session: the session's own workDir
+    /// when present, otherwise its project's workDir. Shared by the workspace
+    /// header, the run submission path, and the embedded TUI terminal panel.
+    func workDir(for sessionID: String) -> String {
+        let session = sessions.first(where: { $0.id == sessionID }) ?? pendingSessions[sessionID]
+        if let sessionWorkDir = session?.workDir, !sessionWorkDir.isEmpty { return sessionWorkDir }
+        guard let projectID = session?.projectID else { return "" }
+        return projects.first(where: { $0.id == projectID })?.workDir ?? ""
+    }
+
     func prepareSession(projectID: String?) -> MothxSession {
         // mothx has no empty-session endpoint. The returned ID is submitted
         // with the first real run and becomes persistent at that point.
@@ -679,6 +689,75 @@ final class MothxServiceManager: ObservableObject {
             runError = copy.stopRunFailedPrefix(describe(error))
             settingsError = runError
         }
+    }
+
+    // MARK: - Interrupted-switch guard
+
+    /// Switch action deferred until the user confirms stopping the current
+    /// task (session/mode switches during a running task would stop it).
+    private(set) var pendingSwitchAction: (() -> Void)?
+    @Published private(set) var showSwitchConfirmation = false
+
+    /// True when the serve API reports an active run for the session. Backed
+    /// by the durable `session_runs` table (statuses created/queued/running/
+    /// waiting_for_approval/waiting_for_question/cancelling/terminalizing), so
+    /// it also sees runs started by the terminal-mode TUI process, not just
+    /// runs submitted from this UI. Returns false on any error (offline, etc.).
+    func sessionHasActiveRun(_ sessionID: String) async -> Bool {
+        guard !sessionID.isEmpty else { return false }
+        do {
+            let data = try await request(path: "api/sessions/\(sessionID)/runtime", method: "GET")
+            guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return false
+            }
+            return object["activeRun"] is [String: Any]
+        } catch {
+            return false
+        }
+    }
+
+    /// Runs `action` (a session/mode switch) immediately, or defers it behind
+    /// a confirmation dialog while a task is running: either this UI's own run
+    /// (`isRunning`) or an active run the serve API reports for
+    /// `activeRunSessionID` (which includes runs started inside the mothx TUI).
+    /// Idle states switch without any dialog.
+    func requestSwitch(activeRunSessionID: String? = nil, _ action: @escaping () -> Void) {
+        if isRunning {
+            pendingSwitchAction = action
+            showSwitchConfirmation = true
+            return
+        }
+        guard let sessionID = activeRunSessionID else {
+            action()
+            return
+        }
+        Task { @MainActor in
+            let busy = await sessionHasActiveRun(sessionID)
+            if busy {
+                pendingSwitchAction = action
+                showSwitchConfirmation = true
+            } else {
+                action()
+            }
+        }
+    }
+
+    /// User confirmed: stop the current run first, then perform the switch.
+    func confirmSwitch() {
+        showSwitchConfirmation = false
+        let action = pendingSwitchAction
+        pendingSwitchAction = nil
+        guard let action else { return }
+        Task { @MainActor in
+            await cancelRun()
+            action()
+        }
+    }
+
+    /// User declined: keep the current session/mode and the running task.
+    func cancelSwitch() {
+        showSwitchConfirmation = false
+        pendingSwitchAction = nil
     }
 
     /// Plans are transient run UI state and must not be restored from history
@@ -1337,7 +1416,7 @@ final class MothxServiceManager: ObservableObject {
         await resolveGlobalMothxExecutable() != nil
     }
 
-    private static func resolveGlobalMothxExecutable() async -> URL? {
+    static func resolveGlobalMothxExecutable() async -> URL? {
         guard let npmRoot = await shellCapturedPath("npm root -g") else { return nil }
         #if arch(arm64)
         let platformPackage = "mothx-installer-darwin-arm64"
@@ -1399,7 +1478,7 @@ final class MothxServiceManager: ObservableObject {
     /// resolve them, causing provider calls to fail. This captures the login
     /// shell's full environment once and merges it over the app's own, so the
     /// child process sees the same variables the user's Terminal would.
-    private static func loginShellEnvironment() async -> [String: String] {
+    static func loginShellEnvironment() async -> [String: String] {
         if let cachedLoginShellEnvironment { return cachedLoginShellEnvironment }
         let env = await withCheckedContinuation { (continuation: CheckedContinuation<[String: String], Never>) in
             DispatchQueue.global(qos: .userInitiated).async {

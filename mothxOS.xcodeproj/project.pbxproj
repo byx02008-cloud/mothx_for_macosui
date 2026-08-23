@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		C207FCAA303AB8D5005F6B16 /* SwiftTerm in Frameworks */ = {isa = PBXBuildFile; productRef = C27552EE3032DD3900BF2801 /* SwiftTerm */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		C27552E03032DD3700BF2801 /* mothxOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = mothxOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -23,6 +27,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				C207FCAA303AB8D5005F6B16 /* SwiftTerm in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -65,6 +70,7 @@
 			);
 			name = mothxOS;
 			packageProductDependencies = (
+				C27552EE3032DD3900BF2801 /* SwiftTerm */,
 			);
 			productName = mothxOS;
 			productReference = C27552E03032DD3700BF2801 /* mothxOS.app */;
@@ -94,6 +100,9 @@
 			);
 			mainGroup = C27552D73032DD3700BF2801;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				C27552EF3032DD3900BF2801 /* XCRemoteSwiftPackageReference "SwiftTerm" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = C27552E13032DD3700BF2801 /* Products */;
 			projectDirPath = "";
@@ -331,6 +340,21 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		C27552EF3032DD3900BF2801 /* XCLocalSwiftPackageReference "SwiftTerm" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Vendor/SwiftTerm;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		C27552EE3032DD3900BF2801 /* SwiftTerm */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C27552EF3032DD3900BF2801 /* XCRemoteSwiftPackageReference "SwiftTerm" */;
+			productName = SwiftTerm;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = C27552D83032DD3700BF2801 /* Project object */;
 }

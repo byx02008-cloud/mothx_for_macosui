@@ -3,6 +3,7 @@ import SwiftUI
 struct WorkspaceView: View {
     @EnvironmentObject private var mothx: MothxServiceManager
     @EnvironmentObject private var languageStore: LanguageStore
+    @EnvironmentObject private var terminalStore: TerminalSessionStore
     @Binding var prompt: String
     let sessionID: String?
     @State private var attachments: [ComposerAttachment] = []
@@ -27,17 +28,42 @@ struct WorkspaceView: View {
     var body: some View {
         let c = languageStore.copy
         return VStack(spacing: 0) {
-            HStack {
-                Text(mothx.sessions.first(where: { $0.id == sessionID })?.title ?? c.workspace)
-                    .font(.system(size: 14, weight: .medium))
-                Spacer()
-                CurrentDirectoryMenu(path: currentWorkDir)
-            }.padding(.horizontal, 24).frame(height: 54)
-            Divider()
+            if terminalStore.isOpen {
+                TUIPanelHeader(store: terminalStore)
+                Divider()
+                TerminalPanelView(store: terminalStore)
+                    .id(terminalStore.sessionID)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+            } else {
+                HStack {
+                    Text(mothx.sessions.first(where: { $0.id == sessionID })?.title ?? c.workspace)
+                        .font(.system(size: 14, weight: .medium))
+                    Spacer()
+                    if let sessionID {
+                        Button {
+                            mothx.requestSwitch(activeRunSessionID: sessionID) {
+                                terminalStore.open(sessionID: sessionID, workDir: mothx.workDir(for: sessionID))
+                            }
+                        } label: {
+                            Label(c.terminalMode, systemImage: "terminal")
+                                .font(.callout)
+                                .padding(.horizontal, 8)
+                                .frame(minHeight: 30)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .hoverHighlight()
+                        .foregroundStyle(.secondary)
+                        .help(c.openTerminalHelp)
+                    }
+                    CurrentDirectoryMenu(path: currentWorkDir)
+                }.padding(.horizontal, 24).frame(height: 54)
+                Divider()
 
-            if let sessionID {
-                GeometryReader { viewport in
-                    ScrollViewReader { reader in
+                if let sessionID {
+                    GeometryReader { _ in
+                        ScrollViewReader { reader in
                         ScrollView {
                             LazyVStack(alignment: .leading, spacing: 6) {
                                 let isRunActive = mothx.runSessionID == sessionID && mothx.isRunning
@@ -139,12 +165,12 @@ struct WorkspaceView: View {
                     }
                 }
 
-            } else {
-                Spacer(); Text(c.workspaceHint).foregroundStyle(.secondary); Spacer()
-            }
+                } else {
+                    Spacer(); Text(c.workspaceHint).foregroundStyle(.secondary); Spacer()
+                }
 
-            PromptComposer(
-                prompt: $prompt,
+                PromptComposer(
+                    prompt: $prompt,
                 attachments: $attachments,
                 mode: $selectedMode,
                 providerID: $selectedProviderID,
@@ -158,8 +184,9 @@ struct WorkspaceView: View {
                 cacheHitRate: mothx.runCacheHitRate,
                 chooseFiles: chooseFiles,
                 submit: submit,
-                stop: { Task { await mothx.cancelRun() } }
-            ).frame(maxWidth: 760).padding(.horizontal, 25).padding(.bottom, 16)
+                    stop: { Task { await mothx.cancelRun() } }
+                ).frame(maxWidth: 760).padding(.horizontal, 25).padding(.bottom, 16)
+            }
         }.padding(.top, 1)
         .alert(c.attach, isPresented: Binding(get: { attachmentError != nil }, set: { if !$0 { attachmentError = nil } })) {
             Button(c.ok) { attachmentError = nil }
@@ -205,6 +232,21 @@ struct WorkspaceView: View {
             selectedProviderID = provider?.id ?? ""
             selectedModelID = provider?.models.first?.id ?? ""
         }
+        .onChange(of: terminalStore.isOpen) { _, isOpen in
+            guard !isOpen, let sessionID else { return }
+            // Returning from terminal mode: reload the conversation so any
+            // messages added by the mothx TUI (same session) show up.
+            Task { await mothx.loadMessages(sessionID: sessionID) }
+        }
+        .onChange(of: sessionID) { _, newSessionID in
+            // While terminal mode is active, switching to another session in
+            // the sidebar switches the terminal too: the previous mothx TUI
+            // process is terminated and a new one resumes the new session
+            // from its working directory.
+            guard terminalStore.isOpen, let newSessionID,
+                  terminalStore.sessionID != newSessionID else { return }
+            terminalStore.open(sessionID: newSessionID, workDir: mothx.workDir(for: newSessionID))
+        }
     }
 
     private func scrollToBottom(_ reader: ScrollViewProxy, animated: Bool) {
@@ -247,14 +289,7 @@ struct WorkspaceView: View {
 
     // MARK: - Helpers
 
-    private func workDir(for sessionID: String) -> String {
-        let session = mothx.sessions.first(where: { $0.id == sessionID }) ?? mothx.pendingSessions[sessionID]
-        if let sessionWorkDir = session?.workDir, !sessionWorkDir.isEmpty { return sessionWorkDir }
-        guard let projectID = session?.projectID else { return "" }
-        return mothx.projects.first(where: { $0.id == projectID })?.workDir ?? ""
-    }
-
-    private var currentWorkDir: String { workDir(for: sessionID ?? "") }
+    private var currentWorkDir: String { mothx.workDir(for: sessionID ?? "") }
 
     private func submit() {
         guard let sessionID else { return }
@@ -275,7 +310,7 @@ struct WorkspaceView: View {
             // The Run API resolves the provider from mothx's global default.
             // Persist the current selection before submitting the run.
             await mothx.saveDefaults(provider: selectedProviderID, model: selectedModel, thinkingLevel: mothx.defaultThinkingLevel, mode: selectedMode)
-            if let runID = await mothx.submitRun(sessionID: sessionID, message: question, images: imageAttachments, workDir: workDir(for: sessionID), model: selectedModel, mode: selectedMode, tools: selectedTools, skills: selectedSkills) {
+            if let runID = await mothx.submitRun(sessionID: sessionID, message: question, images: imageAttachments, workDir: mothx.workDir(for: sessionID), model: selectedModel, mode: selectedMode, tools: selectedTools, skills: selectedSkills) {
                 await mothx.pollRun(runID: runID, sessionID: sessionID)
                 await mothx.updateSessionTitle(id: sessionID, title: String((question.components(separatedBy: .newlines).first ?? question).prefix(48)))
                 await mothx.loadMessages(sessionID: sessionID)
@@ -290,7 +325,7 @@ struct WorkspaceView: View {
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = true
         guard panel.runModal() == .OK else { return }
-        let directory = workDir(for: sessionID ?? "")
+        let directory = mothx.workDir(for: sessionID ?? "")
         guard !directory.isEmpty else {
             attachmentError = languageStore.copy.noWorkDirForAttachment
             return

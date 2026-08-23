@@ -63,6 +63,12 @@ struct ContentView: View {
                 }
             }.padding(24).frame(width: 520)
         }
+        .confirmationDialog(languageStoreCopy.switchStopTaskTitle, isPresented: Binding(get: { mothx.showSwitchConfirmation }, set: { if !$0 { mothx.cancelSwitch() } }), titleVisibility: .visible) {
+            Button(languageStoreCopy.stopAndSwitch, role: .destructive) { mothx.confirmSwitch() }
+            Button(languageStoreCopy.cancel, role: .cancel) { mothx.cancelSwitch() }
+        } message: {
+            Text(languageStoreCopy.switchStopTaskMessage)
+        }
         .task {
             await mothx.loadWorkspace()
             selectDefaultSessionIfNeeded()

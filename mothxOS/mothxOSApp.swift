@@ -11,6 +11,7 @@ import SwiftUI
 struct mothxOSApp: App {
     @StateObject private var mothx = MothxServiceManager()
     @StateObject private var language = LanguageStore()
+    @StateObject private var terminalStore = TerminalSessionStore()
     // WindowGroup may recreate ContentView after the last window is closed.
     // Keep this at the App lifetime so reactivating the app does not repeat
     // launch-only environment checks or restart the existing mothx service.
@@ -21,6 +22,7 @@ struct mothxOSApp: App {
             ContentView(showEnvironmentCheck: $showEnvironmentCheck)
                 .environmentObject(mothx)
                 .environmentObject(language)
+                .environmentObject(terminalStore)
                 .task {
                     mothx.languageStore = language
                 }
