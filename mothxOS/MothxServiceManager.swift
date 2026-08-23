@@ -711,11 +711,12 @@ final class MothxServiceManager: ObservableObject {
                 let object = (try JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
                 let status = object["status"] as? String ?? object["state"] as? String ?? "running"
                 runStatus = status
-                // mothx versions may expose the raw run view with Go's
-                // exported field names ("Usage") or the documented JSON
-                // names ("usage"). Accept both while the service rolls
-                // between those response shapes.
-                updateRunCacheHitRate(from: object["usage"] ?? object["Usage"])
+                // Usage is served by GET /api/sessions/{sessionID}/runs: each
+                // run row carries `Usage` with prompt_tokens / cache_read_tokens.
+                // Read the latest run row directly to compute the cache hit rate.
+                if let usage = await latestRunUsage(sessionID: sessionID, runID: runID) {
+                    updateRunCacheHitRate(from: usage)
+                }
                 let messages = await loadMessages(sessionID: sessionID)
                 // Track current running message for typewriter effect
                 if let replyID = runReplyMessageID {
@@ -774,6 +775,33 @@ final class MothxServiceManager: ObservableObject {
         }
         guard totalInput > 0 else { return }
         runCacheHitRate = min(1, max(0, Double(cacheRead) / Double(totalInput)))
+    }
+
+    /// Fetches the latest persisted usage for the active run from
+    /// `GET /api/sessions/{sessionID}/runs` (newest-first). The row matching
+    /// the active run ID is preferred so a retry or another attempt for the
+    /// same intent cannot shadow the active run; otherwise the newest row is
+    /// used. Returns nil when the endpoint is unavailable or the run has no
+    /// usage yet — mothx only persists usage once the run terminalizes.
+    private func latestRunUsage(sessionID: String, runID: String) async -> [String: Any]? {
+        do {
+            let data = try await request(path: "api/sessions/\(sessionID)/runs?limit=3", method: "GET")
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let runs = object["runs"] as? [[String: Any]] else { return nil }
+            let usageFor: ([String: Any]) -> [String: Any]? = { row in
+                (row["Usage"] as? [String: Any]) ?? (row["usage"] as? [String: Any])
+            }
+            if let matched = runs.first(where: { ($0["ID"] as? String) == runID || ($0["id"] as? String) == runID }),
+               let usage = usageFor(matched) {
+                return usage
+            }
+            if let newest = runs.first, let usage = usageFor(newest) {
+                return usage
+            }
+            return nil
+        } catch {
+            return nil
+        }
     }
 
     private func integerValue(_ value: Any?) -> Int {
