@@ -61,6 +61,10 @@ MothxServiceManager
 
 ## 运行环境要求
 
+> **mothx 最低版本：1.2.95 及以上**（main 分支要求）。
+>
+> 客户端现在按运行直接向 `POST /api/sessions/{id}/runs` 提交 `provider` + `model` 字段（v1.2.95 新增的 per-run 厂商/模型指定），不再通过改写全局 `defaultProvider/defaultModel` 切换；低于 1.2.95 的 mothx 会忽略 `provider` 字段，会话将无法按运行指定厂商/模型（回退到全局默认）。
+
 应用本身不含 mothx 可执行文件，运行时依赖：
 
 - **Node.js**（用于安装和解析全局 mothx）

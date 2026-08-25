@@ -196,7 +196,11 @@ struct WorkspaceView: View {
         .task(id: sessionID) {
             if let sessionID {
                 selectedMode = ["plan", "agent", "yolo"].contains(mothx.defaultMode) ? mothx.defaultMode : "agent"
-                selectedProviderID = mothx.providers.first(where: { $0.id == mothx.defaultProvider })?.id ?? mothx.providers.first?.id ?? ""
+                // Restore per-session provider/model preferences when available,
+                // otherwise fall back to the global default provider.
+                let savedProvider = mothx.providerForSession(sessionID)
+                let resolvedProviderID = (savedProvider.flatMap { saved in mothx.providers.contains(where: { $0.id == saved }) ? saved : nil }) ?? mothx.defaultProvider
+                selectedProviderID = mothx.providers.first(where: { $0.id == resolvedProviderID })?.id ?? mothx.providers.first?.id ?? ""
                 let providerModels = mothx.providers.first(where: { $0.id == selectedProviderID })?.models ?? []
                 let savedModel = mothx.modelForSession(sessionID) ?? mothx.defaultModel
                 selectedModelID = providerModels.contains(where: { $0.id == savedModel }) ? savedModel : providerModels.first?.id ?? ""
@@ -300,17 +304,18 @@ struct WorkspaceView: View {
             let separator = languageStore.language == .zh ? "、" : ", "
             question = languageStore.copy.attachmentsInstruction(attachments.map(\.name).joined(separator: separator))
         }
+        let selectedProvider = selectedProviderID
         let selectedModel = selectedModelID
         let selectedMode = selectedMode
         let selectedTools = Array(selectedTools).sorted()
         let selectedSkills = Array(selectedSkills).sorted()
         prompt = ""; attachments = []
+        mothx.setSessionProvider(selectedProvider, for: sessionID)
         mothx.setSessionModel(selectedModel, for: sessionID)
         Task {
-            // The Run API resolves the provider from mothx's global default.
-            // Persist the current selection before submitting the run.
-            await mothx.saveDefaults(provider: selectedProviderID, model: selectedModel, thinkingLevel: mothx.defaultThinkingLevel, mode: selectedMode)
-            if let runID = await mothx.submitRun(sessionID: sessionID, message: question, images: imageAttachments, workDir: mothx.workDir(for: sessionID), model: selectedModel, mode: selectedMode, tools: selectedTools, skills: selectedSkills) {
+            // v1.2.95+: the run API takes provider/model directly per run,
+            // so the global defaults no longer need to be rewritten here.
+            if let runID = await mothx.submitRun(sessionID: sessionID, message: question, images: imageAttachments, workDir: mothx.workDir(for: sessionID), provider: selectedProvider, model: selectedModel, mode: selectedMode, tools: selectedTools, skills: selectedSkills) {
                 await mothx.pollRun(runID: runID, sessionID: sessionID)
                 await mothx.updateSessionTitle(id: sessionID, title: String((question.components(separatedBy: .newlines).first ?? question).prefix(48)))
                 await mothx.loadMessages(sessionID: sessionID)
@@ -616,12 +621,8 @@ struct PromptComposer: View {
                                         ForEach(filteredProviders) { provider in
                                             Button {
                                                 providerID = provider.id
-                                                let preferredModel = provider.models.first?.id ?? ""
-                                                modelID = preferredModel
+                                                modelID = provider.models.first?.id ?? ""
                                                 showProviderMenu = false
-                                                Task {
-                                                    await mothx.saveDefaults(provider: provider.id, model: preferredModel, thinkingLevel: mothx.defaultThinkingLevel, mode: mode)
-                                                }
                                             } label: {
                                                 HStack {
                                                     Text(provider.id).lineLimit(1)

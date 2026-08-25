@@ -116,6 +116,7 @@ final class MothxServiceManager: ObservableObject {
     private var runEventLastSeq: Int = 0
     @Published private(set) var currentRunID: String?
     @Published private(set) var sessionModels: [String: String] = [:]
+    @Published private(set) var sessionProviders: [String: String] = [:]
     @Published private(set) var serviceLog = ""
     @Published private(set) var currentPlan: MothxPlan?
     @Published private(set) var currentRunningMessageID: String?
@@ -633,7 +634,7 @@ final class MothxServiceManager: ObservableObject {
         }
     }
 
-    func submitRun(sessionID: String, message: String, images: [String], workDir: String = "", model: String = "", mode: String = "agent", tools: [String] = [], skills: [String] = []) async -> String? {
+    func submitRun(sessionID: String, message: String, images: [String], workDir: String = "", provider: String = "", model: String = "", mode: String = "agent", tools: [String] = [], skills: [String] = []) async -> String? {
         guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !images.isEmpty else { return nil }
         isSubmittingRun = true
         isStreaming = true
@@ -654,6 +655,9 @@ final class MothxServiceManager: ObservableObject {
         let pendingProjectID = pendingSessions[sessionID]?.projectID
         do {
             var payload: [String: Any] = ["message": message, "mode": mode, "transcript": true]
+            // v1.2.95+: the run API accepts provider/model directly per run,
+            // so the global defaults no longer need to be rewritten on submit.
+            if !provider.isEmpty { payload["provider"] = provider }
             if !model.isEmpty { payload["model"] = model }
             if !tools.isEmpty { payload["tools"] = tools }
             if !skills.isEmpty { payload["skills"] = skills }
@@ -1115,6 +1119,25 @@ final class MothxServiceManager: ObservableObject {
             if msg.isToolCall || msg.isToolResult { return true }
             return !msg.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
+    }
+
+    func setSessionProvider(_ provider: String, for sessionID: String) {
+        if provider.isEmpty {
+            sessionProviders.removeValue(forKey: sessionID)
+        } else {
+            sessionProviders[sessionID] = provider
+            try? localProjectStore?.setProvider(provider, for: sessionID)
+        }
+    }
+
+    func providerForSession(_ sessionID: String) -> String? {
+        if let provider = sessionProviders[sessionID], !provider.isEmpty { return provider }
+        let provider = try? localProjectStore?.provider(for: sessionID)
+        if let provider = provider ?? nil {
+            sessionProviders[sessionID] = provider
+            return provider
+        }
+        return nil
     }
 
     func setSessionModel(_ model: String, for sessionID: String) {

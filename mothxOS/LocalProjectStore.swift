@@ -38,9 +38,12 @@ final class LocalProjectStore {
         try execute("""
             CREATE TABLE IF NOT EXISTS session_preferences (
                 session_id TEXT PRIMARY KEY NOT NULL,
-                model_id TEXT NOT NULL
+                model_id TEXT NOT NULL,
+                provider_id TEXT
             )
         """)
+        // Migration for databases created before provider_id existed.
+        try? execute("ALTER TABLE session_preferences ADD COLUMN provider_id TEXT")
     }
 
     deinit { sqlite3_close(database) }
@@ -112,7 +115,12 @@ final class LocalProjectStore {
     }
 
     func setModel(_ modelID: String, for sessionID: String) throws {
-        try execute("INSERT OR REPLACE INTO session_preferences (session_id, model_id) VALUES (?, ?)", bindings: [sessionID, modelID])
+        // UPSERT so model and provider updates do not overwrite each other.
+        try execute("INSERT INTO session_preferences (session_id, model_id) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET model_id = excluded.model_id", bindings: [sessionID, modelID])
+    }
+
+    func setProvider(_ providerID: String, for sessionID: String) throws {
+        try execute("INSERT INTO session_preferences (session_id, provider_id) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET provider_id = excluded.provider_id", bindings: [sessionID, providerID])
     }
 
     func model(for sessionID: String) throws -> String? {
@@ -121,6 +129,15 @@ final class LocalProjectStore {
         try bind(sessionID, to: statement, index: 1)
         guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
         return string(statement, column: 0)
+    }
+
+    func provider(for sessionID: String) throws -> String? {
+        let statement = try prepare("SELECT provider_id FROM session_preferences WHERE session_id = ?")
+        defer { sqlite3_finalize(statement) }
+        try bind(sessionID, to: statement, index: 1)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        let value = string(statement, column: 0)
+        return value.isEmpty ? nil : value
     }
 
     func projectIDsBySession() throws -> [String: String] {
