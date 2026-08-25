@@ -108,7 +108,48 @@ mothxOS/
 ├── Localization.swift          # 中英文文案
 ├── Models/                     # 数据模型
 ├── Views/                      # SwiftUI 视图
-├── Utilities/                  # 通用修饰与主题色
+├── Utilities/                  # 视图修饰、运行时安装辅助（RuntimeInstall）
 ├── mothxOS.entitlements        # App Sandbox / 网络客户端 / 用户目录读写
 └── mothxOS.xcodeproj/          # Xcode 工程
+```
+
+## 调试环境变量（仅 Debug 构建生效）
+
+以下环境变量用于在本机复现启动环境检查与在线更新的各个分支。代码中以 `#if DEBUG` 包裹，Release 构建不包含。设置方式：Xcode 中 Product → Scheme → Edit Scheme… → Run → Arguments → Environment Variables，变量值设为 `1` 即生效。
+
+| 变量 | 作用 |
+| --- | --- |
+| `MOTHXOS_SIMULATE_MISSING_NODE` | 让环境检查认为 Node.js 缺失，进入 node 安装引导页（Homebrew 推荐 + 官网 pkg 警示） |
+| `MOTHXOS_SIMULATE_MOTHX_MISSING` | 让 `isMothxInstalled()` 返回 false，强制走进 mothx 安装分支 |
+| `MOTHXOS_SIMULATE_MOTHX_INSTALL_EACCES` | 模拟 `npm install -g mothx-installer` 权限错误（EACCES），进入“安装需要管理员权限”页 |
+| `MOTHXOS_SIMULATE_UPDATE_AVAILABLE` | 强制显示设置页“在线更新”按钮（本机已是最新版本时用于测试） |
+| `MOTHXOS_SIMULATE_UPDATE_EACCES` | 模拟更新时 `npm install -g` 权限错误，进入“更新需要管理员权限”页 |
+
+常用组合：
+
+```text
+# 环境检查 → node 缺失引导页
+MOTHXOS_SIMULATE_MISSING_NODE=1
+
+# 环境检查 → 管理员权限安装页
+MOTHXOS_SIMULATE_MOTHX_MISSING=1
+MOTHXOS_SIMULATE_MOTHX_INSTALL_EACCES=1
+
+# 设置 → 更新权限页
+MOTHXOS_SIMULATE_UPDATE_AVAILABLE=1
+MOTHXOS_SIMULATE_UPDATE_EACCES=1
+```
+
+> 注意：测试结束后请移除这些环境变量，否则每次启动都会进入对应模拟分支。
+## Build方法
+```text
+xcodebuild -project mothxOS.xcodeproj \
+  -scheme mothxOS \
+  -configuration Release \
+  -derivedDataPath ./build \
+  CODE_SIGNING_ALLOWED=NO build
+  
+hdiutil create -volname "mothxOS" \                                                         
+  -srcfolder ./build/Build/Products/Release/mothxOS.app \
+  -ov -format UDZO mothxOS.dmg
 ```

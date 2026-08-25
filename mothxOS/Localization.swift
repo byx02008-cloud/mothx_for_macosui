@@ -258,6 +258,10 @@ struct Copy {
     var updateLogRestartingService: String { text("[步骤] 重启 mothx 服务", "[Step] Restarting mothx service") }
     var updateLogSucceeded: String { text("[完成] 更新成功，服务已重启", "[Done] Update succeeded, service restarted") }
     var updateLogFailedPrefix: (Int32) -> String { { code in self.text("[失败] npm install 退出码 \(code)", "[Failed] npm install exited with code \(code)") } }
+    var updateLogNeedsAdmin: String { text("[提示] npm 全局目录需要管理员权限，可选择以管理员身份重试或复制 sudo 命令手动安装", "[Info] npm's global install directory needs admin rights. Retry as administrator or copy the sudo command.") }
+    var updateNeedsAdminHint: String { text("更新失败：npm 的全局安装目录归 root 所有，需要管理员权限", "Update failed: npm's global install directory is owned by root and needs admin rights.") }
+    var updateStageInstallingAdmin: String { text("正在以管理员权限执行 npm install…", "Running npm install as administrator…") }
+    var updateStageNeedsAdmin: String { text("更新需要管理员权限", "Update requires admin rights") }
 
     // MARK: - Environment check
     var envCheckTitle: String { text("环境检查", "Environment Check") }
@@ -268,6 +272,7 @@ struct Copy {
     var envCheckSyncLabel: String { text("同步项目与会话", "Sync projects and sessions") }
     var envCheckSyncFailed: String { text("项目与会话同步失败，请重试。", "Project and session sync failed. Please retry.") }
     var envCheckPassed: String { text("环境检查通过", "Environment check passed") }
+    var envCheckExit: String { text("退出", "Quit") }
     var installNodeMissingTitle: String { text("未检测到 Node.js", "Node.js not found") }
     var installNodeMissingMessage: String { text("mothx 通过 npm 分发，需要先安装 Node.js（其中包含 npm）才能继续。", "mothx is distributed via npm, which requires Node.js. Install Node.js first to continue.") }
     var installOpenNodeSite: String { text("打开 Node.js 官网下载安装包", "Open nodejs.org to download the installer") }
@@ -281,6 +286,16 @@ struct Copy {
     var installMothxFailedPrefix: (Int32) -> String { { code in self.text("npm install -g mothx-installer 失败（退出码 \(code)）", "npm install -g mothx-installer failed (exit code \(code))") } }
     var installStillNotFoundAfterInstall: String { text("已执行安装，但仍未检测到 mothx，请重试", "Installation ran, but mothx still wasn't detected. Please retry.") }
     var installWaitingForOutput: String { text("等待输出…", "Waiting for output…") }
+    var installNodePkgWarning: String { text("提示：官网安装包会把 Node.js 装到系统目录（属主为 root），之后安装 mothx 需要输入管理员密码。推荐使用 Homebrew 安装，后续无需管理员权限。", "Tip: the official installer places Node.js in a root-owned system location, so installing mothx later requires an administrator password. Homebrew installs it under your home folder and needs no admin rights afterwards.") }
+    var installMothxPermissionTitle: String { text("安装需要管理员权限", "Administrator permission required") }
+    var installMothxPermissionMessage: String { text("npm 的全局安装目录归 root 所有（常见于使用官网安装包安装的 Node.js）。请选择以下任一方式完成安装：", "npm's global install directory is owned by root (common with the official Node.js installer). Complete the installation with one of the options below:") }
+    var installUseAdminPassword: String { text("使用管理员密码安装", "Install with administrator password") }
+    var installCopySudoCommand: String { text("复制 sudo 命令", "Copy sudo command") }
+    var installOpenTerminal: String { text("打开终端", "Open Terminal") }
+    var installPrefixHint: String { text("或者把 npm 全局目录改到用户目录（仅需执行一次，之后无需管理员权限）：npm config set prefix ~/.npm-global，并把 ~/.npm-global/bin 加入 PATH。", "Or move npm's global directory into your home folder (run once, then no admin rights are needed): npm config set prefix ~/.npm-global, and add ~/.npm-global/bin to your PATH.") }
+    var installCopyPrefixCommand: String { text("复制 npm prefix 命令", "Copy npm prefix command") }
+    var installAdminCanceled: String { text("已取消安装（未执行）", "Canceled — nothing was installed") }
+    var installAdminFailedPrefix: (String) -> String { { detail in self.text("管理员安装失败：\(detail)", "Admin install failed: \(detail)") } }
 
     // MARK: - Workspace
     var ok: String { text("确定", "OK") }

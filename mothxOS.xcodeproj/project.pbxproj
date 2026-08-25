@@ -101,7 +101,7 @@
 			mainGroup = C27552D73032DD3700BF2801;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				C27552EF3032DD3900BF2801 /* XCRemoteSwiftPackageReference "SwiftTerm" */,
+				C27552EF3032DD3900BF2801 /* XCLocalSwiftPackageReference "Vendor/SwiftTerm" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = C27552E13032DD3700BF2801 /* Products */;
@@ -342,7 +342,7 @@
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
-		C27552EF3032DD3900BF2801 /* XCLocalSwiftPackageReference "SwiftTerm" */ = {
+		C27552EF3032DD3900BF2801 /* XCLocalSwiftPackageReference "Vendor/SwiftTerm" */ = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = Vendor/SwiftTerm;
 		};
@@ -351,7 +351,7 @@
 /* Begin XCSwiftPackageProductDependency section */
 		C27552EE3032DD3900BF2801 /* SwiftTerm */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = C27552EF3032DD3900BF2801 /* XCRemoteSwiftPackageReference "SwiftTerm" */;
+			package = C27552EF3032DD3900BF2801 /* XCLocalSwiftPackageReference "Vendor/SwiftTerm" */;
 			productName = SwiftTerm;
 		};
 /* End XCSwiftPackageProductDependency section */

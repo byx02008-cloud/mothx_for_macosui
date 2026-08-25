@@ -12,6 +12,7 @@ private enum Phase: Equatable {
     case nodeMissing(hasBrew: Bool)
     case installingBrewNode
     case installingMothx
+    case mothxNeedsAdmin
     case allPassed
     case connecting
     case failed(String)
@@ -35,8 +36,17 @@ struct EnvironmentCheckSheet: View {
     var body: some View {
         let c = languageStore.copy
         VStack(alignment: .leading, spacing: 16) {
-            Label(c.envCheckTitle, systemImage: "checklist")
-                .font(.title3.bold())
+            HStack(alignment: .firstTextBaseline) {
+                Label(c.envCheckTitle, systemImage: "checklist")
+                    .font(.title3.bold())
+                Spacer()
+                if showsExitButton {
+                    Button(c.envCheckExit) {
+                        quitApplication()
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
             Text(c.envCheckSubtitle)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
@@ -57,6 +67,8 @@ struct EnvironmentCheckSheet: View {
             case .allPassed:
                 Label(c.envCheckPassed, systemImage: "checkmark.circle.fill")
                     .foregroundStyle(.green)
+            case .mothxNeedsAdmin:
+                mothxNeedsAdminView(c: c)
             case .failed(let message):
                 VStack(alignment: .leading, spacing: 10) {
                     Label(message, systemImage: "xmark.octagon.fill")
@@ -87,6 +99,15 @@ struct EnvironmentCheckSheet: View {
         }
     }
 
+    /// The quit button is only offered while the environment check is stuck:
+    /// missing Node.js, admin rights needed, or an unrecoverable failure.
+    private var showsExitButton: Bool {
+        switch phase {
+        case .nodeMissing, .mothxNeedsAdmin, .failed: return true
+        default: return false
+        }
+    }
+
     @ViewBuilder
     private func checklistRow(label: String, state: CheckState) -> some View {
         HStack(spacing: 8) {
@@ -109,18 +130,54 @@ struct EnvironmentCheckSheet: View {
             Text(c.installNodeMissingMessage)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
+            // The official nodejs.org pkg installs to /usr/local as root, which
+            // forces `npm install -g` to need sudo afterwards. Prefer Homebrew
+            // (user-owned /opt/homebrew) so the mothx install step stays admin-free.
+            Label(c.installNodePkgWarning, systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(.orange)
             VStack(alignment: .leading, spacing: 8) {
+                if hasBrew {
+                    Button(c.installUseHomebrew) { Task { await installNodeViaBrew() } }
+                        .buttonStyle(.borderedProminent)
+                }
                 Button(c.installOpenNodeSite) {
                     NSWorkspace.shared.open(URL(string: "https://nodejs.org")!)
                 }
-                .buttonStyle(.borderedProminent)
-                if hasBrew {
-                    Button(c.installUseHomebrew) { Task { await installNodeViaBrew() } }
-                        .buttonStyle(.bordered)
-                }
+                .buttonStyle(.bordered)
                 Button(c.installRecheck) { Task { await runChecklist() } }
                     .buttonStyle(.bordered)
             }
+        }
+    }
+
+    @ViewBuilder
+    private func mothxNeedsAdminView(c: Copy) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(c.installMothxPermissionTitle).font(.headline)
+            Text(c.installMothxPermissionMessage)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            Button(c.installUseAdminPassword) { Task { await installMothxAsAdmin() } }
+                .buttonStyle(.borderedProminent)
+            HStack(spacing: 8) {
+                Button(c.installCopySudoCommand) {
+                    copyToPasteboard("sudo npm install -g mothx-installer")
+                }
+                .buttonStyle(.bordered)
+                Button(c.installOpenTerminal) { openTerminal() }
+                    .buttonStyle(.bordered)
+                Button(c.installRecheck) { Task { await runChecklist() } }
+                    .buttonStyle(.bordered)
+            }
+            Label(c.installPrefixHint, systemImage: "arrow.right.circle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Button(c.installCopyPrefixCommand) {
+                copyToPasteboard("npm config set prefix ~/.npm-global\nexport PATH=\"$HOME/.npm-global/bin:$PATH\"")
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.small)
         }
     }
 
@@ -141,10 +198,10 @@ struct EnvironmentCheckSheet: View {
                 .font(.system(.caption, design: .monospaced))
                 .foregroundStyle(log.isEmpty ? .secondary : .primary)
                 .textSelection(.enabled)
-                .frame(maxWidth: .infinity, minHeight: 108, alignment: .topLeading)
+                .frame(maxWidth: .infinity, minHeight: 54, alignment: .topLeading)
                 .padding(10)
         }
-        .frame(height: 130)
+        .frame(height: 65)
         .background(Color.primary.opacity(0.06))
         .clipShape(RoundedRectangle(cornerRadius: 8))
     }
@@ -205,14 +262,56 @@ struct EnvironmentCheckSheet: View {
     private func installMothx() async {
         phase = .installingMothx
         log = ""
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["MOTHXOS_SIMULATE_MOTHX_INSTALL_EACCES"] == "1" {
+            mothxState = .failed
+            phase = .mothxNeedsAdmin
+            return
+        }
+        #endif
         let exitCode = await EnvironmentCheckSheet.runShellStreaming("npm install -g mothx-installer") { chunk in
+            log += chunk
+        }
+        let output = log.lowercased()
+        let permissionIssue = RuntimeInstall.isPermissionError(output)
+        guard exitCode == 0 else {
+            mothxState = .failed
+            phase = permissionIssue
+                ? .mothxNeedsAdmin
+                : .failed(languageStore.copy.installMothxFailedPrefix(exitCode))
+            return
+        }
+        await finishMothxInstallCheck()
+    }
+
+    /// Runs `npm install -g mothx-installer` through the system authorization
+    /// prompt (`osascript ... with administrator privileges`), which is how the
+    /// official Node.js pkg layout (root-owned /usr/local) can be written to
+    /// without asking the user to open a terminal.
+    private func installMothxAsAdmin() async {
+        phase = .installingMothx
+        log = ""
+        let exitCode = await RuntimeInstall.installGloballyAsAdmin { chunk in
             log += chunk
         }
         guard exitCode == 0 else {
             mothxState = .failed
-            phase = .failed(languageStore.copy.installMothxFailedPrefix(exitCode))
+            let output = log.lowercased()
+            if output.contains("cancel") || output.contains("取消") {
+                // User dismissed the password prompt — go back to the choices.
+                phase = .mothxNeedsAdmin
+                return
+            }
+            let detail = String(log.suffix(200)).trimmingCharacters(in: .whitespacesAndNewlines)
+            phase = .failed(languageStore.copy.installAdminFailedPrefix(detail.isEmpty ? "exit \(exitCode)" : detail))
             return
         }
+        await finishMothxInstallCheck()
+    }
+
+    /// Shared post-install verification used by both the plain and the
+    /// admin-elevated install paths.
+    private func finishMothxInstallCheck() async {
         let installed = await MothxServiceManager.isMothxInstalled()
         mothxState = installed ? .passed : .failed
         guard installed else {
@@ -246,6 +345,9 @@ struct EnvironmentCheckSheet: View {
     }
 
     private static func detectNodeVersion() async -> String? {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["MOTHXOS_SIMULATE_MISSING_NODE"] == "1" { return nil }
+        #endif
         let result = await runShell("node --version")
         guard result.exitCode == 0 else { return nil }
         let trimmed = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -304,6 +406,26 @@ struct EnvironmentCheckSheet: View {
                 pipe.fileHandleForReading.readabilityHandler = nil
                 continuation.resume(returning: -1)
             }
+        }
+    }
+
+    private func copyToPasteboard(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    private func openTerminal() {
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// Quits the app. AppKit termination is the primary path; a delayed hard
+    /// exit covers SwiftUI variants that can otherwise swallow it.
+    private func quitApplication() {
+        NSApp.terminate(nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            exit(0)
         }
     }
 }

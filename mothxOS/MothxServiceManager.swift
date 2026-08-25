@@ -1413,7 +1413,10 @@ final class MothxServiceManager: ObservableObject {
     /// which needs to know whether mothx is installed without needing the
     /// resolved executable URL itself.
     static func isMothxInstalled() async -> Bool {
-        await resolveGlobalMothxExecutable() != nil
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["MOTHXOS_SIMULATE_MOTHX_MISSING"] == "1" { return false }
+        #endif
+        return await resolveGlobalMothxExecutable() != nil
     }
 
     static func resolveGlobalMothxExecutable() async -> URL? {

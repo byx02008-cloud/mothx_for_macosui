@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 private enum UpdateStage {
@@ -6,8 +7,12 @@ private enum UpdateStage {
     case restartingService
     case succeeded
     case failed
+    case needsAdmin
 
     var isFinished: Bool { self == .succeeded || self == .failed }
+    /// Stages where the progress sheet may be closed by the user (finished
+    /// states plus the admin-rights prompt, which is parked awaiting input).
+    var isDismissable: Bool { isFinished || self == .needsAdmin }
 }
 
 extension UpdateStage: Equatable {}
@@ -32,6 +37,9 @@ struct AboutSection: View {
     }
 
     private var updateAvailable: Bool {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["MOTHXOS_SIMULATE_UPDATE_AVAILABLE"] == "1" { return true }
+        #endif
         guard let mothxVersion, let latestVersion, !latestVersion.isEmpty else { return false }
         return mothxVersion != latestVersion
     }
@@ -81,7 +89,12 @@ struct AboutSection: View {
         }
         .task { await checkVersions() }
         .sheet(isPresented: $showUpdateProgress) {
-            UpdateProgressSheet(stage: updateStage, log: updateLog) { showUpdateProgress = false }
+            UpdateProgressSheet(
+                stage: updateStage,
+                log: updateLog,
+                onClose: { showUpdateProgress = false },
+                onInstallAsAdmin: { Task { await installUpdateAsAdmin() } }
+            )
         }
     }
 
@@ -134,8 +147,19 @@ struct AboutSection: View {
 
         updateStage = .installing
         appendUpdateLog(c.updateLogRunningNpmInstall)
-        let exitCode = await AboutSection.runShellStreaming("npm install -g mothx-installer") { chunk in
-            updateLog += chunk
+        #if DEBUG
+        let simulatedEACCES = ProcessInfo.processInfo.environment["MOTHXOS_SIMULATE_UPDATE_EACCES"] == "1"
+        #else
+        let simulatedEACCES = false
+        #endif
+        let exitCode: Int32
+        if simulatedEACCES {
+            updateLog += "\nnpm error code EACCES"
+            exitCode = 1
+        } else {
+            exitCode = await AboutSection.runShellStreaming("npm install -g mothx-installer") { chunk in
+                updateLog += chunk
+            }
         }
 
         if exitCode == 0 {
@@ -145,6 +169,15 @@ struct AboutSection: View {
             if let latestVersion { mothxVersion = latestVersion }
             updateStage = .succeeded
             appendUpdateLog(c.updateLogSucceeded)
+        } else if RuntimeInstall.isPermissionError(updateLog) {
+            // The service was already stopped for the update attempt; bring
+            // it back, then park at the admin-rights prompt.
+            updateStage = .restartingService
+            appendUpdateLog(c.updateLogRestartingService)
+            await mothx.connect()
+            updateStage = .needsAdmin
+            appendUpdateLog(c.updateLogNeedsAdmin)
+            errorHint = c.updateNeedsAdminHint
         } else {
             // The service was already stopped for the update attempt; bring
             // it back regardless of whether the install itself succeeded.
@@ -154,6 +187,54 @@ struct AboutSection: View {
             updateStage = .failed
             appendUpdateLog(c.updateLogFailedPrefix(exitCode))
             errorHint = c.updateFailedPrefix("exit \(exitCode)")
+        }
+
+        isUpdating = false
+    }
+
+    /// Retries the install via the system authorization prompt after the
+    /// plain `npm install -g` failed with a permission error. Stops the
+    /// owned service, installs as admin, then brings the service back.
+    private func installUpdateAsAdmin() async {
+        let c = languageStore.copy
+        isUpdating = true
+        errorHint = nil
+        updateLog = ""
+        updateStage = .stoppingService
+
+        if mothx.ownsRunningProcess {
+            appendUpdateLog(c.updateLogStoppingService)
+            await mothx.stopOwnedService()
+        } else {
+            appendUpdateLog(c.updateLogExternalServiceSkipped)
+        }
+
+        updateStage = .installing
+        appendUpdateLog(c.updateLogRunningNpmInstall)
+        let exitCode = await RuntimeInstall.installGloballyAsAdmin { chunk in
+            updateLog += chunk
+        }
+        let lower = updateLog.lowercased()
+        let canceled = lower.contains("cancel") || lower.contains("取消")
+
+        updateStage = .restartingService
+        appendUpdateLog(c.updateLogRestartingService)
+        await mothx.connect()
+
+        if exitCode == 0 {
+            if let latestVersion { mothxVersion = latestVersion }
+            updateStage = .succeeded
+            appendUpdateLog(c.updateLogSucceeded)
+        } else if canceled {
+            // User dismissed the password prompt — park at the choices again.
+            updateStage = .needsAdmin
+            appendUpdateLog(c.updateLogNeedsAdmin)
+            errorHint = c.updateNeedsAdminHint
+        } else {
+            updateStage = .failed
+            appendUpdateLog(c.updateLogFailedPrefix(exitCode))
+            let detail = String(updateLog.suffix(200)).trimmingCharacters(in: .whitespacesAndNewlines)
+            errorHint = c.updateFailedPrefix(detail.isEmpty ? "exit \(exitCode)" : detail)
         }
 
         isUpdating = false
@@ -235,6 +316,7 @@ private struct UpdateProgressSheet: View {
     let stage: UpdateStage
     let log: String
     let onClose: () -> Void
+    let onInstallAsAdmin: () -> Void
 
     var body: some View {
         let c = languageStore.copy
@@ -243,18 +325,45 @@ private struct UpdateProgressSheet: View {
                 Label(c.updateProgressTitle, systemImage: "arrow.triangle.2.circlepath")
                     .font(.title3.bold())
                 Spacer()
-                if stage.isFinished {
+                if stage.isDismissable {
                     Button(c.close) { onClose() }
                 }
             }
 
             HStack(spacing: 8) {
-                if !stage.isFinished {
+                if !stage.isDismissable {
                     ProgressView().controlSize(.small)
                 }
                 Text(stageLabel(c))
                     .font(.subheadline)
                     .foregroundStyle(stage == .failed ? .red : .secondary)
+            }
+
+            if stage == .needsAdmin {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(c.installMothxPermissionTitle).font(.headline)
+                    Text(c.installMothxPermissionMessage)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    Button(c.installUseAdminPassword) { onInstallAsAdmin() }
+                        .buttonStyle(.borderedProminent)
+                    HStack(spacing: 8) {
+                        Button(c.installCopySudoCommand) {
+                            copyToPasteboard("sudo npm install -g mothx-installer")
+                        }
+                        .buttonStyle(.bordered)
+                        Button(c.installOpenTerminal) { openTerminal() }
+                            .buttonStyle(.bordered)
+                    }
+                    Label(c.installPrefixHint, systemImage: "arrow.right.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button(c.installCopyPrefixCommand) {
+                        copyToPasteboard("npm config set prefix ~/.npm-global\nexport PATH=\"$HOME/.npm-global/bin:$PATH\"")
+                    }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                }
             }
 
             ScrollView {
@@ -269,7 +378,7 @@ private struct UpdateProgressSheet: View {
         }
         .padding(20)
         .frame(width: 560, height: 380)
-        .interactiveDismissDisabled(!stage.isFinished)
+        .interactiveDismissDisabled(!stage.isDismissable)
     }
 
     private func stageLabel(_ c: Copy) -> String {
@@ -279,6 +388,18 @@ private struct UpdateProgressSheet: View {
         case .restartingService: return c.updateStageRestartingService
         case .succeeded: return c.updateStageSucceeded
         case .failed: return c.updateStageFailed
+        case .needsAdmin: return c.updateStageNeedsAdmin
+        }
+    }
+
+    private func copyToPasteboard(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    private func openTerminal() {
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") {
+            NSWorkspace.shared.open(url)
         }
     }
 }
