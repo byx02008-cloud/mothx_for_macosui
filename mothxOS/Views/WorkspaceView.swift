@@ -196,14 +196,27 @@ struct WorkspaceView: View {
         .task(id: sessionID) {
             if let sessionID {
                 selectedMode = ["plan", "agent", "yolo"].contains(mothx.defaultMode) ? mothx.defaultMode : "agent"
-                // Restore per-session provider/model preferences when available,
-                // otherwise fall back to the global default provider.
-                let savedProvider = mothx.providerForSession(sessionID)
-                let resolvedProviderID = (savedProvider.flatMap { saved in mothx.providers.contains(where: { $0.id == saved }) ? saved : nil }) ?? mothx.defaultProvider
-                selectedProviderID = mothx.providers.first(where: { $0.id == resolvedProviderID })?.id ?? mothx.providers.first?.id ?? ""
-                let providerModels = mothx.providers.first(where: { $0.id == selectedProviderID })?.models ?? []
-                let savedModel = mothx.modelForSession(sessionID) ?? mothx.defaultModel
-                selectedModelID = providerModels.contains(where: { $0.id == savedModel }) ? savedModel : providerModels.first?.id ?? ""
+                // Restore per-session provider/model preferences. If the saved
+                // provider no longer exists, fall back to the global defaults.
+                if let savedProvider = mothx.providerForSession(sessionID),
+                   mothx.providers.contains(where: { $0.id == savedProvider }) {
+                    // Saved provider exists: keep it, and fall back to its first
+                    // model when the saved model is no longer available.
+                    selectedProviderID = savedProvider
+                    let providerModels = mothx.providers.first(where: { $0.id == savedProvider })?.models ?? []
+                    let savedModel = mothx.modelForSession(sessionID) ?? mothx.defaultModel
+                    selectedModelID = providerModels.contains(where: { $0.id == savedModel }) ? savedModel : providerModels.first?.id ?? ""
+                } else if mothx.providers.contains(where: { $0.id == mothx.defaultProvider }) {
+                    // Saved provider missing: use the configured global default
+                    // provider and model.
+                    selectedProviderID = mothx.defaultProvider
+                    let providerModels = mothx.providers.first(where: { $0.id == mothx.defaultProvider })?.models ?? []
+                    selectedModelID = providerModels.contains(where: { $0.id == mothx.defaultModel }) ? mothx.defaultModel : providerModels.first?.id ?? ""
+                } else {
+                    // Global default provider missing too: pick the first provider.
+                    selectedProviderID = mothx.providers.first?.id ?? ""
+                    selectedModelID = mothx.providers.first?.models.first?.id ?? ""
+                }
                 selectedSkills = mothx.activeSkillsBySession[sessionID] ?? []
                 selectedTools = []
                 await mothx.loadSkills(for: sessionID)
