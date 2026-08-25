@@ -5,9 +5,11 @@ import SwiftUI
 struct MessageBubble: View {
     let message: MothxMessage
     let isCurrentRunning: Bool
+    var onFork: (() -> Void)? = nil
+    var isForking = false
 
     var body: some View {
-        TextMessageBubble(message: message, isCurrentRunning: isCurrentRunning)
+        TextMessageBubble(message: message, isCurrentRunning: isCurrentRunning, onFork: onFork, isForking: isForking)
             .transition(.move(edge: .bottom).combined(with: .opacity))
     }
 }

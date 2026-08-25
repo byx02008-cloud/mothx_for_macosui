@@ -100,6 +100,31 @@ struct TurnBlock: View {
     let sessionID: String
     let isExpanded: Bool
     let onToggle: () -> Void
+    /// Called when the user asks to fork from a completed assistant response.
+    var onFork: ((MothxMessage) -> Void)? = nil
+    var forkingMessageID: String? = nil
+
+    /// Explicit message forks are accepted only at the final assistant text
+    /// entry of a completed turn. This mirrors mothx's `fork_unavailable`
+    /// validation and avoids offering an action that the API must reject.
+    private var forkableAssistantMessage: MothxMessage? {
+        guard !isRunActive,
+              let message = turn.subsequentMessages.last,
+              message.isAssistant,
+              let seq = message.seq,
+              seq > 0,
+              !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return message
+    }
+
+    /// The control is presented below the user's question, but it carries the
+    /// completed assistant message required by the server as its fork boundary.
+    private var forkAction: (() -> Void)? {
+        guard let target = forkableAssistantMessage, let onFork else { return nil }
+        return { onFork(target) }
+    }
 
     private var isRunActive: Bool { mothx.runSessionID == sessionID && mothx.isRunning }
     private var isCurrentRunSession: Bool { mothx.runSessionID == sessionID }
@@ -139,7 +164,12 @@ struct TurnBlock: View {
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: 10) {
-                    MessageBubble(message: turn.userMessage, isCurrentRunning: false)
+                    MessageBubble(
+                        message: turn.userMessage,
+                        isCurrentRunning: false,
+                        onFork: forkAction,
+                        isForking: forkingMessageID == forkableAssistantMessage?.id
+                    )
                     if turn.hasResponded { agentResponseBlock }
                     if turn.isLast, isRunActive,
                        mothx.runStatus == "queued" || mothx.runStatus == "running" {
@@ -167,7 +197,10 @@ struct TurnBlock: View {
                 if !turn.resultMessages.isEmpty { Divider().padding(.vertical, 2) }
             }
             ForEach(turn.resultMessages) { message in
-                MessageBubble(message: message, isCurrentRunning: isRunActive && mothx.currentRunningMessageID == message.id)
+                MessageBubble(
+                    message: message,
+                    isCurrentRunning: isRunActive && mothx.currentRunningMessageID == message.id
+                )
             }
             // One status per turn, always at the bottom.
             // Current run: use live status.  Historical: look up via any

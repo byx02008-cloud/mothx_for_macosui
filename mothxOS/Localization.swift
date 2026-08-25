@@ -339,6 +339,7 @@ struct Copy {
     var saveSessionProjectLinkFailedPrefix: (String) -> String { { detail in self.text("保存会话项目关系失败：\(detail)", "Failed to save the session-project link: \(detail)") } }
     var deleteSessionProjectLinkFailedPrefix: (String) -> String { { detail in self.text("删除会话项目关系失败：\(detail)", "Failed to remove the session-project link: \(detail)") } }
     var deleteSessionFailedPrefix: (String) -> String { { detail in self.text("删除会话失败：\(detail)", "Failed to delete session: \(detail)") } }
+    var forkSessionFailedPrefix: (String) -> String { { detail in self.text("会话分叉失败：\(detail)", "Fork session failed: \(detail)") } }
     var loadMessagesFailedPrefix: (String) -> String { { detail in self.text("读取会话消息失败：\(detail)", "Failed to load session messages: \(detail)") } }
     var noRunIDReturned: String { text("服务端未返回 run ID", "The server did not return a run ID") }
     var submitRunFailedPrefix: (String) -> String { { detail in self.text("提交会话失败：\(detail)", "Failed to submit the session: \(detail)") } }

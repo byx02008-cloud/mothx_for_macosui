@@ -6,6 +6,9 @@ struct WorkspaceView: View {
     @EnvironmentObject private var terminalStore: TerminalSessionStore
     @Binding var prompt: String
     let sessionID: String?
+    /// Called after a fork creates a child session so the owner (ContentView)
+    /// can switch the workspace to the new session.
+    var onSessionActivated: ((MothxSession) -> Void)? = nil
     @State private var attachments: [ComposerAttachment] = []
     @State private var selectedMode = "agent"
     @State private var selectedProviderID = ""
@@ -17,6 +20,7 @@ struct WorkspaceView: View {
     @State private var expandedTurnIDs: Set<UUID> = []
     @State private var showAllHistory = false
     @State private var isConversationAtBottom = true
+    @State private var forkingMessageID: String?
 
     private let conversationBottomID = "conversation-bottom"
 
@@ -74,7 +78,9 @@ struct WorkspaceView: View {
                                         turn: turn,
                                         sessionID: sessionID,
                                         isExpanded: expandedTurnIDs.contains(turn.id),
-                                        onToggle: { toggleTurn(turn) }
+                                        onToggle: { toggleTurn(turn) },
+                                        onFork: { message in fork(from: message) },
+                                        forkingMessageID: forkingMessageID
                                     )
                                 }
 
@@ -301,6 +307,38 @@ struct WorkspaceView: View {
             }
             newIDs.insert(turn.id)
             expandedTurnIDs = newIDs
+        }
+    }
+
+    // MARK: - Session fork
+
+    /// Fork a child session from the final assistant reply of a completed turn.
+    /// State is committed only after yielding once, outside the source view's
+    /// button/update transaction.
+    private func fork(from message: MothxMessage) {
+        guard let sessionID,
+              message.isAssistant,
+              let seq = message.seq,
+              seq > 0,
+              forkingMessageID == nil,
+              mothx.sessions.contains(where: { $0.id == sessionID }) else { return }
+        let requestID = UUID().uuidString
+        forkingMessageID = message.id
+        Task { @MainActor in
+            // Ensure the action closure has returned before an async completion
+            // is allowed to change observable/session-selection state.
+            await Task.yield()
+            let result = await mothx.forkSession(sessionID: sessionID, atSeq: seq, idempotencyKey: requestID)
+            await Task.yield()
+            guard forkingMessageID == message.id else { return }
+            forkingMessageID = nil
+            switch result {
+            case .success(let child):
+                mothx.integrateForkedSession(child)
+                onSessionActivated?(child)
+            case .failure(let error):
+                mothx.reportForkFailure(error)
+            }
         }
     }
 

@@ -33,7 +33,19 @@ struct ContentView: View {
             if showSettings {
                 SettingsView(showSettings: $showSettings, selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID)
             } else {
-                WorkspaceView(prompt: $prompt, sessionID: selectedSessionID)
+                WorkspaceView(
+                    prompt: $prompt,
+                    sessionID: selectedSessionID,
+                    onSessionActivated: { session in
+                        // A successful server-side fork is only possible when
+                        // the source has no active run. WorkspaceView invokes
+                        // this after yielding out of the originating button's
+                        // update transaction, so switch directly instead of
+                        // starting the general switch-confirmation flow.
+                        selectedSessionID = session.id
+                        if let projectID = session.projectID { selectedProjectID = projectID }
+                    }
+                )
             }
         }
         .frame(minWidth: 1050, minHeight: 700)

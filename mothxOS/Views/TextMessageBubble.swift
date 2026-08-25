@@ -5,6 +5,10 @@ struct TextMessageBubble: View {
     @Environment(\.colorScheme) private var colorScheme
     let message: MothxMessage
     let isCurrentRunning: Bool
+    /// When non-nil, shows the "fork session" action on hover. The callback
+    /// carries the completed assistant reply used as the API boundary.
+    var onFork: (() -> Void)? = nil
+    var isForking = false
 
     private var isUser: Bool { message.isUser }
 
@@ -48,9 +52,9 @@ struct TextMessageBubble: View {
                 .background(isUser ? userBackground : assistantBackground)
                 .clipShape(RoundedRectangle(cornerRadius: 10))
 
-                if isUser {
-                    userMetadata
-                        .frame(height: 22, alignment: .topTrailing)
+                if isUser || onFork != nil {
+                    messageMetadata
+                        .frame(height: 22, alignment: isUser ? .topTrailing : .topLeading)
                 }
             }
             if !isUser { Spacer(minLength: 70) }
@@ -104,22 +108,41 @@ struct TextMessageBubble: View {
         withAnimation(.easeInOut(duration: 0.6).repeatForever()) { blinkOpacity = 0.0 }
     }
 
-    private var userMetadata: some View {
-        HStack(spacing: 8) {
+    private var messageMetadata: some View {
+        HStack(spacing: 10) {
             if isHovered {
-                Button {
-                    copyQuestion()
-                } label: {
-                    HStack(spacing: 4) {
-                        Text(didCopy ? "已复制" : "复制主题")
-                        Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
+                if isUser {
+                    Button {
+                        copyQuestion()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text(didCopy ? "已复制" : "复制主题")
+                            Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
+                        }
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .contentShape(Rectangle())
                     }
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .contentShape(Rectangle())
+                    .buttonStyle(.plain)
+                    .help(didCopy ? "已复制 / Copied" : "复制主题 / Copy topic")
                 }
-                .buttonStyle(.plain)
-                .help(didCopy ? "已复制 / Copied" : "复制主题 / Copy topic")
+
+                if let onFork {
+                    Button {
+                        onFork()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text("会话分叉")
+                            Image(systemName: "arrow.triangle.branch")
+                        }
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isForking)
+                    .help("从这里开始创建新的会话 / Start a new session from here")
+                }
             }
         }
         .opacity(isHovered ? 1 : 0)

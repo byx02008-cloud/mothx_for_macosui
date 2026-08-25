@@ -605,6 +605,67 @@ final class MothxServiceManager: ObservableObject {
         }
     }
 
+    /// v1.2.92+: create a child session at a server-validated message boundary.
+    ///
+    /// This deliberately does not mutate any published state. The view owns
+    /// committing the result after the current SwiftUI update transaction has
+    /// completed; publishing `sessions` while a message-button action is being
+    /// reconciled causes SwiftUI's "Modifying state during view update" warning.
+    @MainActor
+    func forkSession(sessionID: String, atSeq: Int, idempotencyKey: String) async -> Result<MothxSession, Error> {
+        guard !sessionID.isEmpty,
+              !idempotencyKey.isEmpty,
+              let parent = sessions.first(where: { $0.id == sessionID }) else {
+            return .failure(SettingsLoadError.invalidResponse)
+        }
+        do {
+            let body = try jsonData(["atSeq": atSeq])
+            let data = try await request(
+                path: "api/sessions/\(sessionID)/fork",
+                method: "POST",
+                body: body,
+                headers: ["Idempotency-Key": idempotencyKey]
+            )
+            guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let childID = (object["sessionId"] as? String) ?? (object["sessionID"] as? String),
+                  !childID.isEmpty else {
+                return .failure(SettingsLoadError.invalidResponse)
+            }
+
+            // The server already atomically copies project ownership and writes
+            // the incremented title. Its fork response does not include that
+            // title, so retain the parent title until the next normal refresh.
+            let child = MothxSession(
+                id: childID,
+                title: object["title"] as? String ?? parent.title,
+                projectID: parent.projectID,
+                updatedAt: ISO8601DateFormatter().string(from: Date()),
+                workDir: parent.workDir,
+                parentSessionId: (object["parentSessionId"] as? String) ?? sessionID,
+                forkBoundarySeq: (object["boundarySeq"] as? Int) ?? atSeq,
+                seedLength: object["seedLength"] as? Int,
+                forkKind: object["forkKind"] as? String
+            )
+            return .success(child)
+        } catch {
+            return .failure(error)
+        }
+    }
+
+    /// Apply the completed fork after the originating SwiftUI interaction has
+    /// yielded. Keeping this separate from `forkSession` prevents published
+    /// state changes during the source message view's update.
+    @MainActor
+    func integrateForkedSession(_ child: MothxSession) {
+        sessions.removeAll { $0.id == child.id }
+        sessions.insert(child, at: 0)
+    }
+
+    @MainActor
+    func reportForkFailure(_ error: Error) {
+        settingsError = copy.forkSessionFailedPrefix(describe(error))
+    }
+
     @discardableResult
     func loadMessages(sessionID: String) async -> [MothxMessage] {
         do {
@@ -1224,7 +1285,17 @@ final class MothxServiceManager: ObservableObject {
         else { values = (object as? [String: Any])?["sessions"] as? [[String: Any]] ?? [] }
         return values.compactMap { item in
             guard let id = item["id"] as? String ?? item["sessionId"] as? String else { return nil }
-            return MothxSession(id: id, title: item["title"] as? String ?? item["preview"] as? String ?? "New session", projectID: item["projectId"] as? String ?? item["projectID"] as? String, updatedAt: item["updatedAt"] as? String ?? item["lastUsed"] as? String, workDir: item["workDir"] as? String ?? item["workdir"] as? String)
+            return MothxSession(
+                id: id,
+                title: item["title"] as? String ?? item["preview"] as? String ?? "New session",
+                projectID: item["projectId"] as? String ?? item["projectID"] as? String,
+                updatedAt: item["updatedAt"] as? String ?? item["lastUsed"] as? String,
+                workDir: item["workDir"] as? String ?? item["workdir"] as? String,
+                parentSessionId: item["parentSessionId"] as? String,
+                forkBoundarySeq: item["forkBoundarySeq"] as? Int,
+                seedLength: item["seedLength"] as? Int,
+                forkKind: item["forkKind"] as? String
+            )
         }
     }
 
