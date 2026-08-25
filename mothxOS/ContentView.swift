@@ -16,6 +16,13 @@ struct ContentView: View {
     @State private var newProjectWorkDir = ""
     @State private var appearanceNow = Date()
     @AppStorage("appearanceMode") private var appearanceMode = "auto"
+    @AppStorage("ignoredMothxUpdateVersion") private var ignoredUpdateVersion = ""
+    @State private var showUpdatePrompt = false
+    @State private var pendingUpdateVersion: String?
+    @State private var showUpdateProgress = false
+    @State private var updateStage: MothxUpdateStage = .stoppingService
+    @State private var updateLog = ""
+    @State private var skipUpdatePromptThisLaunch = false
 
     private var languageStoreCopy: Copy { languageStore.copy }
 
@@ -69,6 +76,38 @@ struct ContentView: View {
         } message: {
             Text(languageStoreCopy.switchStopTaskMessage)
         }
+        .confirmationDialog(languageStoreCopy.updatePromptTitle(pendingUpdateVersion ?? ""), isPresented: $showUpdatePrompt, titleVisibility: .visible) {
+            Button(languageStoreCopy.updatePromptNow) {
+                let version = pendingUpdateVersion ?? ""
+                pendingUpdateVersion = nil
+                skipUpdatePromptThisLaunch = true
+                Task { await runUpdate(asAdmin: false) }
+            }
+            Button(languageStoreCopy.updatePromptIgnore) {
+                if let version = pendingUpdateVersion { ignoredUpdateVersion = version }
+                pendingUpdateVersion = nil
+                skipUpdatePromptThisLaunch = true
+            }
+            Button(languageStoreCopy.updatePromptLater, role: .cancel) {
+                pendingUpdateVersion = nil
+                skipUpdatePromptThisLaunch = true
+            }
+        } message: {
+            Text(languageStoreCopy.updatePromptMessage)
+        }
+        .sheet(isPresented: $showUpdateProgress) {
+            UpdateProgressSheet(
+                stage: updateStage,
+                log: updateLog,
+                onClose: { showUpdateProgress = false },
+                onInstallAsAdmin: { Task { await runUpdate(asAdmin: true) } }
+            )
+        }
+        .onChange(of: showEnvironmentCheck) { _, shown in
+            // The environment check sheet closed — check once for a mothx update.
+            guard !shown else { return }
+            Task { await checkMothxUpdateAtLaunch() }
+        }
         .task {
             await mothx.loadWorkspace()
             selectDefaultSessionIfNeeded()
@@ -88,6 +127,42 @@ struct ContentView: View {
             // session list finishes loading so the workspace is not blank.
             selectDefaultSessionIfNeeded()
         }
+    }
+
+    /// After the environment check sheet closes, prompt once when a newer
+    /// mothx version is published — unless the user skipped this launch or
+    /// already ignored this exact version.
+    private func checkMothxUpdateAtLaunch() async {
+        guard !skipUpdatePromptThisLaunch else { return }
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["MOTHXOS_SIMULATE_UPDATE_PROMPT"] == "1" {
+            pendingUpdateVersion = "1.2.96"
+            showUpdatePrompt = true
+            return
+        }
+        #endif
+        guard let latest = await RuntimeInstall.checkMothxUpdate() else { return }
+        guard latest != ignoredUpdateVersion else { return }
+        pendingUpdateVersion = latest
+        showUpdatePrompt = true
+    }
+
+    /// Runs the shared update flow in the progress sheet (stop service → npm
+    /// install → restart). `asAdmin` retries through the system authorization
+    /// prompt.
+    private func runUpdate(asAdmin: Bool) async {
+        let c = languageStoreCopy
+        updateLog = ""
+        updateStage = .stoppingService
+        showUpdateProgress = true
+        let result = await mothx.performMothxUpdate(asAdmin: asAdmin, onStage: { stage in
+            updateStage = stage
+            let line = UpdateFlowSupport.stageLogLine(stage, c: c)
+            if !line.isEmpty { updateLog += (updateLog.isEmpty ? "" : "\n") + line }
+        }, onLog: { chunk in
+            updateLog += chunk
+        })
+        updateStage = UpdateFlowSupport.terminalStage(for: result)
     }
 
     func selectDefaultSessionIfNeeded() {

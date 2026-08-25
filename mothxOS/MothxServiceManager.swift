@@ -7,6 +7,29 @@ enum WorkspaceSyncState: Equatable {
     case failed
 }
 
+/// Phases of the in-app mothx update flow, shared by the About section and
+/// the launch-time update prompt.
+enum MothxUpdateStage: Equatable {
+    case stoppingService
+    case installing
+    case restartingService
+    case succeeded
+    case failed
+    case needsAdmin
+
+    var isFinished: Bool { self == .succeeded || self == .failed }
+    /// Stages where the progress sheet may be closed by the user (finished
+    /// states plus the admin-rights prompt, which is parked awaiting input).
+    var isDismissable: Bool { isFinished || self == .needsAdmin }
+}
+
+enum MothxUpdateResult {
+    case succeeded(version: String?)
+    case needsAdmin
+    case canceled
+    case failed(detail: String)
+}
+
 
 private struct MothxHealthResponse: Decodable {
     let status: String
@@ -1380,6 +1403,60 @@ final class MothxServiceManager: ObservableObject {
     func restartService() async {
         await stopOwnedService()
         await connect()
+    }
+
+    /// Runs the full update dance: stop the owned mothx service, run
+    /// `npm install -g mothx-installer` (admin-elevated when `asAdmin`),
+    /// restart the service, and report the outcome. Progress is delivered via
+    /// `onStage` (phase transitions) and `onLog` (raw install output, already
+    /// on the main actor).
+    func performMothxUpdate(
+        asAdmin: Bool = false,
+        onStage: @escaping (MothxUpdateStage) -> Void,
+        onLog: @escaping (String) -> Void
+    ) async -> MothxUpdateResult {
+        var logText = ""
+        let append: (String) -> Void = { chunk in
+            logText += chunk
+            onLog(chunk)
+        }
+
+        onStage(.stoppingService)
+        if ownsRunningProcess {
+            await stopOwnedService()
+        }
+
+        onStage(.installing)
+        #if DEBUG
+        let simulatedEACCES = ProcessInfo.processInfo.environment["MOTHXOS_SIMULATE_UPDATE_EACCES"] == "1"
+        #else
+        let simulatedEACCES = false
+        #endif
+        let exitCode: Int32
+        if asAdmin {
+            exitCode = await RuntimeInstall.installGloballyAsAdmin { append($0) }
+        } else if simulatedEACCES {
+            append("\nnpm error code EACCES")
+            exitCode = 1
+        } else {
+            exitCode = await RuntimeInstall.runShellStreaming("npm install -g mothx-installer") { append($0) }
+        }
+
+        onStage(.restartingService)
+        await connect()
+
+        if exitCode == 0 {
+            return .succeeded(version: await RuntimeInstall.latestNpmVersion())
+        }
+        let lower = logText.lowercased()
+        if lower.contains("cancel") || lower.contains("取消") {
+            return .canceled
+        }
+        if RuntimeInstall.isPermissionError(lower) {
+            return .needsAdmin
+        }
+        let detail = String(logText.suffix(200)).trimmingCharacters(in: .whitespacesAndNewlines)
+        return .failed(detail: detail.isEmpty ? "exit \(exitCode)" : detail)
     }
 
     private func isHealthy() async -> Bool {

@@ -124,6 +124,7 @@ mothxOS/
 | `MOTHXOS_SIMULATE_MOTHX_INSTALL_EACCES` | 模拟 `npm install -g mothx-installer` 权限错误（EACCES），进入“安装需要管理员权限”页 |
 | `MOTHXOS_SIMULATE_UPDATE_AVAILABLE` | 强制显示设置页“在线更新”按钮（本机已是最新版本时用于测试） |
 | `MOTHXOS_SIMULATE_UPDATE_EACCES` | 模拟更新时 `npm install -g` 权限错误，进入“更新需要管理员权限”页 |
+| `MOTHXOS_SIMULATE_UPDATE_PROMPT` | 启动后强制弹出“发现新版本”提示（内容固定为 v1.2.96），用于测试启动更新提示 |
 
 常用组合：
 
@@ -138,6 +139,9 @@ MOTHXOS_SIMULATE_MOTHX_INSTALL_EACCES=1
 # 设置 → 更新权限页
 MOTHXOS_SIMULATE_UPDATE_AVAILABLE=1
 MOTHXOS_SIMULATE_UPDATE_EACCES=1
+
+# 启动 → 发现新版本提示
+MOTHXOS_SIMULATE_UPDATE_PROMPT=1
 ```
 
 > 注意：测试结束后请移除这些环境变量，否则每次启动都会进入对应模拟分支。

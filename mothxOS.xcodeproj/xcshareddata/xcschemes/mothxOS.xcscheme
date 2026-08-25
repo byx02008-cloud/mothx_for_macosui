@@ -51,18 +51,6 @@
             ReferencedContainer = "container:mothxOS.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
-      <EnvironmentVariables>
-         <EnvironmentVariable
-            key = "MOTHXOS_SIMULATE_UPDATE_AVAILABLE"
-            value = "1"
-            isEnabled = "YES">
-         </EnvironmentVariable>
-         <EnvironmentVariable
-            key = "MOTHXOS_SIMULATE_UPDATE_EACCES"
-            value = "1"
-            isEnabled = "YES">
-         </EnvironmentVariable>
-      </EnvironmentVariables>
    </LaunchAction>
    <ProfileAction
       buildConfiguration = "Release"

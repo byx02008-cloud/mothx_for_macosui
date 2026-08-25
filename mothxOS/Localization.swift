@@ -258,10 +258,16 @@ struct Copy {
     var updateLogRestartingService: String { text("[步骤] 重启 mothx 服务", "[Step] Restarting mothx service") }
     var updateLogSucceeded: String { text("[完成] 更新成功，服务已重启", "[Done] Update succeeded, service restarted") }
     var updateLogFailedPrefix: (Int32) -> String { { code in self.text("[失败] npm install 退出码 \(code)", "[Failed] npm install exited with code \(code)") } }
+    var updateLogFailedDetail: (String) -> String { { detail in self.text("[失败] \(detail)", "[Failed] \(detail)") } }
     var updateLogNeedsAdmin: String { text("[提示] npm 全局目录需要管理员权限，可选择以管理员身份重试或复制 sudo 命令手动安装", "[Info] npm's global install directory needs admin rights. Retry as administrator or copy the sudo command.") }
     var updateNeedsAdminHint: String { text("更新失败：npm 的全局安装目录归 root 所有，需要管理员权限", "Update failed: npm's global install directory is owned by root and needs admin rights.") }
     var updateStageInstallingAdmin: String { text("正在以管理员权限执行 npm install…", "Running npm install as administrator…") }
     var updateStageNeedsAdmin: String { text("更新需要管理员权限", "Update requires admin rights") }
+    var updatePromptTitle: (String) -> String { { version in self.text("发现新版本 v\(version)，是否现在更新？", "New version v\(version) available. Update now?") } }
+    var updatePromptMessage: String { text("mothx 有可用更新。您可以稍后处理，也可以忽略此版本。", "mothx has an available update. You can handle it later, or ignore this version.") }
+    var updatePromptNow: String { text("现在更新", "Update Now") }
+    var updatePromptLater: String { text("稍后再说", "Later") }
+    var updatePromptIgnore: String { text("忽略此版本", "Ignore this version") }
 
     // MARK: - Environment check
     var envCheckTitle: String { text("环境检查", "Environment Check") }
