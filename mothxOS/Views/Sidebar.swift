@@ -6,16 +6,25 @@ struct Sidebar: View {
     @EnvironmentObject private var terminalStore: TerminalSessionStore
     @Binding var selectedProjectID: String?
     @Binding var selectedSessionID: String?
+    @Binding var selectedTeamProjectID: String?
     @Binding var showSettings: Bool
     @Binding var showNewProject: Bool
     @Binding var appearanceMode: String
     @State private var expandedProjects: Set<String> = []
+    @State private var expandedTeamProjects: Set<String> = []
     @State private var pendingDelete: SidebarDelete?
     @State private var showServiceLogs = false
     @State private var showStats = false
     @State private var showConnectionMenu = false
     @State private var showAppearanceMenu = false
     @State private var isRefreshing = false
+    @State private var showNewTeamTask = false
+
+    /// Regular projects the user created in the UI. Team tasks are real mothx
+    /// projects too, but they are owned by the 团队任务 section.
+    private var visibleProjects: [MothxProject] {
+        mothx.projects.filter { !mothx.teamManager.isTeamProject($0.id) }
+    }
 
     var body: some View {
         let c = languageStore.copy
@@ -41,24 +50,71 @@ struct Sidebar: View {
                 .help(c.refreshProjectsHelp)
                 .disabled(isRefreshing || mothx.state != .connected)
             }.padding(.bottom, 22)
-            HStack {
-                Text(c.projects.uppercased()).sectionLabel()
-                Spacer()
-                Button { showNewProject = true } label: { Image(systemName: "plus") }.buttonStyle(.plain).hoverHighlight().help(c.addProject)
-            }.padding(.bottom, 8)
             ScrollView {
                 VStack(alignment: .leading, spacing: 3) {
-                    ForEach(mothx.projects) { project in
-                        ProjectTreeRow(project: project, expanded: expandedProjects.contains(project.id), selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID, showSettings: $showSettings, toggle: { toggle(project.id) }, addSession: { let session = mothx.prepareSession(projectID: project.id); selectedSessionID = session.id; selectedProjectID = project.id; showSettings = false }, delete: { pendingDelete = .project(project.id) }, requestDeleteSession: { pendingDelete = .session($0) }, openInTUI: { session in
-                        mothx.requestSwitch(activeRunSessionID: selectedSessionID) {
-                            showSettings = false
-                            selectedSessionID = session.id
-                            selectedProjectID = session.projectID
-                            terminalStore.open(sessionID: session.id, workDir: mothx.workDir(for: session.id))
+                    // ---- 团队任务（与项目并列，置于上方）----
+                    HStack(spacing: 6) {
+                        Text(c.teamTask.uppercased()).sectionLabel()
+                        Spacer()
+                        Button {
+                            showNewTeamTask = true
+                        } label: {
+                            Image(systemName: "plus").font(.caption)
                         }
-                    })
+                        .buttonStyle(.plain)
+                        .hoverHighlight()
+                        .help(c.newTeamTask)
                     }
-                    UnassignedProjectTreeRow(selectedSessionID: $selectedSessionID, showSettings: $showSettings, requestDelete: { pendingDelete = .session($0) }, moveToProject: { sessionID, projectID in
+                    .padding(.bottom, 6)
+                    if mothx.teamManager.teamProjects.isEmpty {
+                        Text(c.noTeamTasksHint)
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                            .padding(.leading, 4)
+                            .padding(.bottom, 8)
+                    }
+                    ForEach(mothx.teamManager.teamProjects) { teamProject in
+                        TeamProjectTreeRow(
+                            teamProject: teamProject,
+                            expanded: expandedTeamProjects.contains(teamProject.id),
+                            selected: selectedTeamProjectID == teamProject.id,
+                            selectedSessionID: $selectedSessionID,
+                            selectedTeamProjectID: $selectedTeamProjectID,
+                            showSettings: $showSettings,
+                            toggle: { toggleTeam(teamProject.id) },
+                            delete: { pendingDelete = .teamProject(teamProject.id) },
+                            requestDeleteSession: { pendingDelete = .session($0) },
+                            openInTUI: { session in
+                                mothx.requestSwitch(activeRunSessionID: selectedSessionID) {
+                                    showSettings = false
+                                    selectedTeamProjectID = nil
+                                    selectedSessionID = session.id
+                                    terminalStore.open(sessionID: session.id, workDir: mothx.workDir(for: session.id))
+                                }
+                            }
+                        )
+                    }
+
+                    Divider().padding(.vertical, 6)
+
+                    // ---- 项目 ----
+                    HStack {
+                        Text(c.projects.uppercased()).sectionLabel()
+                        Spacer()
+                        Button { showNewProject = true } label: { Image(systemName: "plus") }.buttonStyle(.plain).hoverHighlight().help(c.addProject)
+                    }.padding(.bottom, 8)
+                    ForEach(visibleProjects) { project in
+                        ProjectTreeRow(project: project, expanded: expandedProjects.contains(project.id), selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID, selectedTeamProjectID: $selectedTeamProjectID, showSettings: $showSettings, toggle: { toggle(project.id) }, addSession: { let session = mothx.prepareSession(projectID: project.id); selectedTeamProjectID = nil; selectedSessionID = session.id; selectedProjectID = project.id; showSettings = false }, delete: { pendingDelete = .project(project.id) }, requestDeleteSession: { pendingDelete = .session($0) }, openInTUI: { session in
+                            mothx.requestSwitch(activeRunSessionID: selectedSessionID) {
+                                showSettings = false
+                                selectedTeamProjectID = nil
+                                selectedSessionID = session.id
+                                selectedProjectID = session.projectID
+                                terminalStore.open(sessionID: session.id, workDir: mothx.workDir(for: session.id))
+                            }
+                        })
+                    }
+                    UnassignedProjectTreeRow(selectedSessionID: $selectedSessionID, selectedTeamProjectID: $selectedTeamProjectID, showSettings: $showSettings, requestDelete: { pendingDelete = .session($0) }, moveToProject: { sessionID, projectID in
                         Task {
                             await mothx.moveSessionToProject(sessionID: sessionID, projectID: projectID)
                             selectedProjectID = projectID
@@ -67,6 +123,7 @@ struct Sidebar: View {
                     }, openInTUI: { session in
                         mothx.requestSwitch(activeRunSessionID: selectedSessionID) {
                             showSettings = false
+                            selectedTeamProjectID = nil
                             selectedSessionID = session.id
                             selectedProjectID = session.projectID
                             terminalStore.open(sessionID: session.id, workDir: mothx.workDir(for: session.id))
@@ -150,6 +207,19 @@ struct Sidebar: View {
         } message: {
             Text(pendingDelete?.message(using: c) ?? c.text("此操作无法撤销。", "This action cannot be undone."))
         }
+        .sheet(isPresented: $showNewTeamTask) {
+            TeamSetupSheet(
+                teamProject: nil,
+                isPresented: $showNewTeamTask,
+                onCreated: { teamProject in
+                    selectedTeamProjectID = teamProject.id
+                    selectedSessionID = nil
+                    selectedProjectID = nil
+                    showSettings = false
+                    expandedTeamProjects.insert(teamProject.id)
+                }
+            )
+        }
         .sheet(isPresented: $showServiceLogs) {
             ServiceLogView()
         }
@@ -158,6 +228,7 @@ struct Sidebar: View {
         }
     }
     private func toggle(_ id: String) { if expandedProjects.contains(id) { expandedProjects.remove(id) } else { expandedProjects.insert(id) } }
+    private func toggleTeam(_ id: String) { if expandedTeamProjects.contains(id) { expandedTeamProjects.remove(id) } else { expandedTeamProjects.insert(id) } }
     private func appearanceButton(_ title: String, value: String) -> some View {
         Button {
             appearanceMode = value
@@ -171,7 +242,10 @@ struct Sidebar: View {
         switch item {
         case .project(let id):
             await mothx.deleteProject(id: id)
-            if selectedProjectID == id { selectedProjectID = nil; selectedSessionID = nil }
+            if selectedProjectID == id { selectedProjectID = nil; selectedSessionID = nil; selectedTeamProjectID = nil }
+        case .teamProject(let id):
+            await mothx.teamManager.deleteTeamProject(id: id)
+            if selectedTeamProjectID == id { selectedTeamProjectID = nil }
         case .session(let id):
             await mothx.deleteSession(id: id)
             if selectedSessionID == id { selectedSessionID = nil; selectedProjectID = nil }
@@ -180,12 +254,113 @@ struct Sidebar: View {
 }
 
 enum SidebarDelete {
-    case project(String); case session(String)
+    case project(String); case teamProject(String); case session(String)
 
     func message(using copy: Copy) -> String {
         switch self {
         case .project(let id): return copy.deleteProjectMessage(id)
+        case .teamProject: return copy.deleteTeamTaskMessage
         case .session(let id): return copy.deleteSessionMessage(id)
+        }
+    }
+}
+
+/// 侧边栏顶部「团队任务」下的一个任务（mothx 中对应真实 Project）。
+/// 点击进入团队任务对话模式；展开后展示该任务产生的所有会话。
+struct TeamProjectTreeRow: View {
+    @EnvironmentObject private var mothx: MothxServiceManager
+    @EnvironmentObject private var languageStore: LanguageStore
+    @EnvironmentObject private var terminalStore: TerminalSessionStore
+    let teamProject: MothxTeamProject
+    let expanded: Bool
+    let selected: Bool
+    @Binding var selectedSessionID: String?
+    @Binding var selectedTeamProjectID: String?
+    @Binding var showSettings: Bool
+    let toggle: () -> Void
+    let delete: () -> Void
+    let requestDeleteSession: (String) -> Void
+    let openInTUI: (MothxSession) -> Void
+    @State private var isHovered = false
+    @State private var showSetup = false
+
+    private var hasActiveRun: Bool {
+        mothx.teamManager.teamRuns.contains { $0.projectID == teamProject.id && !$0.status.isTerminal }
+    }
+    /// 该任务产生的所有会话：mothx 侧它们都归属到任务对应的 Project。
+    private var taskSessions: [MothxSession] {
+        (mothx.sessions + Array(mothx.pendingSessions.values))
+            .filter { $0.projectID == teamProject.mothxProjectID }
+            .sorted { ($0.updatedAt ?? "") > ($1.updatedAt ?? "") }
+    }
+
+    var body: some View {
+        let c = languageStore.copy
+        return VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Button {
+                    selectedTeamProjectID = teamProject.id
+                    selectedSessionID = nil
+                    showSettings = false
+                    toggle()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right").font(.caption2).frame(width: 14)
+                        Image(systemName: "person.3")
+                            .foregroundStyle(.orange)
+                            .font(.system(size: 11))
+                        Text(teamProject.name).lineLimit(1)
+                        if hasActiveRun {
+                            Circle().fill(.orange).frame(width: 6, height: 6)
+                        }
+                        Spacer(minLength: 0)
+                    }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+                }.buttonStyle(.plain)
+                if isHovered {
+                    Spacer()
+                    Button { showSetup = true } label: {
+                        Image(systemName: "gearshape")
+                    }
+                    .buttonStyle(.plain)
+                    .hoverHighlight()
+                    .help(c.configureTeam)
+                    Button(action: delete) {
+                        Image(systemName: "trash").foregroundStyle(.red.opacity(0.8))
+                    }
+                    .buttonStyle(.plain)
+                    .hoverHighlight()
+                    .help(c.delete)
+                }
+            }
+            .padding(.vertical, 6)
+            .padding(.horizontal, 7)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(isHovered || selected ? Color.primary.opacity(0.1) : .clear)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .foregroundStyle(.primary)
+            .onHover { isHovered = $0 }
+            if expanded {
+                ForEach(taskSessions) { session in
+                    SessionTreeRow(session: session, selected: selectedSessionID == session.id, select: {
+                        guard selectedSessionID != session.id else { return }
+                        mothx.requestSwitch(activeRunSessionID: selectedSessionID) {
+                            selectedTeamProjectID = nil
+                            selectedSessionID = session.id
+                            showSettings = false
+                        }
+                    }, delete: { requestDeleteSession(session.id) }, moveToProject: nil, openInTUI: openInTUI)
+                }
+                if taskSessions.isEmpty {
+                    Text(languageStore.copy.teamTaskNoSessions)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .padding(.leading, 27)
+                        .padding(.vertical, 4)
+                }
+            }
+        }
+        .sheet(isPresented: $showSetup) {
+            TeamSetupSheet(teamProject: teamProject, isPresented: $showSetup)
         }
     }
 }
@@ -195,6 +370,7 @@ struct UnassignedProjectTreeRow: View {
     @EnvironmentObject private var languageStore: LanguageStore
     @EnvironmentObject private var terminalStore: TerminalSessionStore
     @Binding var selectedSessionID: String?
+    @Binding var selectedTeamProjectID: String?
     @Binding var showSettings: Bool
     let requestDelete: (String) -> Void
     let moveToProject: (String, String) -> Void
@@ -230,6 +406,7 @@ struct UnassignedProjectTreeRow: View {
                     SessionTreeRow(session: session, selected: selectedSessionID == session.id, select: {
                         guard selectedSessionID != session.id else { return }
                         mothx.requestSwitch(activeRunSessionID: selectedSessionID) {
+                            selectedTeamProjectID = nil
                             selectedSessionID = session.id
                             showSettings = false
                         }
@@ -249,7 +426,7 @@ struct ProjectTreeRow: View {
     @EnvironmentObject private var languageStore: LanguageStore
     @EnvironmentObject private var terminalStore: TerminalSessionStore
     let project: MothxProject; let expanded: Bool
-    @Binding var selectedProjectID: String?; @Binding var selectedSessionID: String?; @Binding var showSettings: Bool
+    @Binding var selectedProjectID: String?; @Binding var selectedSessionID: String?; @Binding var selectedTeamProjectID: String?; @Binding var showSettings: Bool
     let toggle: () -> Void; let addSession: () -> Void; let delete: () -> Void; let requestDeleteSession: (String) -> Void
     let openInTUI: (MothxSession) -> Void
     @State private var showEditor = false
@@ -313,6 +490,7 @@ struct ProjectTreeRow: View {
                     SessionTreeRow(session: session, selected: selectedSessionID == session.id, select: {
                         guard selectedSessionID != session.id else { return }
                         mothx.requestSwitch(activeRunSessionID: selectedSessionID) {
+                            selectedTeamProjectID = nil
                             selectedProjectID = project.id
                             selectedSessionID = session.id
                             showSettings = false
@@ -382,7 +560,7 @@ struct SessionTreeRow: View {
                 Menu {
                     if let moveToProject {
                         Menu {
-                            ForEach(mothx.projects) { project in
+                            ForEach(mothx.projects.filter { !mothx.teamManager.isTeamProject($0.id) }) { project in
                                 Button {
                                     moveToProject(project.id)
                                 } label: {

@@ -150,6 +150,95 @@ struct Copy {
     var forceHTTP11: String { "Force HTTP/1.1" }
     var noModelsHint: String { text("暂无模型，请先填写 Base URL 后从 API 获取。", "No models. Enter a Base URL to discover models from the API.") }
 
+    // MARK: - Agent team (设置页 Agent 团队 / 团队运行面板)
+    var agentTeam: String { text("Agent 团队", "Agent Team") }
+    var agentTeamSubtitle: String { text("为项目配置主 Agent 与成员 Agent，支持每个成员独立 Provider/Model/WorkDir", "Configure the manager and member agents for this project, each with its own provider/model/work directory") }
+    var managerAgent: String { text("主 Agent", "Manager agent") }
+    var memberAgent: String { text("成员 Agent", "Member agent") }
+    var addManager: String { text("新增主 Agent", "Add manager agent") }
+    var addMember: String { text("新增成员", "Add member agent") }
+    var addAgent: String { text("新增 Agent", "Add agent") }
+    var editAgent: String { text("编辑 Agent", "Edit agent") }
+    var agentRole: String { text("角色", "Role") }
+    var roleManager: String { text("主 Agent", "Manager") }
+    var roleMember: String { text("成员", "Member") }
+    var selectProjectAgentTeam: String { text("选择项目", "Select project") }
+    var noProjectForTeam: String { text("请先选择一个项目以配置 Agent 团队", "Select a project first to configure its agent team") }
+    var noAgentProfiles: String { text("尚未配置 Agent，点击下方按钮新增", "No agents configured yet — add one below") }
+    var agentName: String { text("名称", "Name") }
+    var agentProvider: String { text("Provider", "Provider") }
+    var agentModel: String { text("模型", "Model") }
+    var agentWorkDir: String { text("工作目录", "Working directory") }
+    var agentMode: String { text("执行模式", "Execution mode") }
+    var agentTools: String { text("工具（逗号分隔）", "Tools (comma separated)") }
+    var agentSkills: String { text("Skills（逗号分隔）", "Skills (comma separated)") }
+    var agentMaxIterations: String { text("最大迭代次数", "Max iterations") }
+    var agentEnabledTitle: String { text("启用该 Agent", "Enable this agent") }
+    var agentEnabledHint: String { text("未启用的 Agent 不会被调度器使用", "Disabled agents are not scheduled") }
+    var oneManagerPerProject: String { text("每个项目只能有一个主 Agent", "Each project can have exactly one manager agent") }
+    var saveAgent: String { text("保存 Agent", "Save agent") }
+    var defaultProviderLabel: String { text("（默认）", "(default)") }
+    var testRunAgent: String { text("测试运行", "Test run")
+    }
+    var testRunPrompt: String { text("你好，请用一句话介绍你的角色、当前使用的模型和工作目录。", "Hello, briefly introduce your role, current model and working directory in one sentence.") }
+    var testRunInProgress: String { text("测试运行中…", "Test run in progress…") }
+    var testRunResultTitle: String { text("测试结果", "Test result") }
+    var deleteAgentMessage: String { text("删除该 Agent？其团队配置将被移除，会话记录保留。", "Delete this agent? Its team configuration is removed; session history is kept.") }
+    var enabledBadge: String { text("已启用", "Enabled") }
+    var disabledBadge: String { text("已停用", "Disabled") }
+    var sessionBound: String { text("已绑定会话", "Session bound") }
+    var notRunYet: String { text("尚未执行", "Not run yet") }
+
+    // Team run panel
+    var teamTask: String { text("团队任务", "Team task") }
+    var teamTaskHelp: String { text("由主 Agent 拆解计划，成员并行/串行执行后汇总", "Manager plans the task; members execute in parallel/serial; result is synthesized") }
+    var teamPromptPlaceholder: String { text("输入团队任务，例如：全面检查支付模块…", "Describe the team task, e.g. Review the whole payment module…") }
+    var startTeamRunTitle: String { text("开始团队任务", "Start team task") }
+    var teamNoManager: String { text("该项目尚未配置主 Agent（请在设置 → Agent 团队中配置）", "This project has no manager agent configured (see Settings → Agent Team)") }
+    var teamNoMembers: String { text("该项目尚未配置成员 Agent（请在设置 → Agent 团队中配置）", "This project has no member agents configured (see Settings → Agent Team)") }
+    var teamRunPlanning: String { text("主 Agent 规划中", "Manager planning") }
+    var teamRunPlanned: String { text("计划已生成", "Plan ready") }
+    var teamRunRunning: String { text("成员执行中", "Members running") }
+    var teamRunSynthesizing: String { text("主 Agent 汇总中", "Manager synthesizing") }
+    var teamRunCompleted: String { text("已完成", "Completed") }
+    var teamRunPartial: String { text("部分完成", "Partially completed") }
+    var teamRunPlanningFailed: String { text("规划失败", "Planning failed") }
+    var teamRunFailed: String { text("失败", "Failed") }
+    var teamRunCanceled: String { text("已取消", "Canceled") }
+    var cancelTeamRun: String { text("取消团队任务", "Cancel team task") }
+    var retryTaskTitle: String { text("重试", "Retry") }
+    var tokenUsage: String { text("无", "none") }
+    var taskResultTitle: String { text("成员输出", "Member output") }
+    var taskErrorTitle: String { text("错误", "Error") }
+    var finalAnswer: String { text("最终答复", "Final answer") }
+    var noTeamRuns: String { text("该项目的团队任务会显示在这里", "Team tasks for this project appear here") }
+    var teamTaskStatus: String { text("状态", "Status") }
+    var teamTaskAgent: String { text("Agent", "Agent") }
+    var teamTaskDeps: String { text("依赖", "Dependencies") }
+    var noDependencies: String { text("无", "none") }
+    var teamTaskDetail: String { text("详情", "Details") }
+    var teamProjectRuns: String { text("运行记录", "Run history") }
+    var startTeamRunDisabledHint: String { text("正在执行其他团队任务，请稍候", "Another team task is running — wait for it to finish") }
+    var teamRunErrorLabel: String { text("错误信息", "Error detail") }
+    var teamRunEmpty: String { text("暂无运行记录", "No runs yet") }
+
+    // Team setup (左侧项目下新建团队任务)
+    var teamSetupTitle: String { text("团队设置", "Team Setup") }
+    var teamQueueSubtitle: String { text("配置主 Agent 与成员 Agent，每个成员可独立 Provider/Model/WorkDir", "Configure the manager and member agents, each with its own provider/model/work directory") }
+    var configureTeam: String { text("配置团队", "Configure team") }
+    var newTeamTask: String { text("新建团队任务", "New team task") }
+    var newTeamTaskHelp: String { text("配置团队并创建团队任务", "Configure the team and create a team task") }
+    var finishAndEnterTeam: String { text("保存并进入团队任务", "Save & enter team task") }
+    var finishAndEnterTeamHint: String { text("配置完成后进入团队任务对话模式", "Enter team task mode after saving") }
+    var noManagerConfigured: String { text("尚未配置主 Agent", "No manager agent configured") }
+    var noMembersConfigured: String { text("尚未配置成员 Agent", "No member agents configured") }
+    var noTeamTasksHint: String { text("暂无团队任务，点击 + 新建", "No team tasks — press + to create one") }
+    var taskName: String { text("任务名称", "Task name") }
+    var taskNamePlaceholder: String { text("例如：商城支付模块审查", "e.g. Payment module review") }
+    var createAndEnterTeam: String { text("创建并进入团队任务", "Create & enter team task") }
+    var deleteTeamTaskMessage: String { text("删除该团队任务？其关联的 mothx 项目与本地团队数据将被删除，会话记录保留。", "Delete this team task? Its associated mothx project and local team data are removed; session history is kept.") }
+    var teamTaskNoSessions: String { text("该任务暂无会话", "No sessions for this task") }
+
     // MARK: - Run / service status
     var statusQueued: String { text("排队中", "Queued") }
     var statusRunning: String { text("处理中", "Running") }

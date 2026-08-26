@@ -8,6 +8,7 @@ struct ContentView: View {
     @EnvironmentObject private var languageStore: LanguageStore
     @Binding var showEnvironmentCheck: Bool
     @State private var selectedSessionID: String?
+    @State private var selectedTeamProjectID: String?
     @State private var prompt = ""
     @State private var showSettings = false
     @State private var selectedProjectID: String?
@@ -24,28 +25,38 @@ struct ContentView: View {
     @State private var updateLog = ""
     @State private var skipUpdatePromptThisLaunch = false
 
+    @ViewBuilder
+    private var workspaceContent: some View {
+        if let teamProjectID = selectedTeamProjectID {
+            TeamWorkspaceView(teamProjectID: teamProjectID)
+        } else {
+            WorkspaceView(
+                prompt: $prompt,
+                sessionID: selectedSessionID,
+                onSessionActivated: { session in
+                    // A successful server-side fork is only possible when
+                    // the source has no active run. WorkspaceView invokes
+                    // this after yielding out of the originating button's
+                    // update transaction, so switch directly instead of
+                    // starting the general switch-confirmation flow.
+                    selectedTeamProjectID = nil
+                    selectedSessionID = session.id
+                    if let projectID = session.projectID { selectedProjectID = projectID }
+                }
+            )
+        }
+    }
+
     private var languageStoreCopy: Copy { languageStore.copy }
 
     var body: some View {
         HStack(spacing: 0) {
-            Sidebar(selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID, showSettings: $showSettings, showNewProject: $showNewProject, appearanceMode: $appearanceMode)
+            Sidebar(selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID, selectedTeamProjectID: $selectedTeamProjectID, showSettings: $showSettings, showNewProject: $showNewProject, appearanceMode: $appearanceMode)
             Divider()
             if showSettings {
                 SettingsView(showSettings: $showSettings, selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID)
             } else {
-                WorkspaceView(
-                    prompt: $prompt,
-                    sessionID: selectedSessionID,
-                    onSessionActivated: { session in
-                        // A successful server-side fork is only possible when
-                        // the source has no active run. WorkspaceView invokes
-                        // this after yielding out of the originating button's
-                        // update transaction, so switch directly instead of
-                        // starting the general switch-confirmation flow.
-                        selectedSessionID = session.id
-                        if let projectID = session.projectID { selectedProjectID = projectID }
-                    }
-                )
+                workspaceContent
             }
         }
         .frame(minWidth: 1050, minHeight: 700)
@@ -179,6 +190,9 @@ struct ContentView: View {
 
     func selectDefaultSessionIfNeeded() {
         guard selectedSessionID == nil else { return }
+        // Team task mode keeps its own selection; do not override it with a
+        // default session while the user is configuring/running a team task.
+        guard selectedTeamProjectID == nil else { return }
         // Prefer the service's active session. If none is active, restore the
         // most recently updated persisted session instead.
         let session = mothx.activeSessions.first ?? mostRecentSession

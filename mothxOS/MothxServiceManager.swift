@@ -121,6 +121,9 @@ final class MothxServiceManager: ObservableObject {
     @Published private(set) var currentPlan: MothxPlan?
     @Published private(set) var currentRunningMessageID: String?
     @Published private(set) var isRunning: Bool = false
+    /// Agent team orchestration layer (profiles, team runs, scheduling).
+    /// Kept as a nested ObservableObject so views observe it via `mothx.teamManager`.
+    @Published var teamManager = TeamRunManager()
     private let localProjectStore = try? LocalProjectStore()
     weak var languageStore: LanguageStore?
 
@@ -443,6 +446,9 @@ final class MothxServiceManager: ObservableObject {
         }
 
         await loadInstalledSkills()
+        // Agent team layer: load profiles/team runs and resume any active runs.
+        await teamManager.loadData()
+        await teamManager.recoverActiveRuns()
         workspaceSyncState = syncSucceeded ? .passed : .failed
     }
 
