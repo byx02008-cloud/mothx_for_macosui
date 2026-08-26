@@ -389,10 +389,12 @@ private struct SessionRecordRow: View {
 private struct AdvancedSettingsSection: View {
     @EnvironmentObject private var mothx: MothxServiceManager
     @EnvironmentObject private var languageStore: LanguageStore
+    @AppStorage("mothxOS.reuseExistingService") private var reuseExistingService = false
 
     var body: some View {
         let c = languageStore.copy
-        return SettingsCard(title: c.advancedSettings, subtitle: c.advancedSettingsSubtitle) {
+        return VStack(alignment: .leading, spacing: 16) {
+            SettingsCard(title: c.advancedSettings, subtitle: c.advancedSettingsSubtitle) {
             Button {
                 NSWorkspace.shared.open(mothx.advancedTestURL)
             } label: {
@@ -400,6 +402,10 @@ private struct AdvancedSettingsSection: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(.orange)
+            }
+            SettingsCard(title: c.reuseExistingService, subtitle: c.reuseExistingServiceSubtitle) {
+                Toggle(c.reuseExistingServiceToggle, isOn: $reuseExistingService)
+            }
         }
     }
 }

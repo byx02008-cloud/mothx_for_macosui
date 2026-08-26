@@ -235,7 +235,7 @@ final class MothxServiceManager: ObservableObject {
     /// kills an unrelated process that happens to occupy the port.
     func connectAtLaunch() async {
         state = .checking
-        if await isHealthy() {
+        if await isHealthy(), !UserDefaults.standard.bool(forKey: "mothxOS.reuseExistingService") {
             await killExistingMothxOnDefaultPort()
         }
         await connect()
@@ -947,9 +947,9 @@ final class MothxServiceManager: ObservableObject {
     /// Fetches the latest persisted usage for the active run from
     /// `GET /api/sessions/{sessionID}/runs` (newest-first). The row matching
     /// the active run ID is preferred so a retry or another attempt for the
-    /// same intent cannot shadow the active run; otherwise the newest row is
-    /// used. Returns nil when the endpoint is unavailable or the run has no
-    /// usage yet — mothx only persists usage once the run terminalizes.
+    /// same intent cannot shadow the active run. If the active run is not
+    /// present or has no usage yet, return nil rather than borrowing another
+    /// run's usage and displaying an incorrect cache hit rate.
     private func latestRunUsage(sessionID: String, runID: String) async -> [String: Any]? {
         do {
             let data = try await request(path: "api/sessions/\(sessionID)/runs?limit=3", method: "GET")
@@ -960,9 +960,6 @@ final class MothxServiceManager: ObservableObject {
             }
             if let matched = runs.first(where: { ($0["ID"] as? String) == runID || ($0["id"] as? String) == runID }),
                let usage = usageFor(matched) {
-                return usage
-            }
-            if let newest = runs.first, let usage = usageFor(newest) {
                 return usage
             }
             return nil
@@ -1078,6 +1075,16 @@ final class MothxServiceManager: ObservableObject {
                           let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
                     if let seq = object["seq"] as? Int {
                         await MainActor.run { self.runEventLastSeq = max(self.runEventLastSeq, seq) }
+                    }
+                    if object["stream"] as? String == "run",
+                       object["event"] as? String == "usage",
+                       object["runId"] as? String == self.currentRunID,
+                       let eventData = object["data"] as? [String: Any],
+                       let usage = eventData["usage"] as? [String: Any] {
+                        await MainActor.run {
+                            self.updateRunCacheHitRate(from: usage)
+                        }
+                        continue
                     }
                     guard object["stream"] as? String == "transcript",
                           let eventData = object["data"] as? [String: Any],
