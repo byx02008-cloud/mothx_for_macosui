@@ -42,6 +42,7 @@ final class TeamRunManager: ObservableObject {
     private var pollTasks: [String: Task<Void, Never>] = [:]
     private var cancelFlags: [String: Bool] = [:]
     private let maxConcurrentTasks = 3
+    private let maxMemberRetries = MothxTeamTask.maxRetries
     private let maxPlanAttempts = 2
     private let maxResultLength = 30000
 
@@ -58,10 +59,25 @@ final class TeamRunManager: ObservableObject {
     @MainActor
     func loadData() async {
         guard let store else { return }
-        agentProfiles = (try? store.agentProfiles()) ?? []
-        teamProjects = (try? store.teamProjects()) ?? []
-        teamRuns = (try? store.teamRuns()) ?? []
-        for run in teamRuns { teamTasksByRun[run.id] = (try? store.teamTasks(for: run.id)) ?? [] }
+        do {
+            let loadedProfiles = try store.agentProfiles()
+            let loadedTeamProjects = try store.teamProjects()
+            let loadedRuns = try store.teamRuns()
+            var loadedTasks: [String: [MothxTeamTask]] = [:]
+            for run in loadedRuns {
+                loadedTasks[run.id] = try store.teamTasks(for: run.id)
+            }
+            agentProfiles = loadedProfiles
+            teamProjects = loadedTeamProjects
+            teamRuns = loadedRuns
+            teamTasksByRun = loadedTasks
+            errorMessage = nil
+        } catch {
+            // Do not turn a teams.sqlite read failure into an empty database:
+            // that would make team projects appear as regular projects.
+            errorMessage = "加载本地团队数据失败：\(error.localizedDescription)"
+            return
+        }
         // Sweep orphaned agent profiles: drafts whose team project was never
         // created (or an earlier data model whose projects no longer exist).
         let validProjectIDs = Set(teamProjects.map(\.id))
@@ -99,6 +115,18 @@ final class TeamRunManager: ObservableObject {
         guard let store else { errorMessage = "本地团队数据库无法访问"; return nil }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+        // Idempotency: if the row already exists (e.g. a retried confirm), reuse
+        // it instead of creating a duplicate mothx project.
+        if let existing = teamProject(forTeamProjectID: id) {
+            var updated = existing
+            updated.name = trimmed
+            updated.updatedAt = Date()
+            try? store.saveTeamProject(updated)
+            if let index = teamProjects.firstIndex(where: { $0.id == id }) {
+                teamProjects[index] = updated
+            }
+            return updated
+        }
         do {
             let body = try jsonData(["name": trimmed])
             let data = try await request(path: "api/projects", method: "POST", body: body)
@@ -107,9 +135,16 @@ final class TeamRunManager: ObservableObject {
                 errorMessage = "创建 mothx 项目失败"
                 return nil
             }
+            // 先持久化本地记录，再对外发布；保存失败时回滚远端项目，避免留下“只有远端项目、没有本地映射”的半成品。
             let now = Date()
             let project = MothxTeamProject(id: id, name: trimmed, mothxProjectID: mothxProjectID, createdAt: now, updatedAt: now)
-            try store.saveTeamProject(project)
+            do {
+                try store.saveTeamProject(project)
+            } catch {
+                _ = try? await request(path: "api/projects/\(mothxProjectID)", method: "DELETE")
+                errorMessage = "创建团队任务失败：\(error.localizedDescription)"
+                return nil
+            }
             teamProjects.append(project)
             errorMessage = nil
             return project
@@ -135,8 +170,8 @@ final class TeamRunManager: ObservableObject {
         }
     }
 
-    /// Deletes a team task: removes the mothx project (sessions stay, like
-    /// project deletion in mothx) and all locally recorded team data.
+    /// Deletes a team task's mothx project and all locally recorded team data.
+    /// The owning UI removes the project's sessions before calling this method.
     @MainActor
     func deleteTeamProject(id: String) async {
         guard let store, let project = teamProject(forTeamProjectID: id) else { return }
@@ -152,13 +187,15 @@ final class TeamRunManager: ObservableObject {
         }
     }
 
-    /// Removes leftover in-memory drafts of a team project that was never
+    /// Removes leftover drafts (agent profiles) of a setup that was never
     /// confirmed (cancelled team setup).
+    /// 只清理“从未确认创建”的草稿：若该 id 已存在真实团队任务记录，绝不删除。
     @MainActor
     func discardTeamProjectDraft(id: String) async {
         guard let store else { return }
-        try? store.deleteTeamProject(projectID: id)
-        teamProjects.removeAll { $0.id == id }
+        // 一旦团队任务已创建（team_projects 有行），草稿清理不得触碰它。
+        guard teamProject(forTeamProjectID: id) == nil else { return }
+        try? store.deleteAgentProfiles(projectID: id)
         agentProfiles.removeAll { $0.projectID == id }
     }
 
@@ -180,6 +217,37 @@ final class TeamRunManager: ObservableObject {
     @MainActor
     func profile(id: String) -> MothxAgentProfile? {
         agentProfiles.first { $0.id == id }
+    }
+
+    @MainActor
+    func hasActiveRun(for projectID: String) -> Bool {
+        teamRuns.contains { $0.projectID == projectID && !$0.status.isTerminal }
+    }
+
+    /// Repairs the client-owned Session → mothx Project association after a
+    /// restart. Session metadata is written after the first Run is created,
+    /// so a crash or transient HTTP failure can otherwise leave a member
+    /// session under the regular project list.
+    @MainActor
+    func repairSessionProjectLinks() async {
+        var failures = 0
+        for profile in agentProfiles {
+            guard let sessionID = profile.sessionID,
+                  let teamProject = teamProject(forTeamProjectID: profile.projectID),
+                  !teamProject.mothxProjectID.isEmpty else { continue }
+            do {
+                _ = try await request(
+                    path: "api/sessions/\(sessionID)/metadata",
+                    method: "PATCH",
+                    body: try jsonData(["projectId": teamProject.mothxProjectID])
+                )
+            } catch {
+                failures += 1
+            }
+        }
+        if failures > 0 {
+            errorMessage = "有 \(failures) 个成员会话的团队归属修复失败"
+        }
     }
 
     /// Saves a profile; enforces exactly one manager per project.
@@ -247,7 +315,14 @@ final class TeamRunManager: ObservableObject {
         }
         if !profile.projectID.isEmpty {
             let attachProjectID = teamProject(forTeamProjectID: profile.projectID)?.mothxProjectID ?? profile.projectID
-            _ = try? await request(path: "api/sessions/\(sessionID)/metadata", method: "PATCH", body: try? jsonData(["projectId": attachProjectID]))
+            do {
+                _ = try await request(path: "api/sessions/\(sessionID)/metadata", method: "PATCH", body: try? jsonData(["projectId": attachProjectID]))
+            } catch {
+                // The run already exists, so do not report the member run as
+                // failed. Surface the association failure for the next
+                // workspace refresh/retry instead of swallowing it.
+                errorMessage = "成员会话归属团队任务失败：\(error.localizedDescription)"
+            }
         }
         return (sessionID, runID)
     }
@@ -284,6 +359,10 @@ final class TeamRunManager: ObservableObject {
         let members = profiles(for: projectID).filter { $0.role == .member && $0.enabled }
         guard !members.isEmpty else {
             errorMessage = "请先为该团队任务配置至少一个启用的成员 Agent"
+            return nil
+        }
+        guard !hasActiveRun(for: projectID) else {
+            errorMessage = "该团队任务已有正在执行的任务，请稍候"
             return nil
         }
         guard let store else { errorMessage = "本地团队数据库无法访问"; return nil }
@@ -339,8 +418,13 @@ final class TeamRunManager: ObservableObject {
             errorMessage = "只有失败或已取消的任务可以重试"
             return
         }
+        guard tasks[index].retryCount < maxMemberRetries else {
+            errorMessage = "该子任务已重试 (maxMemberRetries) 次，团队任务已停止"
+            return
+        }
         var task = tasks[index]
         task.retryOf = task.retryOf ?? task.id
+        task.retryCount += 1
         task.status = .pending
         task.runID = nil
         task.sessionID = nil
@@ -371,6 +455,12 @@ final class TeamRunManager: ObservableObject {
         guard let store else { return }
         let active = (try? store.activeTeamRuns()) ?? []
         for run in active where pollTasks[run.id] == nil && cancelFlags[run.id] == nil {
+            if run.status == .canceling {
+                // cancelFlags are process-local. Persisted canceling runs must
+                // continue down the cancellation path after a restart, never
+                // re-enter normal scheduling.
+                cancelFlags[run.id] = true
+            }
             startPollTask(run.id)
         }
     }
@@ -418,7 +508,8 @@ final class TeamRunManager: ObservableObject {
                     agentProfileID: task.agentId,
                     sessionID: nil,
                     runID: nil,
-                    retryOf: nil,
+            retryOf: nil,
+                    retryCount: 0,
                     title: task.title,
                     prompt: task.prompt,
                     status: .pending,
@@ -448,7 +539,8 @@ final class TeamRunManager: ObservableObject {
                     agentProfileID: task.agentId,
                     sessionID: nil,
                     runID: nil,
-                    retryOf: nil,
+            retryOf: nil,
+                    retryCount: 0,
                     title: task.title,
                     prompt: task.prompt,
                     status: .pending,
@@ -470,15 +562,32 @@ final class TeamRunManager: ObservableObject {
         while !isCancelRequested(runID) {
             var tasks = loadTasks(runID)
             var changed = false
+            var stopReason: String?
 
             // Poll running runs; move them to completed/failed.
             for index in tasks.indices where tasks[index].status == .running {
                 guard let childRunID = tasks[index].runID else { continue }
                 guard let status = await runStatusOnce(childRunID) else { continue }
                 guard terminalRunStatuses.contains(status.lowercased()) else { continue }
-                if failedRunStatuses.contains(status.lowercased()) {
-                    tasks[index].status = .failed
-                    tasks[index].error = String((await runError(childRunID)).prefix(2000))
+                let normalizedStatus = status.lowercased()
+                if ["cancelled", "canceled"].contains(normalizedStatus) {
+                    tasks[index].status = .canceled
+                    tasks[index].error = "成员 Run 已取消"
+                } else if failedRunStatuses.contains(normalizedStatus) {
+                    let detail = String((await runError(childRunID)).prefix(2000))
+                    if tasks[index].retryCount < maxMemberRetries {
+                        tasks[index].retryCount += 1
+                        tasks[index].status = .queued
+                        tasks[index].runID = nil
+                        tasks[index].sessionID = nil
+                        tasks[index].finishedAt = nil
+                        tasks[index].result = ""
+                        tasks[index].error = "成员 Run 失败，正在进行第 \(tasks[index].retryCount)/\(maxMemberRetries) 次重试：\(detail)"
+                    } else {
+                        tasks[index].status = .failed
+                        tasks[index].error = detail
+                        stopReason = "子 Agent「\(tasks[index].title)」重试 \(maxMemberRetries) 次仍失败，团队任务已停止：\(detail)"
+                    }
                 } else {
                     tasks[index].status = .completed
                     if let sessionID = tasks[index].sessionID {
@@ -487,6 +596,19 @@ final class TeamRunManager: ObservableObject {
                 }
                 tasks[index].finishedAt = Date()
                 changed = true
+            }
+
+            if let stopReason {
+                saveTasks(runID, tasks)
+                await cancelChildRuns(runID)
+                var stoppedTasks = loadTasks(runID)
+                for index in stoppedTasks.indices where !stoppedTasks[index].status.isTerminal {
+                    stoppedTasks[index].status = .canceled
+                    stoppedTasks[index].finishedAt = Date()
+                }
+                saveTasks(runID, stoppedTasks)
+                finishRun(run, status: .failed, error: stopReason)
+                return
             }
 
             // Resolve dependencies: a task becomes queued when all its
@@ -521,14 +643,36 @@ final class TeamRunManager: ObservableObject {
                     tasks[index].startedAt = Date()
                     tasks[index].error = ""
                 } catch {
-                    tasks[index].status = .failed
-                    tasks[index].error = "启动成员 Run 失败：\(error.localizedDescription)"
+                    if tasks[index].retryCount < maxMemberRetries {
+                        tasks[index].retryCount += 1
+                        tasks[index].status = .queued
+                        tasks[index].runID = nil
+                        tasks[index].sessionID = nil
+                        tasks[index].finishedAt = nil
+                        tasks[index].result = ""
+                        tasks[index].error = "启动成员 Run 失败，正在进行第 \(tasks[index].retryCount)/\(maxMemberRetries) 次重试：\(error.localizedDescription)"
+                    } else {
+                        tasks[index].status = .failed
+                        tasks[index].error = "启动成员 Run 失败：\(error.localizedDescription)"
+                        stopReason = "子 Agent「\(tasks[index].title)」重试 \(maxMemberRetries) 次仍失败，团队任务已停止：\(error.localizedDescription)"
+                    }
                 }
                 runningCount += 1
                 changed = true
             }
 
             if changed { saveTasks(runID, tasks) }
+            if let stopReason {
+                await cancelChildRuns(runID)
+                var stoppedTasks = loadTasks(runID)
+                for index in stoppedTasks.indices where !stoppedTasks[index].status.isTerminal {
+                    stoppedTasks[index].status = .canceled
+                    stoppedTasks[index].finishedAt = Date()
+                }
+                saveTasks(runID, stoppedTasks)
+                finishRun(run, status: .failed, error: stopReason)
+                return
+            }
             if tasks.allSatisfy({ $0.status.isTerminal }) { break }
             try? await Task.sleep(for: .milliseconds(800))
         }
@@ -670,14 +814,27 @@ final class TeamRunManager: ObservableObject {
     // MARK: - Prompt builders
 
     private func buildPlanPrompt(userPrompt: String, manager: MothxAgentProfile, members: [MothxAgentProfile], feedback: String) -> String {
-        let agentLines = ([manager] + members).map { agent in
-            "- \(agent.id) | \(agent.name) | role: \(agent.role.rawValue) | provider: \(agent.providerID.isEmpty ? "default" : agent.providerID) | model: \(agent.modelID.isEmpty ? "default" : agent.modelID) | workDir: \(agent.workDir)"
+        let agentLines = ([manager] + members).map { agent -> String in
+            var parts: [String] = [
+                "id: \(agent.id)",
+                "名称: \(agent.name)",
+                "角色: \(agent.role.rawValue == "manager" ? "主 Agent（负责汇总）" : "成员")"
+            ]
+            if !agent.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                parts.append("技能描述: \(agent.summary)")
+            }
+            if !agent.providerID.isEmpty { parts.append("provider: \(agent.providerID)") }
+            if !agent.modelID.isEmpty { parts.append("model: \(agent.modelID)") }
+            if !agent.workDir.isEmpty { parts.append("workDir: \(agent.workDir)") }
+            if !agent.tools.isEmpty { parts.append("tools: \(agent.tools.joined(separator: ", "))") }
+            if !agent.skills.isEmpty { parts.append("skills: \(agent.skills.joined(separator: ", "))") }
+            return "- \(parts.joined(separator: " | "))"
         }.joined(separator: "\n")
         let feedbackBlock = feedback.isEmpty ? "" : "\n\n上一次输出未通过校验：\(feedback)"
         return """
         你是项目的「主 Agent」。用户提交了一个任务，你需要把它拆解为子任务并输出严格的 JSON（不要输出除 JSON 之外的任何内容）。
 
-        可用 Agent（只能引用这些 id）：
+        可用 Agent（只能引用这些 id；请根据每个成员的「技能描述」、tools 与 skills 把子任务分给最合适的成员）：
         \(agentLines)
 
         输出格式（type 必须为 "team_plan"，version 必须为 1）：
@@ -690,7 +847,7 @@ final class TeamRunManager: ObservableObject {
               "id": "task-1",
               "agentId": "成员 agent id",
               "title": "子任务标题",
-              "prompt": "子任务的完整指令",
+              "prompt": "子任务的完整指令（结合该成员的能力与工作目录）",
               "dependsOn": [],
               "execution": "parallel"
             }
@@ -699,6 +856,7 @@ final class TeamRunManager: ObservableObject {
 
         规则：
         - 每个 task 的 agentId 必须来自上面列表；
+        - 参考各成员的技能描述、模型能力和工作目录来分配任务；
         - dependsOn 引用其他 task 的 id；汇总任务依赖前面的任务；
         - 无依赖的任务并行执行（execution: "parallel"），有依赖的串行（execution: "serial"）；
         - 最后应包含一个汇总任务，交给 manager 汇总成员结果；
@@ -726,7 +884,12 @@ final class TeamRunManager: ObservableObject {
             sections.append("[任务：\(task.title)]（Agent：\(agentName)，状态：\(task.status.rawValue)）\n\(body)")
         }
         sections.append("""
-        请根据以上团队成员结果生成最终答复（只输出最终答复本身）。请区分：
+        请根据以上团队成员结果生成最终答复（只输出最终答复本身）。严格遵守以下规则：
+        - 你是汇总者，不是失败成员的替代执行者；
+        - 对状态为 failed、canceled 或 skipped 的任务，不得重新执行、推测或补写该任务的成果；
+        - 如果成员结果缺失，只能明确说明缺失原因，并将最终结果标记为不完整；
+        - 不得把你自己的分析或操作描述成失败成员已经完成的工作。
+        请区分：
         - 已确认的问题；
         - 潜在问题；
         - 建议的验证项。

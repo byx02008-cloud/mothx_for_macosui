@@ -38,7 +38,8 @@ final class TeamStore {
                 enabled INTEGER NOT NULL,
                 session_id TEXT,
                 created_at REAL NOT NULL,
-                updated_at REAL NOT NULL
+                updated_at REAL NOT NULL,
+                summary TEXT NOT NULL DEFAULT ''
             )
         """)
         try execute("""
@@ -74,6 +75,7 @@ final class TeamStore {
                 session_id TEXT,
                 run_id TEXT,
                 retry_of TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
                 title TEXT NOT NULL,
                 prompt TEXT NOT NULL,
                 status TEXT NOT NULL,
@@ -93,7 +95,15 @@ final class TeamStore {
         """)
         // Migration for databases created before retry_of existed.
         try? execute("ALTER TABLE team_tasks ADD COLUMN retry_of TEXT")
+        try? execute("ALTER TABLE team_tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
         try? execute("ALTER TABLE team_runs ADD COLUMN manager_run_id TEXT")
+        // Migration: Agent Profile skill/capability description added later.
+        try? execute("ALTER TABLE agent_profiles ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
+        // Migration: nil dates used to be persisted as 0 (1970-01-01), which
+        // made in-flight rows read back as finished and show negative durations.
+        try? execute("UPDATE team_runs SET finished_at = NULL WHERE finished_at = 0")
+        try? execute("UPDATE team_tasks SET started_at = NULL WHERE started_at = 0")
+        try? execute("UPDATE team_tasks SET finished_at = NULL WHERE finished_at = 0")
     }
 
     deinit { sqlite3_close(database) }
@@ -101,7 +111,7 @@ final class TeamStore {
     // MARK: - Agent Profiles
 
     func agentProfiles() throws -> [MothxAgentProfile] {
-        let statement = try prepare("SELECT id, project_id, name, role, provider_id, model_id, work_dir, mode, tools, skills, max_iterations, enabled, session_id, created_at, updated_at FROM agent_profiles ORDER BY updated_at DESC")
+        let statement = try prepare("SELECT id, project_id, name, role, provider_id, model_id, work_dir, mode, tools, skills, max_iterations, enabled, session_id, created_at, updated_at, summary FROM agent_profiles ORDER BY updated_at DESC")
         defer { sqlite3_finalize(statement) }
         var result: [MothxAgentProfile] = []
         while sqlite3_step(statement) == SQLITE_ROW {
@@ -111,7 +121,7 @@ final class TeamStore {
     }
 
     func agentProfiles(for projectID: String) throws -> [MothxAgentProfile] {
-        let statement = try prepare("SELECT id, project_id, name, role, provider_id, model_id, work_dir, mode, tools, skills, max_iterations, enabled, session_id, created_at, updated_at FROM agent_profiles WHERE project_id = ? ORDER BY role ASC, updated_at DESC")
+        let statement = try prepare("SELECT id, project_id, name, role, provider_id, model_id, work_dir, mode, tools, skills, max_iterations, enabled, session_id, created_at, updated_at, summary FROM agent_profiles WHERE project_id = ? ORDER BY role ASC, updated_at DESC")
         defer { sqlite3_finalize(statement) }
         try bind(projectID, to: statement, index: 1)
         var result: [MothxAgentProfile] = []
@@ -123,8 +133,8 @@ final class TeamStore {
 
     func saveAgentProfile(_ profile: MothxAgentProfile) throws {
         let statement = try prepare("""
-            INSERT INTO agent_profiles (id, project_id, name, role, provider_id, model_id, work_dir, mode, tools, skills, max_iterations, enabled, session_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO agent_profiles (id, project_id, name, role, provider_id, model_id, work_dir, mode, tools, skills, max_iterations, enabled, session_id, created_at, updated_at, summary)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 project_id = excluded.project_id,
                 name = excluded.name,
@@ -138,7 +148,8 @@ final class TeamStore {
                 max_iterations = excluded.max_iterations,
                 enabled = excluded.enabled,
                 session_id = excluded.session_id,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                summary = excluded.summary
         """)
         defer { sqlite3_finalize(statement) }
         try bind(profile.id, to: statement, index: 1)
@@ -156,6 +167,7 @@ final class TeamStore {
               sqlite3_bind_text(statement, 13, profile.sessionID, -1, sqliteTransient) == SQLITE_OK,
               sqlite3_bind_double(statement, 14, profile.createdAt.timeIntervalSince1970) == SQLITE_OK,
               sqlite3_bind_double(statement, 15, profile.updatedAt.timeIntervalSince1970) == SQLITE_OK,
+              sqlite3_bind_text(statement, 16, profile.summary, -1, sqliteTransient) == SQLITE_OK,
               sqlite3_step(statement) == SQLITE_DONE else {
             throw LocalProjectStoreError.writeFailed
         }
@@ -163,6 +175,12 @@ final class TeamStore {
 
     func deleteAgentProfile(id: String) throws {
         try execute("DELETE FROM agent_profiles WHERE id = ?", bindings: [id])
+    }
+
+    /// Removes draft agent profiles that belong to a team project id that was
+    /// never confirmed (used by the cancelled team setup flow).
+    func deleteAgentProfiles(projectID: String) throws {
+        try execute("DELETE FROM agent_profiles WHERE project_id = ?", bindings: [projectID])
     }
 
     // MARK: - Team Projects（团队任务容器）
@@ -264,11 +282,11 @@ final class TeamStore {
         try bind(run.finalAnswer, to: statement, index: 8)
         try bind(run.error, to: statement, index: 9)
         guard sqlite3_bind_double(statement, 10, run.startedAt.timeIntervalSince1970) == SQLITE_OK,
-              sqlite3_bind_double(statement, 11, run.finishedAt?.timeIntervalSince1970 ?? 0) == SQLITE_OK,
-              sqlite3_bind_double(statement, 12, run.updatedAt.timeIntervalSince1970) == SQLITE_OK,
-              sqlite3_step(statement) == SQLITE_DONE else {
+              sqlite3_bind_double(statement, 12, run.updatedAt.timeIntervalSince1970) == SQLITE_OK else {
             throw LocalProjectStoreError.writeFailed
         }
+        try bindDate(run.finishedAt, to: statement, index: 11)
+        guard sqlite3_step(statement) == SQLITE_DONE else { throw LocalProjectStoreError.writeFailed }
     }
 
     func deleteTeamRun(id: String) throws {
@@ -281,7 +299,7 @@ final class TeamStore {
 
     func teamTasks(for runID: String) throws -> [MothxTeamTask] {
         let dependencies = try taskDependencies(for: runID)
-        let statement = try prepare("SELECT id, team_run_id, agent_profile_id, session_id, run_id, retry_of, title, prompt, status, execution_mode, result, error, started_at, finished_at FROM team_tasks WHERE team_run_id = ?")
+        let statement = try prepare("SELECT id, team_run_id, agent_profile_id, session_id, run_id, retry_of, retry_count, title, prompt, status, execution_mode, result, error, started_at, finished_at FROM team_tasks WHERE team_run_id = ?")
         defer { sqlite3_finalize(statement) }
         try bind(runID, to: statement, index: 1)
         var result: [MothxTeamTask] = []
@@ -293,12 +311,13 @@ final class TeamStore {
 
     func saveTeamTask(_ task: MothxTeamTask) throws {
         let statement = try prepare("""
-            INSERT INTO team_tasks (id, team_run_id, agent_profile_id, session_id, run_id, retry_of, title, prompt, status, execution_mode, result, error, started_at, finished_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO team_tasks (id, team_run_id, agent_profile_id, session_id, run_id, retry_of, retry_count, title, prompt, status, execution_mode, result, error, started_at, finished_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 session_id = excluded.session_id,
                 run_id = excluded.run_id,
                 retry_of = excluded.retry_of,
+                retry_count = excluded.retry_count,
                 status = excluded.status,
                 result = excluded.result,
                 error = excluded.error,
@@ -312,17 +331,16 @@ final class TeamStore {
         try bind(task.sessionID, to: statement, index: 4)
         try bind(task.runID, to: statement, index: 5)
         try bind(task.retryOf, to: statement, index: 6)
-        try bind(task.title, to: statement, index: 7)
-        try bind(task.prompt, to: statement, index: 8)
-        try bind(task.status.rawValue, to: statement, index: 9)
-        try bind(task.executionMode, to: statement, index: 10)
-        try bind(task.result, to: statement, index: 11)
-        try bind(task.error, to: statement, index: 12)
-        guard sqlite3_bind_double(statement, 13, task.startedAt?.timeIntervalSince1970 ?? 0) == SQLITE_OK,
-              sqlite3_bind_double(statement, 14, task.finishedAt?.timeIntervalSince1970 ?? 0) == SQLITE_OK,
-              sqlite3_step(statement) == SQLITE_DONE else {
-            throw LocalProjectStoreError.writeFailed
-        }
+        guard sqlite3_bind_int(statement, 7, Int32(task.retryCount)) == SQLITE_OK else { throw LocalProjectStoreError.writeFailed }
+        try bind(task.title, to: statement, index: 8)
+        try bind(task.prompt, to: statement, index: 9)
+        try bind(task.status.rawValue, to: statement, index: 10)
+        try bind(task.executionMode, to: statement, index: 11)
+        try bind(task.result, to: statement, index: 12)
+        try bind(task.error, to: statement, index: 13)
+        try bindDate(task.startedAt, to: statement, index: 14)
+        try bindDate(task.finishedAt, to: statement, index: 15)
+        guard sqlite3_step(statement) == SQLITE_DONE else { throw LocalProjectStoreError.writeFailed }
         // Keep the dependency table in sync with the task's dependsOn list.
         try execute("DELETE FROM team_task_dependencies WHERE task_id = ?", bindings: [task.id])
         for dependency in task.dependsOn {
@@ -363,6 +381,7 @@ final class TeamStore {
             skills: stringArray(statement, column: 9),
             maxIterations: Int(sqlite3_column_int(statement, 10)),
             enabled: sqlite3_column_int(statement, 11) != 0,
+            summary: string(statement, column: 15),
             sessionID: nullableString(statement, column: 12),
             createdAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 13)),
             updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 14))
@@ -395,15 +414,16 @@ final class TeamStore {
             sessionID: nullableString(statement, column: 3),
             runID: nullableString(statement, column: 4),
             retryOf: nullableString(statement, column: 5),
-            title: string(statement, column: 6),
-            prompt: string(statement, column: 7),
-            status: MothxTeamTaskStatus(rawValue: string(statement, column: 8)) ?? .pending,
-            executionMode: string(statement, column: 9),
+            retryCount: Int(sqlite3_column_int(statement, 6)),
+            title: string(statement, column: 7),
+            prompt: string(statement, column: 8),
+            status: MothxTeamTaskStatus(rawValue: string(statement, column: 9)) ?? .pending,
+            executionMode: string(statement, column: 10),
             dependsOn: dependencies[string(statement, column: 0)] ?? [],
-            result: string(statement, column: 10),
-            error: string(statement, column: 11),
-            startedAt: sqlite3_column_type(statement, 12) != SQLITE_NULL ? Date(timeIntervalSince1970: sqlite3_column_double(statement, 12)) : nil,
-            finishedAt: sqlite3_column_type(statement, 13) != SQLITE_NULL ? Date(timeIntervalSince1970: sqlite3_column_double(statement, 13)) : nil
+            result: string(statement, column: 11),
+            error: string(statement, column: 12),
+            startedAt: sqlite3_column_type(statement, 13) != SQLITE_NULL ? Date(timeIntervalSince1970: sqlite3_column_double(statement, 13)) : nil,
+            finishedAt: sqlite3_column_type(statement, 14) != SQLITE_NULL ? Date(timeIntervalSince1970: sqlite3_column_double(statement, 14)) : nil
         )
     }
 
@@ -437,6 +457,16 @@ final class TeamStore {
 
     private func bind(_ value: String?, to statement: OpaquePointer?, index: Int32) throws {
         guard sqlite3_bind_text(statement, index, value, -1, sqliteTransient) == SQLITE_OK else { throw LocalProjectStoreError.writeFailed }
+    }
+
+    /// Binds a date, storing NULL for nil so optional timestamps round-trip
+    /// correctly (0.0 would read back as 1970-01-01).
+    private func bindDate(_ date: Date?, to statement: OpaquePointer?, index: Int32) throws {
+        if let date {
+            guard sqlite3_bind_double(statement, index, date.timeIntervalSince1970) == SQLITE_OK else { throw LocalProjectStoreError.writeFailed }
+        } else {
+            guard sqlite3_bind_null(statement, index) == SQLITE_OK else { throw LocalProjectStoreError.writeFailed }
+        }
     }
 
     private func string(_ statement: OpaquePointer?, column: Int32) -> String {

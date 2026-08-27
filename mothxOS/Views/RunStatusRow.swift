@@ -13,7 +13,7 @@ struct RunStatusRow: View {
                 HStack(spacing: 8) {
                     Text("\(statusLabel) \(formattedElapsed)")
                         .font(.caption)
-                        .foregroundStyle(isErrorStatus || !(error ?? "").isEmpty ? Color.red : Color.primary.opacity(0.68))
+                        .foregroundStyle(statusTextColor)
                     Image(systemName: expanded ? "chevron.down" : "chevron.right")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
@@ -49,6 +49,14 @@ struct RunStatusRow: View {
         switch status.lowercased() {
         case "failed", "error", "timeout", "cancelled", "canceled": return true
         default: return false
+        }
+    }
+
+    private var statusTextColor: Color {
+        switch status.lowercased() {
+        case "completed", "succeeded": return .green
+        case "failed", "error", "timeout", "cancelled", "canceled": return .red
+        default: return (error ?? "").isEmpty ? Color.primary.opacity(0.68) : .red
         }
     }
 

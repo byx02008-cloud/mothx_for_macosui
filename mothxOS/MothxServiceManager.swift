@@ -114,6 +114,7 @@ final class MothxServiceManager: ObservableObject {
     private var runEventTask: Task<Void, Never>?
     private var runEventStreamSessionID: String?
     private var runEventLastSeq: Int = 0
+    private var monitoredRunIDs: Set<String> = []
     @Published private(set) var currentRunID: String?
     @Published private(set) var sessionModels: [String: String] = [:]
     @Published private(set) var sessionProviders: [String: String] = [:]
@@ -388,6 +389,12 @@ final class MothxServiceManager: ObservableObject {
         workspaceSyncState = .pending
         var syncSucceeded = true
 
+        // Team projects are represented as ordinary mothx Projects on the
+        // server. Load the client-owned mapping before publishing projects so
+        // the sidebar never classifies team projects as regular projects on
+        // startup.
+        await teamManager.loadData()
+
         var hadLocalProjectLoadError = false
         var localProjects: [MothxProject] = []
         do {
@@ -430,6 +437,7 @@ final class MothxServiceManager: ObservableObject {
                 }
             }
             sessions = loadedSessions
+            await teamManager.repairSessionProjectLinks()
             if !hadLocalProjectLoadError { settingsError = nil }
         } catch {
             syncSucceeded = false
@@ -446,8 +454,8 @@ final class MothxServiceManager: ObservableObject {
         }
 
         await loadInstalledSkills()
-        // Agent team layer: load profiles/team runs and resume any active runs.
-        await teamManager.loadData()
+        // Agent team layer: resume any active runs after sessions/projects are
+        // available. The mapping itself was loaded before project publication.
         await teamManager.recoverActiveRuns()
         workspaceSyncState = syncSucceeded ? .passed : .failed
     }
@@ -785,23 +793,14 @@ final class MothxServiceManager: ObservableObject {
         }
     }
 
-    // MARK: - Interrupted-switch guard
-
-    /// Switch action deferred until the user confirms stopping the current
-    /// task (session/mode switches during a running task would stop it).
-    private(set) var pendingSwitchAction: (() -> Void)?
-    @Published private(set) var showSwitchConfirmation = false
-
-    /// True when the serve API reports an active run for the session. Backed
-    /// by the durable `session_runs` table (statuses created/queued/running/
-    /// waiting_for_approval/waiting_for_question/cancelling/terminalizing), so
-    /// it also sees runs started by the terminal-mode TUI process, not just
-    /// runs submitted from this UI. Returns false on any error (offline, etc.).
+    /// Returns whether mothx has a durable Agent Run currently active for a
+    /// session. An open TUI process is not itself an active Agent Run: the TUI
+    /// stays alive while waiting for the next user command.
     func sessionHasActiveRun(_ sessionID: String) async -> Bool {
         guard !sessionID.isEmpty else { return false }
         do {
             let data = try await request(path: "api/sessions/\(sessionID)/runtime", method: "GET")
-            guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 return false
             }
             return object["activeRun"] is [String: Any]
@@ -810,48 +809,88 @@ final class MothxServiceManager: ObservableObject {
         }
     }
 
-    /// Runs `action` (a session/mode switch) immediately, or defers it behind
-    /// a confirmation dialog while a task is running: either this UI's own run
-    /// (`isRunning`) or an active run the serve API reports for
-    /// `activeRunSessionID` (which includes runs started inside the mothx TUI).
-    /// Idle states switch without any dialog.
-    func requestSwitch(activeRunSessionID: String? = nil, _ action: @escaping () -> Void) {
-        if isRunning {
-            pendingSwitchAction = action
-            showSwitchConfirmation = true
-            return
-        }
-        guard let sessionID = activeRunSessionID else {
-            action()
-            return
-        }
-        Task { @MainActor in
-            let busy = await sessionHasActiveRun(sessionID)
-            if busy {
-                pendingSwitchAction = action
-                showSwitchConfirmation = true
-            } else {
-                action()
+    /// Waits briefly for the server-side session lock to be released after a
+    /// confirmed UI-to-TUI stop. The cancel endpoint is asynchronous and may
+    /// return before the runtime has finished terminalizing the Run.
+    func waitForSessionIdle(_ sessionID: String) async {
+        guard !sessionID.isEmpty else { return }
+        for _ in 0..<20 {
+            do {
+                let data = try await request(path: "api/sessions/\(sessionID)/runtime", method: "GET")
+                if let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   object["activeRun"] is [String: Any] {
+                    try? await Task.sleep(for: .milliseconds(250))
+                    continue
+                }
+            } catch {
+                // A transient probe failure should not block the mode switch;
+                // the TUI will report a genuine startup error if needed.
             }
+            return
         }
     }
 
-    /// User confirmed: stop the current run first, then perform the switch.
+    // MARK: - Session switching
+
+    private(set) var pendingSwitchAction: (() -> Void)?
+    @Published private(set) var showSwitchConfirmation = false
+
+    /// Requests a UI/TUI mode change. Mode changes while the current mode is
+    /// actively executing are destructive, so defer them until confirmation.
+    /// Plain session navigation deliberately does not use this method.
+    func requestModeSwitch(isRunning: Bool, _ action: @escaping () -> Void) {
+        requestModeSwitch(isRunning: isRunning, continueAction: nil, action)
+    }
+
+    private(set) var pendingContinueSwitchAction: (() -> Void)?
+    @Published private(set) var canContinueModeSwitch = false
+
+    /// Requests a mode switch with an optional detach path. The detach path
+    /// is used by TUI → UI: the TUI keeps running while UI observes its Run.
+    func requestModeSwitch(isRunning: Bool, continueAction: (() -> Void)?, _ action: @escaping () -> Void) {
+        guard isRunning else {
+            (continueAction ?? action)()
+            return
+        }
+        pendingContinueSwitchAction = continueAction
+        canContinueModeSwitch = continueAction != nil
+        pendingSwitchAction = action
+        showSwitchConfirmation = true
+    }
+
     func confirmSwitch() {
         showSwitchConfirmation = false
         let action = pendingSwitchAction
         pendingSwitchAction = nil
-        guard let action else { return }
-        Task { @MainActor in
-            await cancelRun()
-            action()
-        }
+        pendingContinueSwitchAction = nil
+        canContinueModeSwitch = false
+        action?()
     }
 
-    /// User declined: keep the current session/mode and the running task.
+    func continueSwitch() {
+        showSwitchConfirmation = false
+        let action = pendingContinueSwitchAction
+        pendingSwitchAction = nil
+        pendingContinueSwitchAction = nil
+        canContinueModeSwitch = false
+        action?()
+    }
+
     func cancelSwitch() {
         showSwitchConfirmation = false
         pendingSwitchAction = nil
+        pendingContinueSwitchAction = nil
+        canContinueModeSwitch = false
+    }
+
+    /// Switch sessions immediately without changing the active Run. Runs are
+    /// durable server-side tasks, so a UI selection change must not cancel the
+    /// run or block navigation.
+    /// `activeRunSessionID` is retained for source compatibility with callers
+    /// that also use this helper for terminal-mode switches.
+    func requestSwitch(activeRunSessionID: String? = nil, _ action: @escaping () -> Void) {
+        _ = activeRunSessionID
+        action()
     }
 
     /// Plans are transient run UI state and must not be restored from history
@@ -861,7 +900,9 @@ final class MothxServiceManager: ObservableObject {
     }
 
     func pollRun(runID: String, sessionID: String) async {
+        guard monitoredRunIDs.insert(runID).inserted else { return }
         defer {
+            monitoredRunIDs.remove(runID)
             runElapsed = elapsedSinceRunStart()
             isSubmittingRun = false
             currentRunningMessageID = nil
@@ -914,6 +955,38 @@ final class MothxServiceManager: ObservableObject {
                 settingsError = describe(error)
             }
             try? await Task.sleep(for: .milliseconds(500))
+        }
+    }
+
+    /// Attaches the UI to a Run that was started by the TUI (or another
+    /// client). The durable runtime snapshot provides the Run identity; the
+    /// existing poller and WebSocket stream then handle the rest.
+    func attachToActiveRun(sessionID: String) async {
+        guard !sessionID.isEmpty else { return }
+        do {
+            let data = try await request(path: "api/sessions/\(sessionID)/runtime", method: "GET")
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let active = object["activeRun"] as? [String: Any],
+                  let runID = (active["runId"] as? String) ?? (active["runID"] as? String) ?? (active["id"] as? String),
+                  !runID.isEmpty else { return }
+
+            runSessionID = sessionID
+            currentRunID = runID
+            runStatus = (active["status"] as? String) ?? (active["state"] as? String) ?? "running"
+            isSubmittingRun = false
+            isStreaming = true
+            isRunning = true
+            cancelRequested = false
+            runExistingMessageIDs = Set((messagesBySession[sessionID] ?? []).map(\.id))
+            runStartedAt = parseDate(active["startedAt"] ?? active["started_at"]) ?? Date()
+            runElapsed = elapsedSinceRunStart()
+            startRunEventStream(sessionID: sessionID)
+            if !monitoredRunIDs.contains(runID) {
+                Task { @MainActor in await self.pollRun(runID: runID, sessionID: sessionID) }
+            }
+        } catch {
+            // Runtime attachment is best-effort; the normal message history
+            // remains available if the service is temporarily unavailable.
         }
     }
 

@@ -162,8 +162,9 @@ struct TextMessageBubble: View {
 }
 
 /// Renders a completed assistant response as Markdown while keeping a plain-text
-/// fallback for malformed or unsupported Markdown input.
-private struct MarkdownMessageText: View {
+/// fallback for malformed or unsupported Markdown input. Shared by the session
+/// conversation and the team task final answer.
+struct MarkdownMessageText: View {
     let markdown: String
     @Environment(\.colorScheme) private var colorScheme
 

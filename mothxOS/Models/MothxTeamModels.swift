@@ -75,6 +75,7 @@ enum MothxTeamTaskStatus: String, Codable, Hashable {
 /// One member task within a Team Run. `dependsOn` lists task IDs that must
 /// reach a terminal state before this task may start.
 struct MothxTeamTask: Identifiable, Codable, Hashable {
+    static let maxRetries = 5
     var id: String
     var teamRunID: String
     var agentProfileID: String
@@ -83,6 +84,8 @@ struct MothxTeamTask: Identifiable, Codable, Hashable {
     /// Retry lineage: the task ID this task retries, when the user asked to
     /// re-run a failed/skipped task.
     var retryOf: String?
+    /// Number of automatic member-run retries already consumed.
+    var retryCount: Int = 0
     var title: String
     var prompt: String
     var status: MothxTeamTaskStatus

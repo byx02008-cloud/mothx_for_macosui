@@ -24,6 +24,8 @@ struct MothxAgentProfile: Identifiable, Codable, Hashable {
     var skills: [String]
     var maxIterations: Int
     var enabled: Bool
+    /// 技能/职责描述（供主 Agent 拆解任务时判断该成员适合哪类子任务）。
+    var summary: String = ""
     /// Lazy-bound mothx session; saved after the first successful run.
     var sessionID: String?
     var createdAt: Date
@@ -44,6 +46,7 @@ struct MothxAgentProfile: Identifiable, Codable, Hashable {
             skills: [],
             maxIterations: 50,
             enabled: true,
+            summary: "",
             sessionID: nil,
             createdAt: now,
             updatedAt: now

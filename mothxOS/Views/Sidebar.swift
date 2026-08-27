@@ -4,6 +4,7 @@ struct Sidebar: View {
     @EnvironmentObject private var mothx: MothxServiceManager
     @EnvironmentObject private var languageStore: LanguageStore
     @EnvironmentObject private var terminalStore: TerminalSessionStore
+    @ObservedObject var teamManager: TeamRunManager
     @Binding var selectedProjectID: String?
     @Binding var selectedSessionID: String?
     @Binding var selectedTeamProjectID: String?
@@ -11,7 +12,6 @@ struct Sidebar: View {
     @Binding var showNewProject: Bool
     @Binding var appearanceMode: String
     @State private var expandedProjects: Set<String> = []
-    @State private var expandedTeamProjects: Set<String> = []
     @State private var pendingDelete: SidebarDelete?
     @State private var showServiceLogs = false
     @State private var showStats = false
@@ -23,7 +23,7 @@ struct Sidebar: View {
     /// Regular projects the user created in the UI. Team tasks are real mothx
     /// projects too, but they are owned by the 团队任务 section.
     private var visibleProjects: [MothxProject] {
-        mothx.projects.filter { !mothx.teamManager.isTeamProject($0.id) }
+        mothx.projects.filter { !teamManager.isTeamProject($0.id) }
     }
 
     var body: some View {
@@ -66,32 +66,20 @@ struct Sidebar: View {
                         .help(c.newTeamTask)
                     }
                     .padding(.bottom, 6)
-                    if mothx.teamManager.teamProjects.isEmpty {
+                    if teamManager.teamProjects.isEmpty {
                         Text(c.noTeamTasksHint)
                             .font(.caption)
                             .foregroundStyle(.tertiary)
                             .padding(.leading, 4)
                             .padding(.bottom, 8)
                     }
-                    ForEach(mothx.teamManager.teamProjects) { teamProject in
+                    ForEach(teamManager.teamProjects) { teamProject in
                         TeamProjectTreeRow(
                             teamProject: teamProject,
-                            expanded: expandedTeamProjects.contains(teamProject.id),
                             selected: selectedTeamProjectID == teamProject.id,
-                            selectedSessionID: $selectedSessionID,
                             selectedTeamProjectID: $selectedTeamProjectID,
                             showSettings: $showSettings,
-                            toggle: { toggleTeam(teamProject.id) },
-                            delete: { pendingDelete = .teamProject(teamProject.id) },
-                            requestDeleteSession: { pendingDelete = .session($0) },
-                            openInTUI: { session in
-                                mothx.requestSwitch(activeRunSessionID: selectedSessionID) {
-                                    showSettings = false
-                                    selectedTeamProjectID = nil
-                                    selectedSessionID = session.id
-                                    terminalStore.open(sessionID: session.id, workDir: mothx.workDir(for: session.id))
-                                }
-                            }
+                            delete: { pendingDelete = .teamProject(teamProject.id) }
                         )
                     }
 
@@ -216,7 +204,6 @@ struct Sidebar: View {
                     selectedSessionID = nil
                     selectedProjectID = nil
                     showSettings = false
-                    expandedTeamProjects.insert(teamProject.id)
                 }
             )
         }
@@ -228,7 +215,6 @@ struct Sidebar: View {
         }
     }
     private func toggle(_ id: String) { if expandedProjects.contains(id) { expandedProjects.remove(id) } else { expandedProjects.insert(id) } }
-    private func toggleTeam(_ id: String) { if expandedTeamProjects.contains(id) { expandedTeamProjects.remove(id) } else { expandedTeamProjects.insert(id) } }
     private func appearanceButton(_ title: String, value: String) -> some View {
         Button {
             appearanceMode = value
@@ -244,6 +230,15 @@ struct Sidebar: View {
             await mothx.deleteProject(id: id)
             if selectedProjectID == id { selectedProjectID = nil; selectedSessionID = nil; selectedTeamProjectID = nil }
         case .teamProject(let id):
+            let sessionIDs = mothx.sessions
+                .filter { $0.projectID == mothx.teamManager.teamProject(forTeamProjectID: id)?.mothxProjectID }
+                .map(\.id)
+            let pendingSessionIDs = mothx.pendingSessions.values
+                .filter { $0.projectID == mothx.teamManager.teamProject(forTeamProjectID: id)?.mothxProjectID }
+                .map(\.id)
+            for sessionID in Set(sessionIDs + pendingSessionIDs) {
+                await mothx.deleteSession(id: sessionID)
+            }
             await mothx.teamManager.deleteTeamProject(id: id)
             if selectedTeamProjectID == id { selectedTeamProjectID = nil }
         case .session(let id):
@@ -266,46 +261,30 @@ enum SidebarDelete {
 }
 
 /// 侧边栏顶部「团队任务」下的一个任务（mothx 中对应真实 Project）。
-/// 点击进入团队任务对话模式；展开后展示该任务产生的所有会话。
+/// 点击进入团队任务对话模式。团队任务产生的会话由任务统一管理，
+/// 不在侧边栏中作为任务的子节点展示。
 struct TeamProjectTreeRow: View {
     @EnvironmentObject private var mothx: MothxServiceManager
     @EnvironmentObject private var languageStore: LanguageStore
-    @EnvironmentObject private var terminalStore: TerminalSessionStore
     let teamProject: MothxTeamProject
-    let expanded: Bool
     let selected: Bool
-    @Binding var selectedSessionID: String?
     @Binding var selectedTeamProjectID: String?
     @Binding var showSettings: Bool
-    let toggle: () -> Void
     let delete: () -> Void
-    let requestDeleteSession: (String) -> Void
-    let openInTUI: (MothxSession) -> Void
     @State private var isHovered = false
     @State private var showSetup = false
 
     private var hasActiveRun: Bool {
         mothx.teamManager.teamRuns.contains { $0.projectID == teamProject.id && !$0.status.isTerminal }
     }
-    /// 该任务产生的所有会话：mothx 侧它们都归属到任务对应的 Project。
-    private var taskSessions: [MothxSession] {
-        (mothx.sessions + Array(mothx.pendingSessions.values))
-            .filter { $0.projectID == teamProject.mothxProjectID }
-            .sorted { ($0.updatedAt ?? "") > ($1.updatedAt ?? "") }
-    }
-
     var body: some View {
         let c = languageStore.copy
-        return VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 6) {
-                Button {
-                    selectedTeamProjectID = teamProject.id
-                    selectedSessionID = nil
-                    showSettings = false
-                    toggle()
-                } label: {
+        return HStack(spacing: 6) {
+            Button {
+                selectedTeamProjectID = teamProject.id
+                showSettings = false
+            } label: {
                     HStack(spacing: 6) {
-                        Image(systemName: expanded ? "chevron.down" : "chevron.right").font(.caption2).frame(width: 14)
                         Image(systemName: "person.3")
                             .foregroundStyle(.orange)
                             .font(.system(size: 11))
@@ -316,49 +295,36 @@ struct TeamProjectTreeRow: View {
                         Spacer(minLength: 0)
                     }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
                 }.buttonStyle(.plain)
-                if isHovered {
-                    Spacer()
-                    Button { showSetup = true } label: {
-                        Image(systemName: "gearshape")
+            if isHovered {
+                Spacer()
+                Menu {
+                    Button {
+                        showSetup = true
+                    } label: {
+                        Label(c.configureTeam, systemImage: "gearshape")
                     }
-                    .buttonStyle(.plain)
-                    .hoverHighlight()
-                    .help(c.configureTeam)
-                    Button(action: delete) {
-                        Image(systemName: "trash").foregroundStyle(.red.opacity(0.8))
+                    Divider()
+                    Button(role: .destructive, action: delete) {
+                        Label(c.delete, systemImage: "trash")
                     }
-                    .buttonStyle(.plain)
-                    .hoverHighlight()
-                    .help(c.delete)
-                }
-            }
-            .padding(.vertical, 6)
-            .padding(.horizontal, 7)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(isHovered || selected ? Color.primary.opacity(0.1) : .clear)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            .foregroundStyle(.primary)
-            .onHover { isHovered = $0 }
-            if expanded {
-                ForEach(taskSessions) { session in
-                    SessionTreeRow(session: session, selected: selectedSessionID == session.id, select: {
-                        guard selectedSessionID != session.id else { return }
-                        mothx.requestSwitch(activeRunSessionID: selectedSessionID) {
-                            selectedTeamProjectID = nil
-                            selectedSessionID = session.id
-                            showSettings = false
-                        }
-                    }, delete: { requestDeleteSession(session.id) }, moveToProject: nil, openInTUI: openInTUI)
-                }
-                if taskSessions.isEmpty {
-                    Text(languageStore.copy.teamTaskNoSessions)
+                } label: {
+                    Image(systemName: "ellipsis")
                         .font(.caption)
-                        .foregroundStyle(.tertiary)
-                        .padding(.leading, 27)
-                        .padding(.vertical, 4)
+                        .foregroundStyle(.white)
                 }
+                .menuStyle(.borderlessButton)
+                .buttonStyle(.plain)
+                .hoverHighlight()
+                .help(c.showMore)
             }
         }
+        .padding(.vertical, 6)
+        .padding(.horizontal, 7)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(isHovered || selected ? Color.primary.opacity(0.1) : .clear)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .foregroundStyle(.primary)
+        .onHover { isHovered = $0 }
         .sheet(isPresented: $showSetup) {
             TeamSetupSheet(teamProject: teamProject, isPresented: $showSetup)
         }

@@ -51,7 +51,7 @@ struct ContentView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            Sidebar(selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID, selectedTeamProjectID: $selectedTeamProjectID, showSettings: $showSettings, showNewProject: $showNewProject, appearanceMode: $appearanceMode)
+            Sidebar(teamManager: mothx.teamManager, selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID, selectedTeamProjectID: $selectedTeamProjectID, showSettings: $showSettings, showNewProject: $showNewProject, appearanceMode: $appearanceMode)
             Divider()
             if showSettings {
                 SettingsView(showSettings: $showSettings, selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID)
@@ -94,6 +94,9 @@ struct ContentView: View {
             }.padding(24).frame(width: 520)
         }
         .confirmationDialog(languageStoreCopy.switchStopTaskTitle, isPresented: Binding(get: { mothx.showSwitchConfirmation }, set: { if !$0 { mothx.cancelSwitch() } }), titleVisibility: .visible) {
+            if mothx.canContinueModeSwitch {
+                Button(languageStoreCopy.continueAndSwitch) { mothx.continueSwitch() }
+            }
             Button(languageStoreCopy.stopAndSwitch, role: .destructive) { mothx.confirmSwitch() }
             Button(languageStoreCopy.cancel, role: .cancel) { mothx.cancelSwitch() }
         } message: {
@@ -133,6 +136,10 @@ struct ContentView: View {
         }
         .task {
             await mothx.loadWorkspace()
+            // Team layer safety net: make sure team projects are always loaded
+            // even if loadWorkspace bailed early (e.g. offline at first paint).
+            await mothx.teamManager.loadData()
+            await mothx.teamManager.recoverActiveRuns()
             selectDefaultSessionIfNeeded()
         }
         .task {

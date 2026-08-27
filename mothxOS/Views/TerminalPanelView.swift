@@ -21,14 +21,13 @@ struct TerminalPanelView: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> LocalProcessTerminalView {
-        let terminal = LocalProcessTerminalView(frame: .zero)
+        let terminal = store.terminal(for: context.coordinator.sessionID ?? "")
         terminal.processDelegate = context.coordinator
         terminal.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         // The caret must stay visible regardless of keyboard focus: SwiftTerm's
         // macOS TerminalView only becomes first responder in a few paths, and
         // with `tracksFocus` on the cursor is not drawn at all when unfocused.
         terminal.caretViewTracksFocus = false
-        store.attach(terminal)
         context.coordinator.installShiftEnterMonitor(terminal: terminal)
         context.coordinator.installFocusHandling(terminal: terminal)
         return terminal
@@ -39,13 +38,15 @@ struct TerminalPanelView: NSViewRepresentable {
         guard !context.coordinator.hasStarted, store.isOpen else { return }
         context.coordinator.hasStarted = true
         guard let sessionID = store.sessionID else { return }
+        guard !store.hasStarted(sessionID: sessionID) else { return }
+        store.markStarting(sessionID: sessionID)
         Task { @MainActor in
             // The panel may have been closed (or switched to another session)
             // while the executable/environment resolution was in flight; do
             // not start a process for a panel that is no longer current.
             guard store.isOpen, store.sessionID == sessionID else { return }
             guard let executable = await MothxServiceManager.resolveGlobalMothxExecutable() else {
-                store.markTerminated(exitCode: 127)
+                store.markTerminated(sessionID: sessionID, exitCode: 127)
                 return
             }
             let environment = await Self.terminalEnvironment()
@@ -185,10 +186,10 @@ struct TerminalPanelView: NSViewRepresentable {
         func hostCurrentDirectoryUpdate(source: SwiftTerm.TerminalView, directory: String?) {}
 
         func processTerminated(source: SwiftTerm.TerminalView, exitCode: Int32?) {
-            // Ignore termination of an old process after the panel switched to
-            // another session or was closed (store.sessionID is nil then).
+            // Record termination for the owning session even when its terminal
+            // is detached because another session is currently visible.
             guard store.sessionID == sessionID else { return }
-            store.markTerminated(exitCode: exitCode)
+            store.markTerminated(sessionID: sessionID ?? "", exitCode: exitCode)
         }
     }
 }
@@ -214,8 +215,20 @@ struct TUIPanelHeader: View {
             }
             Spacer()
             Button {
-                mothx.requestSwitch(activeRunSessionID: store.sessionID) {
+                guard let sessionID = store.sessionID else {
                     store.close()
+                    return
+                }
+                Task { @MainActor in
+                    // The TUI process remains alive while idle, so process
+                    // liveness is not sufficient to decide whether closing
+                    // it would stop an Agent Run.
+                    let activeRun = await mothx.sessionHasActiveRun(sessionID)
+                    mothx.requestModeSwitch(
+                        isRunning: activeRun,
+                        continueAction: { store.detach() },
+                        { store.close() }
+                    )
                 }
             } label: {
                 Image(systemName: "xmark").font(.caption2)

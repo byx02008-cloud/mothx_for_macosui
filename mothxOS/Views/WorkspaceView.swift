@@ -6,6 +6,9 @@ struct WorkspaceView: View {
     @EnvironmentObject private var terminalStore: TerminalSessionStore
     @Binding var prompt: String
     let sessionID: String?
+    /// Displays the conversation without exposing run controls or the prompt
+    /// composer. Used for the read-only session tabs inside team tasks.
+    var readOnly: Bool = false
     /// Called after a fork creates a child session so the owner (ContentView)
     /// can switch the workspace to the new session.
     var onSessionActivated: ((MothxSession) -> Void)? = nil
@@ -44,10 +47,21 @@ struct WorkspaceView: View {
                     Text(mothx.sessions.first(where: { $0.id == sessionID })?.title ?? c.workspace)
                         .font(.system(size: 14, weight: .medium))
                     Spacer()
-                    if let sessionID {
+                    if let sessionID, !readOnly {
                         Button {
-                            mothx.requestSwitch(activeRunSessionID: sessionID) {
-                                terminalStore.open(sessionID: sessionID, workDir: mothx.workDir(for: sessionID))
+                            let uiRunActive = mothx.runSessionID == sessionID && (mothx.isRunning || mothx.isSubmittingRun)
+                            // If this session already owns a retained TUI,
+                            // this is only a reattach. Do not cancel the Run
+                            // just because the detached PTY is still alive.
+                            let hasRetainedTUI = terminalStore.hasTerminal(sessionID: sessionID)
+                            mothx.requestModeSwitch(isRunning: uiRunActive && !hasRetainedTUI) {
+                                Task { @MainActor in
+                                    if mothx.runSessionID == sessionID && (mothx.isRunning || mothx.isSubmittingRun) {
+                                        await mothx.cancelRun()
+                                        await mothx.waitForSessionIdle(sessionID)
+                                    }
+                                    terminalStore.open(sessionID: sessionID, workDir: mothx.workDir(for: sessionID))
+                                }
                             }
                         } label: {
                             Label(c.terminalMode, systemImage: "terminal")
@@ -122,6 +136,14 @@ struct WorkspaceView: View {
                         .onChange(of: mothx.messagesBySession[sessionID] ?? []) { _, _ in
                             scrollToBottom(reader, animated: false)
                         }
+                        .onChange(of: currentTurns.count) { _, _ in
+                            // The initial history request completes after the
+                            // ScrollView has appeared. Re-apply the bottom
+                            // position after the turn list is committed so a
+                            // restored session does not open on an empty area
+                            // until the user nudges the scrollbar.
+                            scrollToBottom(reader, animated: false)
+                        }
                         .onChange(of: mothx.thinkingBySession[sessionID] ?? "") { _, _ in
                             if mothx.runSessionID == sessionID, mothx.isRunning {
                                 scrollToBottom(reader, animated: true)
@@ -175,8 +197,9 @@ struct WorkspaceView: View {
                     Spacer(); Text(c.workspaceHint).foregroundStyle(.secondary); Spacer()
                 }
 
-                PromptComposer(
-                    prompt: $prompt,
+                if !readOnly {
+                    PromptComposer(
+                        prompt: $prompt,
                 attachments: $attachments,
                 mode: $selectedMode,
                 providerID: $selectedProviderID,
@@ -191,7 +214,8 @@ struct WorkspaceView: View {
                 chooseFiles: chooseFiles,
                 submit: submit,
                     stop: { Task { await mothx.cancelRun() } }
-                ).frame(maxWidth: 760).padding(.horizontal, 25).padding(.bottom, 16)
+                    ).frame(maxWidth: 760).padding(.horizontal, 25).padding(.bottom, 16)
+                }
             }
         }.padding(.top, 1)
         .alert(c.attach, isPresented: Binding(get: { attachmentError != nil }, set: { if !$0 { attachmentError = nil } })) {
@@ -228,6 +252,7 @@ struct WorkspaceView: View {
                 await mothx.loadSkills(for: sessionID)
                 selectedSkills = mothx.activeSkillsBySession[sessionID] ?? []
                 await mothx.loadMessages(sessionID: sessionID)
+                await mothx.attachToActiveRun(sessionID: sessionID)
                 currentTurns = computeTurns(mothx.messagesBySession[sessionID] ?? [])
                 showAllHistory = false
                 expandedTurnIDs = currentTurns.last.map { [$0.id] } ?? []
@@ -259,13 +284,15 @@ struct WorkspaceView: View {
             guard !isOpen, let sessionID else { return }
             // Returning from terminal mode: reload the conversation so any
             // messages added by the mothx TUI (same session) show up.
-            Task { await mothx.loadMessages(sessionID: sessionID) }
+            Task {
+                await mothx.loadMessages(sessionID: sessionID)
+                await mothx.attachToActiveRun(sessionID: sessionID)
+            }
         }
         .onChange(of: sessionID) { _, newSessionID in
             // While terminal mode is active, switching to another session in
-            // the sidebar switches the terminal too: the previous mothx TUI
-            // process is terminated and a new one resumes the new session
-            // from its working directory.
+            // the sidebar changes the visible terminal. The previous session's
+            // retained TUI process remains alive and can be shown again later.
             guard terminalStore.isOpen, let newSessionID,
                   terminalStore.sessionID != newSessionID else { return }
             terminalStore.open(sessionID: newSessionID, workDir: mothx.workDir(for: newSessionID))

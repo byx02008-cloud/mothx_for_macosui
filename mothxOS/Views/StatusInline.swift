@@ -40,8 +40,7 @@ struct StatusInline: View {
                     // Status label
                     Text(statusLabel)
                         .font(.caption)
-                        .foregroundStyle(isErrorStatus || !(error ?? "").isEmpty
-                            ? Color.red : Color.primary.opacity(0.68))
+                        .foregroundStyle(statusTextColor)
 
                     // Elapsed
                     Text("·")
@@ -129,6 +128,14 @@ struct StatusInline: View {
         switch status.lowercased() {
         case "failed", "error", "timeout", "cancelled", "canceled": return true
         default: return false
+        }
+    }
+
+    private var statusTextColor: Color {
+        switch status.lowercased() {
+        case "completed", "succeeded": return .green
+        case "failed", "error", "timeout", "cancelled", "canceled": return .red
+        default: return (error ?? "").isEmpty ? Color.primary.opacity(0.68) : .red
         }
     }
 

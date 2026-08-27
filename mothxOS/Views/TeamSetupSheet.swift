@@ -18,7 +18,6 @@ struct TeamSetupSheet: View {
     @State private var draftProjectID = UUID().uuidString.lowercased()
     @State private var editingAgent: MothxAgentProfile?
     @State private var creating = false
-    @State private var didComplete = false
 
     private var c: Copy { languageStore.copy }
     private var team: TeamRunManager { mothx.teamManager }
@@ -110,10 +109,6 @@ struct TeamSetupSheet: View {
             taskName = teamProject?.name ?? ""
             editingAgent = nil
         }
-        .onDisappear {
-            // 取消新建（未确认）时清理草稿，避免残留空行。成功创建后不清除。
-            if isCreating, !creating, !didComplete { Task { await team.discardTeamProjectDraft(id: draftProjectID) } }
-        }
         .sheet(isPresented: Binding(get: { editingAgent != nil }, set: { if !$0 { editingAgent = nil } })) {
             if let editingAgent {
                 AgentEditorSheet(profile: editingAgent, projectID: activeProjectID, isPresented: Binding(get: { self.editingAgent != nil }, set: { if !$0 { self.editingAgent = nil } }))
@@ -133,7 +128,6 @@ struct TeamSetupSheet: View {
             let project = await team.createTeamProject(name: validName, id: draftProjectID)
             creating = false
             guard let project else { return }
-            didComplete = true
             isPresented = false
             onCreated?(project)
         } else if let teamProject {
@@ -143,6 +137,9 @@ struct TeamSetupSheet: View {
     }
 
     private func cancel() {
+        // 仅显式取消时清理草稿（不依赖 onDisappear，避免 macOS 上误触发导致
+        // 已创建的团队任务被草稿清理删除）；管理器层也有保护不会删真实任务。
+        if isCreating { Task { await team.discardTeamProjectDraft(id: draftProjectID) } }
         isPresented = false
     }
 }
@@ -181,6 +178,9 @@ private struct AgentSummaryRow: View {
         let model = profile.modelID.isEmpty ? c.defaultProviderLabel : profile.modelID
         let provider = profile.providerID.isEmpty ? "" : "\(profile.providerID)/"
         let workDir = profile.workDir.isEmpty ? "" : " · \(profile.workDir)"
+        if !profile.summary.isEmpty {
+            return "\(provider)\(model)\(workDir) · \(profile.summary)"
+        }
         return "\(provider)\(model)\(workDir)"
     }
 }
@@ -218,6 +218,21 @@ struct AgentEditorSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     SettingsField(title: c.agentName, text: $profile.name)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(c.agentSummary).font(.caption).foregroundStyle(.secondary)
+                        TextEditor(text: $profile.summary)
+                            .font(.system(size: 13))
+                            .scrollContentBackground(.hidden)
+                            .frame(minHeight: 54, maxHeight: 90)
+                            .padding(8)
+                            .background(Color.primary.opacity(0.18))
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                            .overlay(alignment: .topLeading) {
+                                if profile.summary.isEmpty {
+                                    Text(c.agentSummaryPlaceholder).font(.system(size: 13)).foregroundStyle(.tertiary).padding(.horizontal, 12).padding(.vertical, 10).allowsHitTesting(false)
+                                }
+                            }
+                    }
                     HStack {
                         Text(c.agentRole).frame(width: 150, alignment: .leading)
                         Picker(c.agentRole, selection: $profile.role) {

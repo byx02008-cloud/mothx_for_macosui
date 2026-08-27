@@ -166,6 +166,8 @@ struct Copy {
     var noProjectForTeam: String { text("请先选择一个项目以配置 Agent 团队", "Select a project first to configure its agent team") }
     var noAgentProfiles: String { text("尚未配置 Agent，点击下方按钮新增", "No agents configured yet — add one below") }
     var agentName: String { text("名称", "Name") }
+    var agentSummary: String { text("技能描述", "Skill description") }
+    var agentSummaryPlaceholder: String { text("例如：负责后端支付接口审查，熟悉 Go/PostgreSQL，仅执行审计类任务\n这段描述会提供给主 Agent 用于分配子任务", "e.g. Reviews backend payment APIs; Go/PostgreSQL; audit-only tasks.\nThis description helps the manager agent allocate subtasks.") }
     var agentProvider: String { text("Provider", "Provider") }
     var agentModel: String { text("模型", "Model") }
     var agentWorkDir: String { text("工作目录", "Working directory") }
@@ -238,6 +240,20 @@ struct Copy {
     var createAndEnterTeam: String { text("创建并进入团队任务", "Create & enter team task") }
     var deleteTeamTaskMessage: String { text("删除该团队任务？其关联的 mothx 项目与本地团队数据将被删除，会话记录保留。", "Delete this team task? Its associated mothx project and local team data are removed; session history is kept.") }
     var teamTaskNoSessions: String { text("该任务暂无会话", "No sessions for this task") }
+    var teamTrajectoryTitle: String { text("运行轨迹", "Trajectory") }
+    var newTeamRunTitle: String { text("发起新任务", "New task") }
+    var managerSynthesis: String { text("主 Agent 汇总", "Manager synthesis") }
+    // 执行动态（谁在做什么 + 时间）
+    var teamActivityTitle: String { text("执行动态", "Activity") }
+    var activityPlanning: String { text("任务拆解中", "Planning tasks") }
+    var activityWaitingMembers: String { text("等待成员结果", "Waiting for members") }
+    var activitySynthesizing: String { text("汇总中", "Synthesizing") }
+    var activitySummaryDone: String { text("汇总完成", "Summary done") }
+    var activityWaiting: String { text("等待中", "Waiting") }
+    var activityCanceling: String { text("取消中", "Canceling") }
+    func activityRunning(_ title: String) -> String { text("正在执行：\(title)", "Running: \(title)") }
+    func activityStartedAt(_ time: String) -> String { text("开始于 \(time)", "Started \(time)") }
+    func activityDoneAt(_ time: String) -> String { text("完成于 \(time)", "Done at \(time)") }
 
     // MARK: - Run / service status
     var statusQueued: String { text("排队中", "Queued") }
@@ -309,11 +325,12 @@ struct Copy {
     var terminalCloseHelp: String { text("关闭终端", "Close terminal") }
     var terminalMode: String { text("终端模式", "Terminal mode") }
     var openTerminalHelp: String { text("在终端中打开当前会话", "Open current session in terminal") }
-    var switchStopTaskTitle: String { text("停止当前任务？", "Stop current task?") }
-    var switchStopTaskMessage: String { text("当前有任务正在运行，切换会话或模式将停止该任务。确定要切换吗？", "A task is still running. Switching sessions or modes will stop it. Switch anyway?") }
-    var stopAndSwitch: String { text("停止并切换", "Stop and switch") }
     func terminalExited(_ code: Int32) -> String { text("TUI 已退出（代码 \(code)）", "TUI exited (code \(code))") }
     var terminalLaunchFailed: String { text("未找到 mothx，无法启动 TUI", "mothx not found; unable to start TUI") }
+    var switchStopTaskTitle: String { text("停止当前任务？", "Stop current task?") }
+    var switchStopTaskMessage: String { text("当前模式正在执行，切换模式将停止当前任务。确定要切换吗？", "The current mode is running. Switching modes will stop the current task. Continue?") }
+    var stopAndSwitch: String { text("停止并切换", "Stop and switch") }
+    var continueAndSwitch: String { text("继续执行并切换", "Continue and switch") }
 
     // MARK: - About
     var about: String { text("关于软件", "About") }
