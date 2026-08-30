@@ -1,6 +1,76 @@
 import Combine
 import Foundation
 
+struct MothxToolResultDetail: Decodable {
+    let toolCallID: String
+    let toolName: String?
+    let content: String
+    let isError: Bool
+    let oldText: String?
+    let newText: String?
+
+    private struct DiffPayload: Decodable {
+        let oldText: String?
+        let newText: String?
+
+        enum CodingKeys: String, CodingKey {
+            case oldText, newText
+            case oldTextSnake = "old_text"
+            case newTextSnake = "new_text"
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            oldText = try container.decodeIfPresent(String.self, forKey: .oldText)
+                ?? container.decodeIfPresent(String.self, forKey: .oldTextSnake)
+            newText = try container.decodeIfPresent(String.self, forKey: .newText)
+                ?? container.decodeIfPresent(String.self, forKey: .newTextSnake)
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case toolCallID = "toolCallId"
+        case toolCallIDSnake = "tool_call_id"
+        case toolName, content, isError, oldText, newText, diff, toolDiff
+        case toolNameSnake = "tool_name"
+        case isErrorSnake = "is_error"
+        case oldTextSnake = "old_text"
+        case newTextSnake = "new_text"
+        case toolDiffSnake = "tool_diff"
+    }
+
+    init(toolCallID: String, toolName: String?, content: String, isError: Bool, oldText: String?, newText: String?) {
+        self.toolCallID = toolCallID
+        self.toolName = toolName
+        self.content = content
+        self.isError = isError
+        self.oldText = oldText
+        self.newText = newText
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        toolCallID = try container.decodeIfPresent(String.self, forKey: .toolCallID)
+            ?? container.decode(String.self, forKey: .toolCallIDSnake)
+        toolName = try container.decodeIfPresent(String.self, forKey: .toolName)
+            ?? container.decodeIfPresent(String.self, forKey: .toolNameSnake)
+        content = try container.decodeIfPresent(String.self, forKey: .content) ?? ""
+        // Older mothx servers omit isError for successful tool results.
+        isError = try container.decodeIfPresent(Bool.self, forKey: .isError)
+            ?? container.decodeIfPresent(Bool.self, forKey: .isErrorSnake)
+            ?? false
+        let diff = try container.decodeIfPresent(DiffPayload.self, forKey: .diff)
+            ?? container.decodeIfPresent(DiffPayload.self, forKey: .toolDiff)
+            ?? container.decodeIfPresent(DiffPayload.self, forKey: .toolDiffSnake)
+        oldText = try container.decodeIfPresent(String.self, forKey: .oldText)
+            ?? container.decodeIfPresent(String.self, forKey: .oldTextSnake)
+            ?? diff?.oldText
+        newText = try container.decodeIfPresent(String.self, forKey: .newText)
+            ?? container.decodeIfPresent(String.self, forKey: .newTextSnake)
+            ?? diff?.newText
+    }
+}
+
 enum WorkspaceSyncState: Equatable {
     case pending
     case passed
@@ -107,6 +177,7 @@ final class MothxServiceManager: ObservableObject {
     private static var cachedLoginShellEnvironment: [String: String]?
     private var startupOutput = ""
     private var logStreamTask: Task<Void, Never>?
+    private var runtimeHeartbeatTask: Task<Void, Never>?
     private var logSocket: URLSessionWebSocketTask?
     private var runStartedAt: Date?
     private var runExistingMessageIDs: Set<String> = []
@@ -115,12 +186,17 @@ final class MothxServiceManager: ObservableObject {
     private var runEventStreamSessionID: String?
     private var runEventLastSeq: Int = 0
     private var monitoredRunIDs: Set<String> = []
+    private let changeStore = MothxChangeStore()
+    private var fileChangesByRun: [String: [String: MothxFileChange]] = [:]
     @Published private(set) var currentRunID: String?
     @Published private(set) var sessionModels: [String: String] = [:]
     @Published private(set) var sessionProviders: [String: String] = [:]
     @Published private(set) var serviceLog = ""
     @Published private(set) var currentPlan: MothxPlan?
     @Published private(set) var currentRunningMessageID: String?
+    @Published private(set) var changesByRun: [String: MothxTurnChanges] = [:]
+    @Published private(set) var latestChangesBySession: [String: MothxTurnChanges] = [:]
+    @Published private(set) var changesByMessage: [String: [String: MothxTurnChanges]] = [:]
     @Published private(set) var isRunning: Bool = false
     /// Agent team orchestration layer (profiles, team runs, scheduling).
     /// Kept as a nested ObservableObject so views observe it via `mothx.teamManager`.
@@ -129,6 +205,33 @@ final class MothxServiceManager: ObservableObject {
     weak var languageStore: LanguageStore?
 
     private var copy: Copy { Copy(resolvedLanguage: languageStore?.language ?? AppLanguage.resolve(setting: "auto")) }
+
+    init() {
+        changesByRun = changeStore.load()
+        // Rewrite any legacy changes.json immediately without file contents.
+        changeStore.save(changesByRun)
+        recordRuntimeLog("lifecycle", "client initialized; runtimeLog=\(RuntimeLog.shared.fileURL.path)")
+        runtimeHeartbeatTask = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                guard !Task.isCancelled else { break }
+                RuntimeLog.shared.write("heartbeat", "main actor alive")
+            }
+        }
+    }
+
+    deinit {
+        runtimeHeartbeatTask?.cancel()
+    }
+
+    /// Records client-side diagnostics alongside the mothx service log and in
+    /// a persistent file. Callers should pass metadata only.
+    func recordRuntimeLog(_ category: String, _ message: String) {
+        RuntimeLog.shared.write(category, message)
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        serviceLog += "[\(stamp)] [client/\(category)] \(message)\n"
+        if serviceLog.count > 60_000 { serviceLog = String(serviceLog.suffix(60_000)) }
+    }
 
     /// Localized description for an error, using our own copy for errors we
     /// throw ourselves (LocalProjectStore, settings decoding); falls back to
@@ -627,6 +730,7 @@ final class MothxServiceManager: ObservableObject {
     /// reconciled causes SwiftUI's "Modifying state during view update" warning.
     @MainActor
     func forkSession(sessionID: String, atSeq: Int, idempotencyKey: String) async -> Result<MothxSession, Error> {
+        recordRuntimeLog("fork", "request start session=\(sessionID) atSeq=\(atSeq)")
         guard !sessionID.isEmpty,
               !idempotencyKey.isEmpty,
               let parent = sessions.first(where: { $0.id == sessionID }) else {
@@ -662,6 +766,7 @@ final class MothxServiceManager: ObservableObject {
             )
             return .success(child)
         } catch {
+            recordRuntimeLog("fork", "request failed session=\(sessionID) atSeq=\(atSeq) error=\(describe(error))")
             return .failure(error)
         }
     }
@@ -680,13 +785,26 @@ final class MothxServiceManager: ObservableObject {
         settingsError = copy.forkSessionFailedPrefix(describe(error))
     }
 
+    func forkFailureMessage(_ error: Error) -> String {
+        if let apiError = error as? MothxAPIError,
+           apiError.statusCode == 409,
+           apiError.detail.contains("fork_unavailable") {
+            return copy.forkUnavailable
+        }
+        return copy.forkSessionFailedPrefix(describe(error))
+    }
+
     @discardableResult
     func loadMessages(sessionID: String) async -> [MothxMessage] {
+        let started = Date()
+        recordRuntimeLog("messages", "load start session=\(sessionID)")
         do {
             let data = try await request(path: "api/sessions/\(sessionID)/messages?limit=200", method: "GET")
             let messages = decodeMessages(data)
+            recordRuntimeLog("messages", "load complete session=\(sessionID) count=\(messages.count) bytes=\(data.count) elapsedMs=\(Int(Date().timeIntervalSince(started) * 1000))")
             messagesBySession[sessionID] = messages
             await loadHistoricalRuns(sessionID: sessionID, messages: messages)
+            await rebuildHistoricalChanges(sessionID: sessionID, messages: messages)
             startRunEventStream(sessionID: sessionID)
             if sessionID == runSessionID {
                 runReplyMessageID = messages.first { message in
@@ -704,9 +822,49 @@ final class MothxServiceManager: ObservableObject {
             }
             return messages
         } catch {
+            recordRuntimeLog("messages", "load failed session=\(sessionID) elapsedMs=\(Int(Date().timeIntervalSince(started) * 1000)) error=\(describe(error))")
             settingsError = copy.loadMessagesFailedPrefix(describe(error))
             return []
         }
+    }
+
+    /// Loads one tool result only when the user opens its process page. The
+    /// server response is bounded before it reaches a SwiftUI Text tree.
+    func loadToolResultDetail(sessionID: String, toolCallID: String) async -> MothxToolResultDetail? {
+        let started = Date()
+        let escapedSession = pathEscaped(sessionID)
+        let escapedCall = pathEscaped(toolCallID)
+        do {
+            let data = try await request(path: "api/sessions/\(escapedSession)/tool-results/\(escapedCall)", method: "GET")
+            let decoded = try JSONDecoder().decode(MothxToolResultDetail.self, from: data)
+            recordRuntimeLog("tool-detail", "load complete session=\(sessionID) call=\(toolCallID) bytes=\(data.count) elapsedMs=\(Int(Date().timeIntervalSince(started) * 1000))")
+            return MothxToolResultDetail(
+                toolCallID: decoded.toolCallID,
+                toolName: decoded.toolName,
+                content: boundedToolDetail(decoded.content),
+                isError: decoded.isError,
+                oldText: decoded.oldText,
+                newText: decoded.newText
+            )
+        } catch {
+            recordRuntimeLog("tool-detail", "load failed session=\(sessionID) call=\(toolCallID) elapsedMs=\(Int(Date().timeIntervalSince(started) * 1000)) error=\(describe(error))")
+            return nil
+        }
+    }
+
+    private func pathEscaped(_ value: String) -> String {
+        var allowed = CharacterSet.urlPathAllowed
+        allowed.remove(charactersIn: "/?#")
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+    }
+
+    private func boundedToolDetail(_ value: String) -> String {
+        let lines = value.components(separatedBy: .newlines)
+        let limitedLines = lines.prefix(240)
+        var result = limitedLines.joined(separator: "\n")
+        if result.count > 12_000 { result = String(result.prefix(12_000)) + "\n…" }
+        if lines.count > limitedLines.count { result += "\n…（结果过长，已截断）" }
+        return result
     }
 
     func submitRun(sessionID: String, message: String, images: [String], workDir: String = "", provider: String = "", model: String = "", mode: String = "agent", tools: [String] = [], skills: [String] = []) async -> String? {
@@ -1053,6 +1211,265 @@ final class MothxServiceManager: ObservableObject {
         return 0
     }
 
+    // MARK: - Server-provided file changes
+
+    private func handleToolEvent(sessionID: String, runID: String, data: [String: Any]) {
+        guard runID != "",
+              let tool = data["tool"] as? String,
+              isWriteLikeTool(tool) else { return }
+
+        let status = ((data["status"] as? String) ?? (data["state"] as? String) ?? "").lowercased()
+        guard ["completed", "succeeded", "success", "done"].contains(status) else { return }
+
+        let args = toolArguments(from: data) ?? [:]
+        let diff = (data["diff"] as? [String: Any])
+            ?? (data["toolDiff"] as? [String: Any])
+            ?? (data["tool_diff"] as? [String: Any])
+        guard let rawPath = toolPath(from: diff ?? [:]) ?? toolPath(from: args),
+              let target = captureTarget(rawPath, sessionID: sessionID) else { return }
+        let pair = serverBeforeAfter(from: data)
+        let summary = data["summary"] as? String ?? ""
+        let counts = serverDiffCounts(from: data) ?? historicalDiffCounts(summary) ?? (0, 0)
+        let change: MothxFileChange
+        if let pair {
+            change = MothxDiffBuilder.make(path: target.relativePath, oldText: pair.oldText, newText: pair.newText)
+        } else {
+            change = MothxFileChange(
+                previewPath: target.relativePath,
+                unifiedDiff: summary,
+                added: counts.added,
+                deleted: counts.deleted
+            )
+        }
+        mergeServerChange(change, sessionID: sessionID, runID: runID)
+    }
+
+    /// Tool names have changed across mothx releases and adapters. The
+    /// session stream is the source of truth, so accept the canonical names
+    /// as well as the common editor-facing aliases without treating shell
+    /// commands as file edits.
+    private func isWriteLikeTool(_ name: String) -> Bool {
+        let normalized = name.lowercased().replacingOccurrences(of: "-", with: "_")
+        return ["edit", "write", "insert", "edit_file", "write_file", "insert_file", "insert_text"].contains(normalized)
+    }
+
+    private func toolArguments(from data: [String: Any]) -> [String: Any]? {
+        if let args = data["args"] as? [String: Any] { return args }
+        if let args = data["arguments"] as? [String: Any] { return args }
+        if let input = data["input"] as? [String: Any] { return input }
+        return nil
+    }
+
+    private func toolPath(from args: [String: Any]) -> String? {
+        for key in ["path", "file", "filePath", "file_path"] {
+            if let path = args[key] as? String, !path.isEmpty { return path }
+        }
+        return nil
+    }
+
+    private func serverBeforeAfter(from data: [String: Any]) -> (oldText: String, newText: String)? {
+        let diff = (data["diff"] as? [String: Any])
+            ?? (data["toolDiff"] as? [String: Any])
+            ?? (data["tool_diff"] as? [String: Any])
+        let oldText = data["oldText"] as? String ?? data["old_text"] as? String
+            ?? diff?["oldText"] as? String ?? diff?["old_text"] as? String
+        let newText = data["newText"] as? String ?? data["new_text"] as? String
+            ?? diff?["newText"] as? String ?? diff?["new_text"] as? String
+        guard let oldText, let newText else { return nil }
+        return (oldText, newText)
+    }
+
+    private func serverDiffCounts(from data: [String: Any]) -> (added: Int, deleted: Int)? {
+        let diff = (data["diff"] as? [String: Any])
+            ?? (data["toolDiff"] as? [String: Any])
+            ?? (data["tool_diff"] as? [String: Any])
+        let addedValue = data["added"] ?? diff?["added"]
+        let deletedValue = data["deleted"] ?? diff?["deleted"]
+        guard addedValue != nil || deletedValue != nil else { return nil }
+        return (integerValue(addedValue), integerValue(deletedValue))
+    }
+
+    private func mergeServerChange(_ change: MothxFileChange, sessionID: String, runID: String) {
+        var changes = fileChangesByRun[runID] ?? [:]
+        changes[change.path] = combinedServerChange(previous: changes[change.path], next: change)
+        fileChangesByRun[runID] = changes
+        let turnChanges = MothxTurnChanges(
+            id: runID,
+            runID: runID,
+            files: changes.values.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending },
+            capturedAt: Date()
+        )
+        changesByRun[runID] = turnChanges
+        latestChangesBySession[sessionID] = turnChanges
+        changeStore.save(changesByRun)
+    }
+
+    private func combinedServerChange(previous: MothxFileChange?, next: MothxFileChange) -> MothxFileChange {
+        guard let previous,
+              let firstOldText = previous.oldText,
+              next.isReviewable,
+              let finalNewText = next.newText else {
+            return next
+        }
+        return MothxDiffBuilder.make(path: next.path, oldText: firstOldText, newText: finalNewText)
+    }
+
+    private func captureTarget(_ rawPath: String, sessionID: String) -> (url: URL, relativePath: String)? {
+        let workDir = mothxWorkDirectory(for: sessionID)
+        guard !workDir.isEmpty else { return nil }
+        let root = URL(fileURLWithPath: workDir).standardizedFileURL
+        let url = (rawPath.hasPrefix("/") ? URL(fileURLWithPath: rawPath) : root.appendingPathComponent(rawPath)).standardizedFileURL
+        let rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        guard url.path == root.path || url.path.hasPrefix(rootPath) else { return nil }
+        return (url, String(url.path.dropFirst(rootPath.count)))
+    }
+
+    private func mothxWorkDirectory(for sessionID: String) -> String {
+        workDir(for: sessionID)
+    }
+
+    /// Rebuilds the summary card for runs that happened while the app was
+    /// closed. Authoritative oldText/newText values come only from the tool
+    /// detail API. Older servers without those fields remain preview-only.
+    private func rebuildHistoricalChanges(sessionID: String, messages: [MothxMessage]) async {
+        guard let runMapping = historicalRunsByMessage[sessionID], !runMapping.isEmpty else { return }
+        recordRuntimeLog("changes", "historical rebuild session=\(sessionID) runs=\(runMapping.count) messages=\(messages.count)")
+        changesByMessage[sessionID] = [:]
+        var currentUserID: String?
+        var calls: [(MothxMessage, [String: Any], (url: URL, relativePath: String), MothxMessage?)] = []
+        var resultsByCallID: [String: MothxMessage] = [:]
+
+        func flush() async {
+            guard let currentUserID,
+                  let run = runMapping[currentUserID],
+                  !calls.isEmpty else {
+                calls.removeAll()
+                resultsByCallID.removeAll()
+                return
+            }
+            var files = fileChangesByRun[run.id] ?? [:]
+            for (call, _, target, result) in calls {
+                var summary = result?.summary ?? ""
+                let detail: MothxToolResultDetail?
+                if let callID = call.toolCallId {
+                    detail = await loadToolResultDetail(sessionID: sessionID, toolCallID: callID)
+                } else {
+                    detail = nil
+                }
+                if !summary.contains("Diff:"), let detail {
+                    summary = detail.content
+                }
+                guard let change = historicalChange(target: target, summary: summary, detail: detail) else { continue }
+                files[change.path] = combinedServerChange(previous: files[change.path], next: change)
+            }
+            guard !files.isEmpty else {
+                calls.removeAll()
+                resultsByCallID.removeAll()
+                return
+            }
+            fileChangesByRun[run.id] = files
+            let turnChanges = MothxTurnChanges(
+                id: run.id,
+                runID: run.id,
+                files: files.values.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending },
+                capturedAt: Date()
+            )
+            changesByRun[run.id] = turnChanges
+            // Bind the reconstructed changes directly to the user message
+            // that started this turn. This is stable even for legacy tui_*
+            // runs without an intent ID or assistant result message.
+            changesByMessage[sessionID, default: [:]][currentUserID] = turnChanges
+            latestChangesBySession[sessionID] = turnChanges
+            recordRuntimeLog("changes", "historical rebuild complete run=\(run.id) files=\(files.count)")
+            calls.removeAll()
+            resultsByCallID.removeAll()
+        }
+
+        for message in messages {
+            if message.isUser {
+                await flush()
+                currentUserID = message.id
+                continue
+            }
+            guard currentUserID != nil else { continue }
+            if message.isToolCall,
+               let toolName = message.toolName,
+               isWriteLikeTool(toolName),
+               let argsData = message.arguments.data(using: .utf8),
+               let args = (try? JSONSerialization.jsonObject(with: argsData)) as? [String: Any],
+               let path = toolPath(from: args),
+               let target = captureTarget(path, sessionID: sessionID) {
+                let result = message.toolCallId.flatMap { resultsByCallID[$0] }
+                calls.append((message, args, target, result))
+            } else if message.isToolResult, let callID = message.toolCallId {
+                resultsByCallID[callID] = message
+                if let index = calls.firstIndex(where: { $0.0.toolCallId == callID }) {
+                    calls[index].3 = message
+                }
+            }
+        }
+        await flush()
+        changeStore.save(changesByRun)
+    }
+
+    private func historicalChange(target: (url: URL, relativePath: String), summary: String, detail: MothxToolResultDetail?) -> MothxFileChange? {
+        guard detail?.isError != true else { return nil }
+        if let oldText = detail?.oldText,
+           let newText = detail?.newText {
+            return MothxDiffBuilder.make(path: target.relativePath, oldText: oldText, newText: newText)
+        }
+        guard detail != nil || !summary.isEmpty else { return nil }
+        let counts = historicalDiffCounts(summary) ?? (0, 0)
+        return MothxFileChange(
+            previewPath: target.relativePath,
+            unifiedDiff: summary,
+            added: counts.added,
+            deleted: counts.deleted
+        )
+    }
+
+    private func historicalDiffCounts(_ summary: String) -> (added: Int, deleted: Int)? {
+        let pattern = #"Diff:\s*\+(\d+)\s*-(\d+)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: summary, range: NSRange(summary.startIndex..., in: summary)),
+              let addedRange = Range(match.range(at: 1), in: summary),
+              let deletedRange = Range(match.range(at: 2), in: summary),
+              let added = Int(summary[addedRange]),
+              let deleted = Int(summary[deletedRange]) else { return nil }
+        return (added, deleted)
+    }
+
+    /// UI fallback for historical turns. It is intentionally idempotent and
+    /// scoped to one displayed turn, so a missing historical reconstruction
+    /// cannot hide a Diff summary just because the app was restarted.
+    func ensureHistoricalChanges(sessionID: String, runID: String?, toolCalls: [MothxMessage]) async {
+        // Never attach an unmapped historical turn to the session's latest
+        // run. If mothx cannot identify this turn's run, leave it without a
+        // change card instead of showing another turn's files.
+        guard let resolvedRunID = runID else { return }
+        var files = fileChangesByRun[resolvedRunID] ?? [:]
+        for call in toolCalls {
+            guard let argsData = call.arguments.data(using: .utf8),
+                  let args = (try? JSONSerialization.jsonObject(with: argsData)) as? [String: Any],
+                  let path = toolPath(from: args),
+                  let target = captureTarget(path, sessionID: sessionID),
+                  let callID = call.toolCallId,
+                  let detail = await loadToolResultDetail(sessionID: sessionID, toolCallID: callID),
+                  let change = historicalChange(target: target, summary: detail.content, detail: detail) else { continue }
+            files[change.path] = combinedServerChange(previous: files[change.path], next: change)
+        }
+        guard !files.isEmpty else { return }
+        fileChangesByRun[resolvedRunID] = files
+        changesByRun[resolvedRunID] = MothxTurnChanges(
+            id: resolvedRunID,
+            runID: resolvedRunID,
+            files: files.values.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending },
+            capturedAt: Date()
+        )
+        latestChangesBySession[sessionID] = changesByRun[resolvedRunID]
+        changeStore.save(changesByRun)
+    }
+
     private func loadHistoricalRuns(sessionID: String, messages: [MothxMessage]) async {
         do {
             let data = try await request(path: "api/sessions/\(sessionID)/runs?limit=200", method: "GET")
@@ -1162,6 +1579,15 @@ final class MothxServiceManager: ObservableObject {
                        let usage = eventData["usage"] as? [String: Any] {
                         await MainActor.run {
                             self.updateRunCacheHitRate(from: usage)
+                        }
+                        continue
+                    }
+                    if object["stream"] as? String == "tool",
+                       object["event"] as? String == "tool_event",
+                       let eventData = object["data"] as? [String: Any],
+                       let eventRunID = (object["runId"] as? String) ?? (eventData["runId"] as? String) {
+                        await MainActor.run {
+                            self.handleToolEvent(sessionID: sessionID, runID: eventRunID, data: eventData)
                         }
                         continue
                     }

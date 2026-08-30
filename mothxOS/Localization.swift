@@ -106,6 +106,15 @@ struct Copy {
     var workspace: String { text("mothx 工作区", "mothx workspace") }
     var building: String { text("我们要构建什么？", "What are we building?") }
     var workspaceHint: String { text("让 mothx 在项目中探索、编辑和运行代码。", "Ask mothx to explore, edit, and run code in your project.") }
+    var reviewChanges: String { text("审核", "Review") }
+    var viewChanges: String { text("查看更改", "View changes") }
+    var preview: String { text("预览", "Preview") }
+    var reviewChangesTitle: String { text("变更审核", "Review changes") }
+    var fileCreated: String { text("已创建", "Created") }
+    var fileModified: String { text("已修改", "Modified") }
+    var fileDeleted: String { text("已删除", "Deleted") }
+    var diffTooLarge: String { text("Diff 过大", "Diff too large") }
+    func filesChanged(_ count: Int) -> String { text("已编辑 \(count) 个文件", "Edited \(count) files") }
     var explainProject: String { text("解释这个项目", "Explain this project") }
     var runTests: String { text("运行测试", "Run the tests") }
     var findBug: String { text("查找问题", "Find a bug") }
@@ -449,6 +458,7 @@ struct Copy {
     var deleteSessionProjectLinkFailedPrefix: (String) -> String { { detail in self.text("删除会话项目关系失败：\(detail)", "Failed to remove the session-project link: \(detail)") } }
     var deleteSessionFailedPrefix: (String) -> String { { detail in self.text("删除会话失败：\(detail)", "Failed to delete session: \(detail)") } }
     var forkSessionFailedPrefix: (String) -> String { { detail in self.text("会话分叉失败：\(detail)", "Fork session failed: \(detail)") } }
+    var forkUnavailable: String { text("该轮次无法做分叉处理", "This turn cannot be forked") }
     var loadMessagesFailedPrefix: (String) -> String { { detail in self.text("读取会话消息失败：\(detail)", "Failed to load session messages: \(detail)") } }
     var noRunIDReturned: String { text("服务端未返回 run ID", "The server did not return a run ID") }
     var submitRunFailedPrefix: (String) -> String { { detail in self.text("提交会话失败：\(detail)", "Failed to submit the session: \(detail)") } }

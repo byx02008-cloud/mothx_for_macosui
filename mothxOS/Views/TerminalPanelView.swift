@@ -35,28 +35,7 @@ struct TerminalPanelView: NSViewRepresentable {
 
     func updateNSView(_ nsView: LocalProcessTerminalView, context: Context) {
         applyAppearance(nsView, context: context)
-        guard !context.coordinator.hasStarted, store.isOpen else { return }
-        context.coordinator.hasStarted = true
-        guard let sessionID = store.sessionID else { return }
-        guard !store.hasStarted(sessionID: sessionID) else { return }
-        store.markStarting(sessionID: sessionID)
-        Task { @MainActor in
-            // The panel may have been closed (or switched to another session)
-            // while the executable/environment resolution was in flight; do
-            // not start a process for a panel that is no longer current.
-            guard store.isOpen, store.sessionID == sessionID else { return }
-            guard let executable = await MothxServiceManager.resolveGlobalMothxExecutable() else {
-                store.markTerminated(sessionID: sessionID, exitCode: 127)
-                return
-            }
-            let environment = await Self.terminalEnvironment()
-            nsView.startProcess(
-                executable: executable.path,
-                args: ["-r", sessionID],
-                environment: environment.isEmpty ? nil : environment,
-                currentDirectory: store.workDir.isEmpty ? nil : store.workDir
-            )
-        }
+        context.coordinator.startIfNeeded(in: nsView)
     }
 
     /// The login-shell environment is needed for PATH and provider secrets,
@@ -124,6 +103,43 @@ struct TerminalPanelView: NSViewRepresentable {
         init(store: TerminalSessionStore, sessionID: String?) {
             self.store = store
             self.sessionID = sessionID
+        }
+
+        /// SwiftUI may call updateNSView while the representable still has a
+        /// zero-sized frame. Starting the PTY at that point gives it a 0x0
+        /// window size and mothx renders a blank TUI. Wait for layout to
+        /// commit a real frame, then start exactly once.
+        func startIfNeeded(in terminal: LocalProcessTerminalView) {
+            guard !hasStarted, store.isOpen, let sessionID else { return }
+            guard terminal.bounds.width > 1, terminal.bounds.height > 1 else {
+                Task { @MainActor [weak self, weak terminal] in
+                    try? await Task.sleep(for: .milliseconds(50))
+                    guard let self, let terminal else { return }
+                    self.startIfNeeded(in: terminal)
+                }
+                return
+            }
+            guard !store.hasStarted(sessionID: sessionID) else {
+                hasStarted = true
+                return
+            }
+            hasStarted = true
+            store.markStarting(sessionID: sessionID)
+            Task { @MainActor [weak self, weak terminal] in
+                guard let self, let terminal,
+                      self.store.isOpen, self.store.sessionID == sessionID else { return }
+                guard let executable = await MothxServiceManager.resolveGlobalMothxExecutable() else {
+                    self.store.markTerminated(sessionID: sessionID, exitCode: 127)
+                    return
+                }
+                let environment = await TerminalPanelView.terminalEnvironment()
+                terminal.startProcess(
+                    executable: executable.path,
+                    args: ["-r", sessionID],
+                    environment: environment.isEmpty ? nil : environment,
+                    currentDirectory: self.store.workDir.isEmpty ? nil : self.store.workDir
+                )
+            }
         }
 
         private var shiftEnterMonitor: Any?

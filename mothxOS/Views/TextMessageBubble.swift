@@ -167,16 +167,17 @@ struct TextMessageBubble: View {
 struct MarkdownMessageText: View {
     let markdown: String
     @Environment(\.colorScheme) private var colorScheme
+    @State private var renderedSegments: [MarkdownSegment] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            ForEach(segments) { segment in
+            ForEach(renderedSegments.isEmpty ? [MarkdownSegment(content: markdown, isCodeBlock: false)] : renderedSegments) { segment in
                 if segment.isCodeBlock {
                     Group {
-                        if let attributedString = attributedString(for: segment.content) {
+                        if let attributedString = segment.attributedString {
                             Text(attributedString)
                         } else {
-                            Text(segment.content)
+                            Text(segment.rawContent)
                         }
                     }
                     .font(.system(.body, design: .monospaced))
@@ -186,16 +187,18 @@ struct MarkdownMessageText: View {
                     .background(codeBackground)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                 } else if !segment.content.isEmpty {
-                    if let attributedString = attributedString(for: segment.content) {
+                    if let attributedString = segment.attributedString {
                         Text(attributedString).lineSpacing(4)
                     } else {
-                        Text(segment.content).lineSpacing(4)
+                        Text(segment.rawContent).lineSpacing(4)
                     }
                 }
             }
         }
         .textSelection(.enabled)
         .frame(maxWidth: 560, alignment: .leading)
+        .onAppear { updateRenderedSegments() }
+        .onChange(of: markdown) { _, _ in updateRenderedSegments() }
     }
 
     private var codeBackground: Color {
@@ -216,13 +219,32 @@ struct MarkdownMessageText: View {
             if cursor < range.lowerBound {
                 result.append(MarkdownSegment(content: String(markdown[cursor..<range.lowerBound]), isCodeBlock: false))
             }
-            result.append(MarkdownSegment(content: codeContent(from: String(markdown[range])), isCodeBlock: true))
+            result.append(MarkdownSegment(
+                content: codeContent(from: String(markdown[range])),
+                isCodeBlock: true,
+                rawContent: String(markdown[range])
+            ))
             cursor = range.upperBound
         }
         if cursor < markdown.endIndex {
             result.append(MarkdownSegment(content: String(markdown[cursor...]), isCodeBlock: false))
         }
         return result.isEmpty ? [MarkdownSegment(content: markdown, isCodeBlock: false)] : result
+    }
+
+    private func updateRenderedSegments() {
+        guard MarkdownSafety.isSafeToParse(markdown) else {
+            renderedSegments = [MarkdownSegment(content: markdown, isCodeBlock: false)]
+            return
+        }
+        renderedSegments = segments.map { segment in
+            MarkdownSegment(
+                content: segment.content,
+                isCodeBlock: segment.isCodeBlock,
+                attributedString: attributedString(for: segment.content),
+                rawContent: segment.rawContent
+            )
+        }
     }
 
     private func codeContent(from fencedBlock: String) -> String {
@@ -240,6 +262,7 @@ struct MarkdownMessageText: View {
     /// run of text. Parse line-by-line instead (inline formatting such as **bold**,
     /// `code`, and links is preserved) and re-insert the breaks the author typed.
     private func attributedString(for markdown: String) -> AttributedString? {
+        guard MarkdownSafety.isSafeToParse(markdown) else { return nil }
         let normalized = normalizedMarkdown(for: markdown)
         let lines = normalized.components(separatedBy: "\n")
         var result = AttributedString()
@@ -255,15 +278,17 @@ struct MarkdownMessageText: View {
                 result += AttributedString(needParagraphBreak ? "\n\n" : "\n")
             }
             needParagraphBreak = false
-            result += parsedInlineLine(trimmed)
+            guard let parsedLine = parsedInlineLine(trimmed) else { return nil }
+            result += parsedLine
         }
-        return result
+        guard !markdown.isEmpty || !result.characters.isEmpty else { return nil }
+        return result.characters.isEmpty && !markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : result
     }
 
     /// Parse one line with full inline syntax. Block markers such as `- `, `* `,
     /// or `1. ` are stripped by the parser when the block is a single line, so
     /// restore them to keep lists readable.
-    private func parsedInlineLine(_ line: String) -> AttributedString {
+    private func parsedInlineLine(_ line: String) -> AttributedString? {
         let marker = listMarkerPrefix(of: line)
         let content = marker.map { String(line.dropFirst($0.count)) } ?? line
         if let parsed = try? AttributedString(
@@ -277,9 +302,10 @@ struct MarkdownMessageText: View {
             }
             return parsed
         }
-        // A malformed fragment should not make the entire message fall back to
-        // raw Markdown; keep this line literal so the rest still renders.
-        return AttributedString(line)
+        // A malformed fragment falls back to the original segment. Do not
+        // keep partially parsed output because losing one line is worse than
+        // showing the source Markdown.
+        return nil
     }
 
     private func listMarkerPrefix(of line: String) -> String? {
@@ -341,4 +367,31 @@ private struct MarkdownSegment: Identifiable {
     let id = UUID()
     let content: String
     let isCodeBlock: Bool
+    let attributedString: AttributedString?
+    let rawContent: String
+
+    init(content: String, isCodeBlock: Bool, attributedString: AttributedString? = nil, rawContent: String? = nil) {
+        self.content = content
+        self.isCodeBlock = isCodeBlock
+        self.attributedString = attributedString
+        self.rawContent = rawContent ?? content
+    }
+}
+
+private enum MarkdownSafety {
+    // Keep pathological transcripts out of Foundation's Markdown parser. The
+    // original source is still rendered as plain selectable text below.
+    static let maxDocumentCharacters = 20_000
+    static let maxLineCharacters = 4_000
+    static let maxLineCount = 800
+    static let maxFenceCount = 80
+
+    static func isSafeToParse(_ text: String) -> Bool {
+        guard text.count <= maxDocumentCharacters else { return false }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        guard lines.count <= maxLineCount else { return false }
+        guard lines.allSatisfy({ $0.count <= maxLineCharacters }) else { return false }
+        let fenceCount = text.components(separatedBy: "```").count - 1
+        return fenceCount <= maxFenceCount
+    }
 }

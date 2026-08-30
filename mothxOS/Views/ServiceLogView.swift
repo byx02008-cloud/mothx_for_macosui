@@ -11,8 +11,19 @@ struct ServiceLogView: View {
                 Label(languageStore.copy.serviceLogTitle, systemImage: "doc.text.magnifyingglass")
                     .font(.title2.bold())
                 Spacer()
+                Button("复制日志路径") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(RuntimeLog.shared.fileURL.path, forType: .string)
+                }
+                .font(.caption)
+                .help(RuntimeLog.shared.fileURL.path)
                 Button(languageStore.copy.close) { dismiss() }
             }
+
+            Text("客户端诊断日志：\(RuntimeLog.shared.fileURL.path)")
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
 
             if mothx.serviceLog.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 ContentUnavailableView(languageStore.copy.noServiceLog, systemImage: "doc.text")

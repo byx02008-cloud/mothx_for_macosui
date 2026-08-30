@@ -20,10 +20,19 @@ struct WorkspaceView: View {
     @State private var selectedTools: Set<String> = []
     @State private var attachmentError: String?
     @State private var currentTurns: [Turn] = []
-    @State private var expandedTurnIDs: Set<UUID> = []
+    @State private var expandedTurnIDs: Set<String> = []
+    @State private var preparedTurnIDs: Set<String> = []
+    @State private var preparingTurnID: String?
     @State private var showAllHistory = false
     @State private var isConversationAtBottom = true
     @State private var forkingMessageID: String?
+    @State private var forkErrorMessage: String?
+    @State private var reviewedChanges: MothxTurnChanges?
+    @State private var previewedSkill: MothxSkill?
+    @State private var previewedTool: ToolInvocationSummary?
+    @State private var reviewSidebarWidth: CGFloat = 420
+    @State private var conversationWasAtBottomBeforeReview = true
+    @State private var conversationLayoutID = 0
 
     private let conversationBottomID = "conversation-bottom"
 
@@ -34,7 +43,9 @@ struct WorkspaceView: View {
 
     var body: some View {
         let c = languageStore.copy
-        return VStack(spacing: 0) {
+        return GeometryReader { workspaceProxy in
+        HSplitView {
+        VStack(spacing: 0) {
             if terminalStore.isOpen {
                 TUIPanelHeader(store: terminalStore)
                 Divider()
@@ -76,6 +87,10 @@ struct WorkspaceView: View {
                         .help(c.openTerminalHelp)
                     }
                     CurrentDirectoryMenu(path: currentWorkDir)
+                        // The sidebar toggle is overlaid against the window's
+                        // trailing edge. Reserve its slot while the sidebar
+                        // is closed so it never covers the directory menu.
+                        .padding(.trailing, isRightSidebarOpen ? 0 : 46)
                 }.padding(.horizontal, 24).frame(height: 54)
                 Divider()
 
@@ -92,9 +107,13 @@ struct WorkspaceView: View {
                                         turn: turn,
                                         sessionID: sessionID,
                                         isExpanded: expandedTurnIDs.contains(turn.id),
+                                        isContentReady: preparedTurnIDs.contains(turn.id),
                                         onToggle: { toggleTurn(turn) },
                                         onFork: { message in fork(from: message) },
-                                        forkingMessageID: forkingMessageID
+                                        forkingMessageID: forkingMessageID,
+                                        onReviewChanges: presentReview,
+                                        onPreviewSkill: presentSkillPreview,
+                                        onPreviewTool: presentToolPreview
                                     )
                                 }
 
@@ -113,10 +132,11 @@ struct WorkspaceView: View {
                                     }
                                 }
 
-                                if isRunActive,
-                                   let thinking = mothx.thinkingBySession[sessionID],
-                                   !thinking.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                    ThinkingContentView(text: thinking)
+                                if isRunActive {
+                                    if let thinking = mothx.thinkingBySession[sessionID],
+                                       !thinking.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                        ThinkingContentView(text: thinking)
+                                    }
                                 }
 
                                 Color.clear
@@ -127,7 +147,7 @@ struct WorkspaceView: View {
                             .padding(28)
                             .frame(maxWidth: .infinity)
                             .background(
-                                ConversationScrollObserver { atBottom in
+                                ConversationScrollObserver(layoutToken: conversationLayoutID) { atBottom in
                                     isConversationAtBottom = atBottom
                                 }
                             )
@@ -154,6 +174,13 @@ struct WorkspaceView: View {
                                 scrollToBottom(reader, animated: true)
                             }
                         }
+                        .onChange(of: reviewedChanges == nil) { _, isClosed in
+                            conversationLayoutID += 1
+                            guard isClosed, conversationWasAtBottomBeforeReview else { return }
+                            DispatchQueue.main.async {
+                                scrollToBottom(reader, animated: false)
+                            }
+                        }
                         .onAppear {
                             scrollToBottom(reader, animated: false)
                         }
@@ -164,6 +191,7 @@ struct WorkspaceView: View {
                                         showAllHistory.toggle()
                                         if let lastID = currentTurns.last?.id {
                                             expandedTurnIDs = [lastID]
+                                            prepareTurn(lastID)
                                         }
                                     }
                                 } label: {
@@ -223,6 +251,11 @@ struct WorkspaceView: View {
         } message: {
             Text(attachmentError ?? "")
         }
+        .alert("会话分叉失败 / Fork failed", isPresented: Binding(get: { forkErrorMessage != nil }, set: { if !$0 { forkErrorMessage = nil } })) {
+            Button(c.ok) { forkErrorMessage = nil }
+        } message: {
+            Text(forkErrorMessage ?? "")
+        }
         .task(id: sessionID) {
             if let sessionID {
                 selectedMode = ["plan", "agent", "yolo"].contains(mothx.defaultMode) ? mothx.defaultMode : "agent"
@@ -254,17 +287,24 @@ struct WorkspaceView: View {
                 await mothx.loadMessages(sessionID: sessionID)
                 await mothx.attachToActiveRun(sessionID: sessionID)
                 currentTurns = computeTurns(mothx.messagesBySession[sessionID] ?? [])
+                mothx.recordRuntimeLog("workspace", "session ready id=\(sessionID) messages=\(mothx.messagesBySession[sessionID]?.count ?? 0) turns=\(currentTurns.count)")
                 showAllHistory = false
                 expandedTurnIDs = currentTurns.last.map { [$0.id] } ?? []
+                preparedTurnIDs = []
+                preparingTurnID = nil
+                if let lastID = currentTurns.last?.id { prepareTurn(lastID) }
             }
         }
         .onChange(of: mothx.messagesBySession) { _, _ in
             if let sessionID {
+                let started = Date()
                 currentTurns = computeTurns(mothx.messagesBySession[sessionID] ?? [])
+                mothx.recordRuntimeLog("workspace", "turns recomputed session=\(sessionID) messages=\(mothx.messagesBySession[sessionID]?.count ?? 0) turns=\(currentTurns.count) elapsedMs=\(Int(Date().timeIntervalSince(started) * 1000))")
                 if currentTurns.count <= 3 { showAllHistory = false }
                 // Keep last turn expanded, preserve other expanded
                 if let lastID = currentTurns.last?.id {
                     expandedTurnIDs.insert(lastID)
+                    prepareTurn(lastID)
                 }
             }
         }
@@ -290,12 +330,57 @@ struct WorkspaceView: View {
             }
         }
         .onChange(of: sessionID) { _, newSessionID in
+            // A review/preview belongs to the previous conversation. Close
+            // it before the newly selected session is rendered.
+            if isRightSidebarOpen {
+                closeRightSidebar()
+            }
             // While terminal mode is active, switching to another session in
             // the sidebar changes the visible terminal. The previous session's
             // retained TUI process remains alive and can be shown again later.
             guard terminalStore.isOpen, let newSessionID,
                   terminalStore.sessionID != newSessionID else { return }
             terminalStore.open(sessionID: newSessionID, workDir: mothx.workDir(for: newSessionID))
+        }
+        if let reviewedChanges {
+            ChangeReviewSidebar(changes: reviewedChanges, workDirectory: currentWorkDir, initialPath: nil) {
+                closeRightSidebar()
+            }
+            .frame(
+                minWidth: 150,
+                idealWidth: reviewSidebarWidth,
+                maxWidth: max(150, workspaceProxy.size.width * 0.5)
+            )
+            .layoutPriority(1)
+        }
+        if let previewedSkill {
+            SkillPreviewSidebar(skill: previewedSkill) {
+                closeRightSidebar()
+            }
+            .frame(
+                minWidth: 150,
+                idealWidth: reviewSidebarWidth,
+                maxWidth: max(150, workspaceProxy.size.width * 0.5)
+            )
+            .layoutPriority(1)
+        }
+        if let previewedTool {
+            ToolDetailSidebar(sessionID: sessionID ?? "", item: previewedTool) {
+                closeRightSidebar()
+            }
+            .frame(
+                minWidth: 150,
+                idealWidth: reviewSidebarWidth,
+                maxWidth: max(150, workspaceProxy.size.width * 0.5)
+            )
+            .layoutPriority(1)
+        }
+        }
+        }
+        .overlay(alignment: .topTrailing) {
+            if !isRightSidebarOpen && !terminalStore.isOpen {
+                rightSidebarToggleButton
+            }
         }
     }
 
@@ -320,11 +405,84 @@ struct WorkspaceView: View {
         }
     }
 
+    private func toggleRightSidebar() {
+        withAnimation(.easeInOut(duration: 0.22)) {
+            if reviewedChanges != nil || previewedSkill != nil || previewedTool != nil {
+                reviewedChanges = nil
+                previewedSkill = nil
+                previewedTool = nil
+                return
+            }
+            guard let sessionID,
+                  let changes = mothx.latestChangesBySession[sessionID] else { return }
+            conversationWasAtBottomBeforeReview = isConversationAtBottom
+            reviewedChanges = changes
+        }
+    }
+
+    private func presentReview(_ changes: MothxTurnChanges) {
+        withAnimation(.easeInOut(duration: 0.22)) {
+            conversationWasAtBottomBeforeReview = isConversationAtBottom
+            previewedSkill = nil
+            previewedTool = nil
+            reviewedChanges = changes
+        }
+    }
+
+    private func presentSkillPreview(_ skill: MothxSkill) {
+        withAnimation(.easeInOut(duration: 0.22)) {
+            conversationWasAtBottomBeforeReview = isConversationAtBottom
+            previewedSkill = skill
+            previewedTool = nil
+            reviewedChanges = nil
+        }
+    }
+
+    private func presentToolPreview(_ item: ToolInvocationSummary) {
+        withAnimation(.easeInOut(duration: 0.22)) {
+            conversationWasAtBottomBeforeReview = isConversationAtBottom
+            previewedTool = item
+            previewedSkill = nil
+            reviewedChanges = nil
+        }
+    }
+
+    private func closeRightSidebar() {
+        withAnimation(.easeInOut(duration: 0.22)) {
+            reviewedChanges = nil
+            previewedSkill = nil
+            previewedTool = nil
+        }
+    }
+
+    private var rightSidebarToggleButton: some View {
+        Button(action: toggleRightSidebar) {
+            Image(systemName: "sidebar.right")
+                .font(.system(size: 15, weight: .medium))
+                .frame(width: 30, height: 30)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .hoverHighlight()
+        .foregroundStyle(.secondary)
+        .help("显示右侧栏")
+        .padding(.trailing, 16)
+        .padding(.top, 12)
+        .transition(.opacity)
+    }
+
+    private var isRightSidebarOpen: Bool {
+        reviewedChanges != nil || previewedSkill != nil || previewedTool != nil
+    }
+
     // MARK: - Turn accordion
 
     private func toggleTurn(_ turn: Turn) {
+        mothx.recordRuntimeLog("turn", "toggle id=\(turn.id) index=\(turn.index) expanded=\(expandedTurnIDs.contains(turn.id)) results=\(turn.resultMessages.count) tools=\(turn.toolSummaries.count)")
         if expandedTurnIDs.contains(turn.id) {
             expandedTurnIDs.remove(turn.id)
+            preparedTurnIDs.remove(turn.id)
+            if preparingTurnID == turn.id { preparingTurnID = nil }
         } else {
             // Expand this turn, collapse all other non-last turns
             var newIDs = expandedTurnIDs
@@ -334,6 +492,26 @@ struct WorkspaceView: View {
             }
             newIDs.insert(turn.id)
             expandedTurnIDs = newIDs
+            prepareTurn(turn.id)
+        }
+    }
+
+    /// Give SwiftUI one layout pass to display the loading placeholder before
+    /// exposing a potentially very large turn to the lazy conversation stack.
+    /// Once ready, the entire expanded turn is present before scrollbar input
+    /// can request another portion of it.
+    private func prepareTurn(_ turnID: String) {
+        guard !preparedTurnIDs.contains(turnID), preparingTurnID != turnID else { return }
+        preparingTurnID = turnID
+        Task { @MainActor in
+            await Task.yield()
+            await Task.yield()
+            guard expandedTurnIDs.contains(turnID) else {
+                if preparingTurnID == turnID { preparingTurnID = nil }
+                return
+            }
+            preparedTurnIDs.insert(turnID)
+            if preparingTurnID == turnID { preparingTurnID = nil }
         }
     }
 
@@ -343,12 +521,16 @@ struct WorkspaceView: View {
     /// State is committed only after yielding once, outside the source view's
     /// button/update transaction.
     private func fork(from message: MothxMessage) {
+        let attemptedSessionID = sessionID ?? "nil"
         guard let sessionID,
               message.isAssistant,
               let seq = message.seq,
               seq > 0,
               forkingMessageID == nil,
-              mothx.sessions.contains(where: { $0.id == sessionID }) else { return }
+              mothx.sessions.contains(where: { $0.id == sessionID }) else {
+            mothx.recordRuntimeLog("fork", "ignored guard session=\(attemptedSessionID) message=\(message.id) seq=\(message.seq.map(String.init) ?? "nil") isAssistant=\(message.isAssistant) running=\(mothx.isRunning)")
+            return
+        }
         let requestID = UUID().uuidString
         forkingMessageID = message.id
         Task { @MainActor in
@@ -361,9 +543,12 @@ struct WorkspaceView: View {
             forkingMessageID = nil
             switch result {
             case .success(let child):
+                mothx.recordRuntimeLog("fork", "request success parent=\(sessionID) child=\(child.id) boundary=\(child.forkBoundarySeq.map(String.init) ?? "nil")")
                 mothx.integrateForkedSession(child)
                 onSessionActivated?(child)
             case .failure(let error):
+                mothx.recordRuntimeLog("fork", "request result failure parent=\(sessionID) error=\(error.localizedDescription)")
+                forkErrorMessage = mothx.forkFailureMessage(error)
                 mothx.reportForkFailure(error)
             }
         }
@@ -474,33 +659,50 @@ struct CurrentDirectoryMenu: View {
     }
 
     var body: some View {
-        Button {
-            guard !path.isEmpty, applicationsReady else { return }
-            isPresented = true
-        } label: {
-            Group {
-                if applicationsReady {
-                    ZStack {
-                        Color.clear
-                        HStack(spacing: 6) {
-                            Image(systemName: "folder.fill").foregroundStyle(.orange)
-                            Text(directoryName).lineLimit(1)
-                            Image(systemName: "chevron.down").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
-                        }.font(.callout).padding(.horizontal, 13)
-                    }
-                } else {
-                    ProgressView().controlSize(.small).frame(width: 24, height: 24)
+        HStack(spacing: 0) {
+            if applicationsReady, let defaultApplication = applications.first {
+                Button {
+                    open(defaultApplication)
+                } label: {
+                    Image(nsImage: defaultApplication.icon)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 16, height: 16)
+                        .frame(width: 32, height: 26)
+                        .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .hoverHighlight()
+                .help("在 \(defaultApplication.name) 中打开 \(directoryName)")
+
+                Divider()
+                    .frame(height: 16)
+
+                Button {
+                    isPresented = true
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 26, height: 26)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .hoverHighlight()
+                .help("选择打开 \(directoryName) 的应用")
+            } else {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 58, height: 26)
             }
-            .frame(width: 104, height: 34)
-            .background(colorScheme == .dark ? Color.white.opacity(0.09) : Color.black.opacity(0.06))
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.primary.opacity(colorScheme == .dark ? 0.14 : 0.10)))
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain).hoverHighlight()
+        .frame(width: 58, height: 26)
+        .fixedSize(horizontal: true, vertical: true)
+        .background(colorScheme == .dark ? Color.white.opacity(0.09) : Color.black.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.primary.opacity(colorScheme == .dark ? 0.14 : 0.10)))
         .foregroundStyle(path.isEmpty ? .secondary : .primary)
-        .disabled(path.isEmpty || !applicationsReady)
+        .opacity(path.isEmpty ? 0.65 : 1)
         .task(id: path) {
             applicationsReady = false
             guard !path.isEmpty else { return }
@@ -928,6 +1130,7 @@ private struct ThinkingContentView: View {
 }
 
 private struct ConversationScrollObserver: NSViewRepresentable {
+    let layoutToken: Int
     let onBottomChanged: (Bool) -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -937,17 +1140,22 @@ private struct ConversationScrollObserver: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let view = NSView(frame: .zero)
         view.postsFrameChangedNotifications = false
+        context.coordinator.layoutToken = layoutToken
         context.coordinator.attach(to: view)
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
         context.coordinator.onBottomChanged = onBottomChanged
+        context.coordinator.layoutToken = layoutToken
         context.coordinator.attach(to: nsView)
     }
 
     final class Coordinator {
         var onBottomChanged: (Bool) -> Void
+        var layoutToken = 0
+        var appliedLayoutToken: Int?
+        var lastBottomState: Bool?
         weak var observedScrollView: NSScrollView?
         var boundsObserver: NSObjectProtocol?
 
@@ -960,6 +1168,7 @@ private struct ConversationScrollObserver: NSViewRepresentable {
                 guard let self, let view,
                       let scrollView = Self.findScrollView(from: view) else { return }
                 guard self.observedScrollView !== scrollView else {
+                    self.refreshLayoutIfNeeded()
                     self.updateBottomState()
                     return
                 }
@@ -975,8 +1184,18 @@ private struct ConversationScrollObserver: NSViewRepresentable {
                 ) { [weak self] _ in
                     self?.updateBottomState()
                 }
+                self.refreshLayoutIfNeeded()
                 self.updateBottomState()
             }
+        }
+
+        func refreshLayoutIfNeeded() {
+            guard let scrollView = observedScrollView,
+                  appliedLayoutToken != layoutToken else { return }
+            appliedLayoutToken = layoutToken
+            scrollView.needsLayout = true
+            scrollView.layoutSubtreeIfNeeded()
+            scrollView.reflectScrolledClipView(scrollView.contentView)
         }
 
         func updateBottomState() {
@@ -993,6 +1212,8 @@ private struct ConversationScrollObserver: NSViewRepresentable {
             let documentBottom = documentView.bounds.maxY
             // Account for the bottom content inset and sub-pixel rounding.
             let atBottom = documentBottom - visibleBottom <= 50
+            guard lastBottomState != atBottom else { return }
+            lastBottomState = atBottom
             onBottomChanged(atBottom)
         }
 
