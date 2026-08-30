@@ -20,6 +20,7 @@ struct SettingsView: View {
     @State private var skillsDir = ""
     @State private var sessionDir = ""
     @State private var imageGeneration = MothxImageGenerationConfig()
+    @State private var imageRecognition = MothxImageRecognitionConfig()
     @State private var language = "auto"
     @State private var section = "providers"
     @State private var pendingDeletion: DeletionRequest?
@@ -52,6 +53,8 @@ struct SettingsView: View {
                     GeneralSection(language: $language)
                 } else if section == "imageGeneration" {
                     ImageGenerationSection(config: $imageGeneration)
+                } else if section == "imageRecognition" {
+                    ImageRecognitionSection(config: $imageRecognition)
                 } else if section == "skills" {
                     SkillsSection(skillsDir: $skillsDir)
                 } else if section == "sessions" {
@@ -88,7 +91,7 @@ struct SettingsView: View {
         } message: {
             Text(pendingDeletion?.message(using: languageStore.copy) ?? languageStore.copy.text("此操作无法撤销。", "This action cannot be undone."))
         }
-        .task { await mothx.loadSettings(); defaultProviderID = mothx.defaultProvider; defaultModelID = mothx.defaultModel; defaultThinkingLevel = mothx.defaultThinkingLevel; defaultMode = mothx.defaultMode; language = languageStore.setting; skillsDir = mothx.skillsDir; sessionDir = mothx.sessionDir; imageGeneration = mothx.imageGeneration; providerID = "" }
+        .task { await mothx.loadSettings(); defaultProviderID = mothx.defaultProvider; defaultModelID = mothx.defaultModel; defaultThinkingLevel = mothx.defaultThinkingLevel; defaultMode = mothx.defaultMode; language = languageStore.setting; skillsDir = mothx.skillsDir; sessionDir = mothx.sessionDir; imageGeneration = mothx.imageGeneration; imageRecognition = mothx.imageRecognition; providerID = "" }
     }
     func select(_ provider: MothxProviderConfig) { providerID = provider.id; draft = provider; modelID = provider.models.first?.id ?? ""; saved = false }
     func save() async { await mothx.saveProvider(draft, asDefault: false); saved = true }
@@ -178,7 +181,7 @@ struct SettingsNavigation: View {
     @Environment(\.colorScheme) private var colorScheme
     @EnvironmentObject private var languageStore: LanguageStore
     @Binding var section: String
-    var body: some View { let c = languageStore.copy; return VStack(alignment: .leading, spacing: 8) { Text(c.settings.uppercased()).sectionLabel().padding(.bottom, 10); SettingsNavItem(title: c.general, icon: "gearshape", id: "general", section: $section); SettingsNavItem(title: c.providers, icon: "server.rack", id: "providers", section: $section); SettingsNavItem(title: c.imageGeneration, icon: "photo", id: "imageGeneration", section: $section); SettingsNavItem(title: c.skills, icon: "sparkles", id: "skills", section: $section); SettingsNavItem(title: c.sessions, icon: "clock", id: "sessions", section: $section); SettingsNavItem(title: c.advancedSettings, icon: "wrench.and.screwdriver", id: "advanced", section: $section); SettingsNavItem(title: c.about, icon: "info.circle", id: "about", section: $section); Spacer() }.padding(22).frame(width: 230).background(colorScheme == .light ? .white : .codexSidebar) }
+    var body: some View { let c = languageStore.copy; return VStack(alignment: .leading, spacing: 8) { Text(c.settings.uppercased()).sectionLabel().padding(.bottom, 10); SettingsNavItem(title: c.general, icon: "gearshape", id: "general", section: $section); SettingsNavItem(title: c.providers, icon: "server.rack", id: "providers", section: $section); SettingsNavItem(title: c.text("图片识别", "Image Recognition"), icon: "eye", id: "imageRecognition", section: $section); SettingsNavItem(title: c.imageGeneration, icon: "photo", id: "imageGeneration", section: $section); SettingsNavItem(title: c.skills, icon: "sparkles", id: "skills", section: $section); SettingsNavItem(title: c.sessions, icon: "clock", id: "sessions", section: $section); SettingsNavItem(title: c.advancedSettings, icon: "wrench.and.screwdriver", id: "advanced", section: $section); SettingsNavItem(title: c.about, icon: "info.circle", id: "about", section: $section); Spacer() }.padding(22).frame(width: 230).background(colorScheme == .light ? .white : .codexSidebar) }
 }
 
 struct SettingsNavItem: View { let title: String; let icon: String; let id: String; @Binding var section: String
@@ -274,31 +277,137 @@ struct ImageGenerationSection: View {
     @EnvironmentObject private var languageStore: LanguageStore
     @Binding var config: MothxImageGenerationConfig
 
+    private var selectedProvider: MothxProviderConfig? {
+        mothx.providers.first { $0.id == config.providerID }
+    }
+
+    private var models: [MothxModelConfig] {
+        selectedProvider?.models ?? []
+    }
+
     var body: some View {
         let c = languageStore.copy
-        return SettingsCard(title: c.imageGeneration, subtitle: c.imageGenerationSubtitle) {
+        return SettingsCard(
+            title: c.imageGeneration,
+            subtitle: c.text(
+                "选择一个已有运营商和模型作为生图模型。客户端不判断模型能力，也不保存 API Key。",
+                "Choose an existing provider and model for image generation. The app does not inspect capabilities or store API keys."
+            )
+        ) {
             Toggle(c.imageGenerationEnabled, isOn: $config.enabled)
-            SettingsField(title: c.imageGenerationProvider, text: $config.provider, placeholder: "openai")
-            HStack {
-                Text(c.imageGenerationAPIType).frame(width: 150, alignment: .leading)
-                Picker(c.imageGenerationAPIType, selection: $config.apiType) {
-                    Text(c.imageGenerationAPIImages).tag("openai-images")
-                    Text(c.imageGenerationAPIResponses).tag("openai-responses")
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text(c.text("生图 Provider", "Generation Provider")).font(.caption).foregroundStyle(.secondary)
+                    Picker(c.text("生图 Provider", "Generation Provider"), selection: $config.providerID) {
+                        Text(c.selectProvider).tag("")
+                        ForEach(mothx.providers) { provider in
+                            Text(provider.id).tag(provider.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .labelsHidden()
-                .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 7) {
+                    Text(c.text("生图模型", "Generation Model")).font(.caption).foregroundStyle(.secondary)
+                    Picker(c.text("生图模型", "Generation Model"), selection: $config.modelID) {
+                        Text(c.selectModel).tag("")
+                        ForEach(models) { model in
+                            Text(model.displayName).tag(model.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .disabled(models.isEmpty)
+                }
             }
-            .padding(10)
-            .background(Color.primary.opacity(0.08))
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            SettingsField(title: c.baseURL, text: $config.baseUrl, placeholder: "https://api.openai.com/v1")
-            SettingsField(title: c.imageGenerationToken, text: $config.token, placeholder: "${OPENAI_API_KEY}", secure: true)
-            SettingsField(title: c.imageGenerationModel, text: $config.model, placeholder: "gpt-image-1")
+            .onChange(of: config.providerID) { _, newProviderID in
+                let providerModels = mothx.providers.first(where: { $0.id == newProviderID })?.models ?? []
+                if !providerModels.contains(where: { $0.id == config.modelID }) {
+                    config.modelID = providerModels.first?.id ?? ""
+                }
+            }
+            Text(c.text(
+                "只保存 Provider/Model 的选择。输入 /生图 后，提交时会使用这里选择的运营商与模型；模型是否支持生图由用户自行保证。",
+                "Only the Provider/Model selection is stored. After /生图, the run is submitted with this provider and model; the user is responsible for choosing a model that can generate images."
+            ))
+            .font(.caption)
+            .foregroundStyle(.secondary)
             Button(c.imageGenerationSave) {
-                Task { await mothx.saveImageGeneration(config) }
+                mothx.saveImageGeneration(config)
             }
             .buttonStyle(.borderedProminent)
             .tint(.orange)
+            .disabled(config.enabled && (config.providerID.isEmpty || config.modelID.isEmpty))
+        }
+    }
+}
+
+struct ImageRecognitionSection: View {
+    @EnvironmentObject private var mothx: MothxServiceManager
+    @EnvironmentObject private var languageStore: LanguageStore
+    @Binding var config: MothxImageRecognitionConfig
+
+    private var selectedProvider: MothxProviderConfig? {
+        mothx.providers.first { $0.id == config.providerID }
+    }
+
+    private var models: [MothxModelConfig] {
+        selectedProvider?.models ?? []
+    }
+
+    var body: some View {
+        let c = languageStore.copy
+        return SettingsCard(
+            title: c.text("图片识别", "Image Recognition"),
+            subtitle: c.text(
+                "配置后优先使用这里选择的模型识别图片，再把识别结果交给当前工作模型；未配置时才尝试当前多模态模型直传。",
+                "When configured, this model is used first to describe images and its result is passed to the active model; without it, a multimodal active model is used directly."
+            )
+        ) {
+            Toggle(c.text("启用独立图片识别模型", "Enable dedicated image recognition model"), isOn: $config.enabled)
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text(c.text("识别 Provider", "Recognition Provider")).font(.caption).foregroundStyle(.secondary)
+                    Picker(c.text("识别 Provider", "Recognition Provider"), selection: $config.providerID) {
+                        Text(c.selectProvider).tag("")
+                        ForEach(mothx.providers) { provider in
+                            Text(provider.id).tag(provider.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                VStack(alignment: .leading, spacing: 7) {
+                    Text(c.text("识别模型", "Recognition Model")).font(.caption).foregroundStyle(.secondary)
+                    Picker(c.text("识别模型", "Recognition Model"), selection: $config.modelID) {
+                        Text(c.selectModel).tag("")
+                        ForEach(models) { model in
+                            Text(model.displayName).tag(model.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .disabled(models.isEmpty)
+                }
+            }
+            .onChange(of: config.providerID) { _, newProviderID in
+                let providerModels = mothx.providers.first(where: { $0.id == newProviderID })?.models ?? []
+                if !providerModels.contains(where: { $0.id == config.modelID }) {
+                    config.modelID = providerModels.first?.id ?? ""
+                }
+            }
+            Text(c.text(
+                "只保存 Provider/Model 的选择，不复制或保存 API Key。首次使用时，如果服务端没有把所选识别模型标记为 image，客户端会自动补齐该能力标记，然后再提交图片。",
+                "Only the Provider/Model selection is stored; API keys are not copied. On first use, the app adds the image capability to the selected recognition model if the server catalog omitted it, then submits the image."
+            ))
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            Button(c.text("保存图片识别设置", "Save image recognition settings")) {
+                mothx.saveImageRecognition(config)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.orange)
+            .disabled(config.enabled && (config.providerID.isEmpty || config.modelID.isEmpty))
         }
     }
 }
@@ -475,7 +584,7 @@ struct ModelRow: View {
     let delete: () -> Void
     @State private var isHovered = false
 
-    var body: some View { VStack(alignment: .leading, spacing: 12) { HStack { Image(systemName: selected ? "chevron.down" : "chevron.right").font(.caption); Text(model.displayName).font(.system(size: 14, weight: .medium)); Text(model.id).font(.caption).foregroundStyle(.secondary); Spacer(); if model.reasoning { Text("Reasoning").font(.caption2).foregroundStyle(.orange) }; Button(action: delete) { Image(systemName: "trash").foregroundStyle(.red.opacity(0.8)) }.buttonStyle(.plain) }.foregroundStyle(.primary); if selected { HStack { SettingsField(title: "Model ID", text: $model.id); SettingsField(title: "Name", text: $model.name) }; HStack { NumberField(title: "Context window", value: $model.contextWindow); NumberField(title: "Max tokens", value: $model.maxTokens) }; Toggle("Reasoning", isOn: $model.reasoning); Text("Input: \(model.input.isEmpty ? "text" : model.input.joined(separator: ", "))").font(.caption).foregroundStyle(.secondary) } }.padding(14).frame(maxWidth: .infinity, alignment: .leading).background(selected ? Color.primary.opacity(0.08) : (isHovered ? Color.primary.opacity(0.08) : (colorScheme == .light ? .white : .codexCard))).clipShape(RoundedRectangle(cornerRadius: 9)).contentShape(Rectangle()).onHover { isHovered = $0 }.onTapGesture(perform: select) }
+    var body: some View { VStack(alignment: .leading, spacing: 12) { HStack { Image(systemName: selected ? "chevron.down" : "chevron.right").font(.caption); Text(model.displayName).font(.system(size: 14, weight: .medium)); Text(model.id).font(.caption).foregroundStyle(.secondary); Spacer(); if model.reasoning { Text("Reasoning").font(.caption2).foregroundStyle(.orange) }; Button(action: delete) { Image(systemName: "trash").foregroundStyle(.red.opacity(0.8)) }.buttonStyle(.plain) }.foregroundStyle(.primary); if selected { HStack { SettingsField(title: "Model ID", text: $model.id); SettingsField(title: "Name", text: $model.name) }; HStack { NumberField(title: "Context window", value: $model.contextWindow); NumberField(title: "Max tokens", value: $model.maxTokens) }; if model.contextWindow <= 0 { Text("API 未提供该模型的上下文上限，请根据运营商文档手动填写。\nThe API did not provide this model's context limit; enter it from the provider documentation.").font(.caption).foregroundStyle(.orange) }; Toggle("Reasoning", isOn: $model.reasoning); Text("Input: \(model.input.isEmpty ? "text" : model.input.joined(separator: ", "))").font(.caption).foregroundStyle(.secondary) } }.padding(14).frame(maxWidth: .infinity, alignment: .leading).background(selected ? Color.primary.opacity(0.08) : (isHovered ? Color.primary.opacity(0.08) : (colorScheme == .light ? .white : .codexCard))).clipShape(RoundedRectangle(cornerRadius: 9)).contentShape(Rectangle()).onHover { isHovered = $0 }.onTapGesture(perform: select) }
 }
 
 struct NumberField: View { let title: String; @Binding var value: Int

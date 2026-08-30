@@ -1,4 +1,11 @@
 import SwiftUI
+import UniformTypeIdentifiers
+import AppKit
+
+private enum ImageGenerationSelection: Hashable {
+    case currentModel
+    case configuredModel
+}
 
 struct WorkspaceView: View {
     @EnvironmentObject private var mothx: MothxServiceManager
@@ -18,6 +25,8 @@ struct WorkspaceView: View {
     @State private var selectedModelID = ""
     @State private var selectedSkills: Set<String> = []
     @State private var selectedTools: Set<String> = []
+    @State private var imageGenerationMenuOpen = false
+    @State private var imageGenerationSelection: ImageGenerationSelection?
     @State private var attachmentError: String?
     @State private var currentTurns: [Turn] = []
     @State private var expandedTurnIDs: Set<String> = []
@@ -30,6 +39,7 @@ struct WorkspaceView: View {
     @State private var reviewedChanges: MothxTurnChanges?
     @State private var previewedSkill: MothxSkill?
     @State private var previewedTool: ToolInvocationSummary?
+    @State private var previewedImage: MothxImagePreview?
     @State private var reviewSidebarWidth: CGFloat = 420
     @State private var conversationWasAtBottomBeforeReview = true
     @State private var conversationLayoutID = 0
@@ -119,7 +129,8 @@ struct WorkspaceView: View {
                                         forkingMessageID: forkingMessageID,
                                         onReviewChanges: presentReview,
                                         onPreviewSkill: presentSkillPreview,
-                                        onPreviewTool: presentToolPreview
+                                        onPreviewTool: presentToolPreview,
+                                        onPreviewImage: presentImagePreview
                                     )
                                 }
 
@@ -175,9 +186,23 @@ struct WorkspaceView: View {
                             }
                         }
                         .onChange(of: mothx.runStatus) { _, _ in
-                            if mothx.runSessionID == sessionID, mothx.isRunning {
+                            guard mothx.runSessionID == sessionID else { return }
+                            let terminalStatuses = ["completed", "succeeded", "failed", "error", "cancelled", "canceled", "timed_out", "timeout", "expired", "incomplete"]
+                            if terminalStatuses.contains((mothx.runStatus ?? "").lowercased()) {
+                                conversationLayoutID += 1
+                                requestScrollToBottom()
+                            } else if mothx.isRunning {
                                 scrollToBottom(reader, animated: true)
                             }
+                        }
+                        .onChange(of: mothx.isRunning) { wasRunning, isRunning in
+                            guard mothx.runSessionID == sessionID, wasRunning, !isRunning else { return }
+                            // The final transcript can be shorter than the
+                            // streaming projection. Re-anchor after the
+                            // terminal layout has committed so the old clip
+                            // origin cannot leave a blank viewport.
+                            conversationLayoutID += 1
+                            requestScrollToBottom()
                         }
                         .onChange(of: reviewedChanges == nil) { _, isClosed in
                             conversationLayoutID += 1
@@ -229,25 +254,49 @@ struct WorkspaceView: View {
                 }
 
                 if !readOnly {
-                    PromptComposer(
-                        prompt: $prompt,
-                attachments: $attachments,
-                mode: $selectedMode,
-                providerID: $selectedProviderID,
-                modelID: $selectedModelID,
-                providers: mothx.providers,
-                skills: mothx.installedSkills,
-                selectedSkills: $selectedSkills,
-                selectedTools: $selectedTools,
-                models: currentModels,
-                isRunning: mothx.isSubmittingRun || mothx.isStreaming,
-                contextUsedTokens: sessionMetrics.contextUsedTokens,
-                contextWindowTokens: sessionMetrics.contextWindowTokens,
-                cacheHitRate: sessionMetrics.cacheHitRate,
-                chooseFiles: chooseFiles,
-                submit: submit,
-                    stop: { Task { await mothx.cancelRun() } }
-                    ).frame(maxWidth: 760).padding(.horizontal, 25).padding(.bottom, 16)
+                    VStack(spacing: 8) {
+                        let recognitionProgress = mothx.imageRecognitionProgress
+                        if recognitionProgress.isVisible && recognitionProgress.sessionID == sessionID {
+                            ImageRecognitionProgressCard(progress: recognitionProgress)
+                        }
+                        if imageGenerationMenuOpen || imageGenerationSelection != nil {
+                            ImageGenerationChoiceCard(
+                                selection: imageGenerationSelection,
+                                configuredProvider: mothx.imageGeneration.providerID,
+                                configuredModel: mothx.imageGeneration.modelID,
+                                configuredEnabled: mothx.imageGeneration.enabled,
+                                onSelect: chooseImageGenerationModel,
+                                onCancel: cancelImageGeneration
+                            )
+                        }
+                        PromptComposer(
+                            prompt: $prompt,
+                            attachments: $attachments,
+                            mode: $selectedMode,
+                            providerID: $selectedProviderID,
+                            modelID: $selectedModelID,
+                            providers: mothx.providers,
+                            skills: mothx.installedSkills,
+                            selectedSkills: $selectedSkills,
+                            selectedTools: $selectedTools,
+                            models: currentModels,
+                            isRunning: mothx.isSubmittingRun || mothx.isStreaming,
+                            promptPlaceholder: imageGenerationSelection == nil
+                                ? c.askAnything
+                                : c.text("请输入生图提示词", "Enter an image generation prompt"),
+                            contextUsedTokens: sessionMetrics.contextUsedTokens,
+                            contextWindowTokens: sessionMetrics.contextWindowTokens,
+                            cacheHitRate: sessionMetrics.cacheHitRate,
+                            chooseFiles: chooseFiles,
+                            addAttachmentFiles: addAttachmentFiles,
+                            onPasteImage: addPastedImage,
+                            submit: submit,
+                            stop: { Task { await mothx.cancelRun() } }
+                        )
+                    }
+                    .frame(maxWidth: 760)
+                    .padding(.horizontal, 25)
+                    .padding(.bottom, 16)
                 }
             }
         }.padding(.top, 1)
@@ -263,6 +312,8 @@ struct WorkspaceView: View {
         }
         .task(id: sessionID) {
             if let sessionID {
+                imageGenerationMenuOpen = false
+                imageGenerationSelection = nil
                 selectedMode = ["plan", "agent", "yolo"].contains(mothx.defaultMode) ? mothx.defaultMode : "agent"
                 // Restore per-session provider/model preferences. If the saved
                 // provider no longer exists, fall back to the global defaults.
@@ -383,6 +434,17 @@ struct WorkspaceView: View {
             )
             .layoutPriority(1)
         }
+        if let previewedImage {
+            ImagePreviewSidebar(image: previewedImage) {
+                closeRightSidebar()
+            }
+            .frame(
+                minWidth: 150,
+                idealWidth: reviewSidebarWidth,
+                maxWidth: max(150, workspaceProxy.size.width * 0.5)
+            )
+            .layoutPriority(1)
+        }
         }
         }
         .overlay(alignment: .topTrailing) {
@@ -419,10 +481,11 @@ struct WorkspaceView: View {
 
     private func toggleRightSidebar() {
         withAnimation(.easeInOut(duration: 0.22)) {
-            if reviewedChanges != nil || previewedSkill != nil || previewedTool != nil {
+            if reviewedChanges != nil || previewedSkill != nil || previewedTool != nil || previewedImage != nil {
                 reviewedChanges = nil
                 previewedSkill = nil
                 previewedTool = nil
+                previewedImage = nil
                 return
             }
             guard let sessionID,
@@ -437,6 +500,7 @@ struct WorkspaceView: View {
             conversationWasAtBottomBeforeReview = isConversationAtBottom
             previewedSkill = nil
             previewedTool = nil
+            previewedImage = nil
             reviewedChanges = changes
         }
     }
@@ -446,6 +510,7 @@ struct WorkspaceView: View {
             conversationWasAtBottomBeforeReview = isConversationAtBottom
             previewedSkill = skill
             previewedTool = nil
+            previewedImage = nil
             reviewedChanges = nil
         }
     }
@@ -454,6 +519,17 @@ struct WorkspaceView: View {
         withAnimation(.easeInOut(duration: 0.22)) {
             conversationWasAtBottomBeforeReview = isConversationAtBottom
             previewedTool = item
+            previewedSkill = nil
+            previewedImage = nil
+            reviewedChanges = nil
+        }
+    }
+
+    private func presentImagePreview(_ image: MothxImagePreview) {
+        withAnimation(.easeInOut(duration: 0.22)) {
+            conversationWasAtBottomBeforeReview = isConversationAtBottom
+            previewedImage = image
+            previewedTool = nil
             previewedSkill = nil
             reviewedChanges = nil
         }
@@ -464,6 +540,7 @@ struct WorkspaceView: View {
             reviewedChanges = nil
             previewedSkill = nil
             previewedTool = nil
+            previewedImage = nil
         }
     }
 
@@ -484,7 +561,7 @@ struct WorkspaceView: View {
     }
 
     private var isRightSidebarOpen: Bool {
-        reviewedChanges != nil || previewedSkill != nil || previewedTool != nil
+        reviewedChanges != nil || previewedSkill != nil || previewedTool != nil || previewedImage != nil
     }
 
     // MARK: - Turn accordion
@@ -570,10 +647,44 @@ struct WorkspaceView: View {
 
     private var currentWorkDir: String { mothx.workDir(for: sessionID ?? "") }
 
+    private func chooseImageGenerationModel(_ selection: ImageGenerationSelection) {
+        if selection == .configuredModel {
+            let config = mothx.imageGeneration
+            let exists = config.enabled
+                && mothx.providers.contains { provider in
+                    provider.id == config.providerID
+                        && provider.models.contains { $0.id == config.modelID }
+                }
+            guard exists else {
+                attachmentError = languageStore.copy.text(
+                    "图片生成设置还没有选择有效的 Provider 和模型，请先到设置中完成配置。",
+                    "Image generation has no valid configured Provider/model. Configure it in Settings first."
+                )
+                return
+            }
+        }
+        imageGenerationSelection = selection
+        imageGenerationMenuOpen = false
+        prompt = ""
+    }
+
+    private func cancelImageGeneration() {
+        imageGenerationMenuOpen = false
+        imageGenerationSelection = nil
+        prompt = ""
+    }
+
     private func submit() {
         guard let sessionID else { return }
         var question = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !question.isEmpty || !attachments.isEmpty else { return }
+        if question == "/生图" {
+            prompt = ""
+            imageGenerationSelection = nil
+            imageGenerationMenuOpen = true
+            return
+        }
+        let generationSelection = imageGenerationSelection
         // Submission starts a new turn. Collapse every turn that already
         // belongs to this session; the incoming local user message will form
         // a new last turn and the message observer will expand that one only.
@@ -582,23 +693,159 @@ struct WorkspaceView: View {
             preparedTurnIDs.removeAll()
             preparingTurnID = nil
         }
-        let imageAttachments = attachments.compactMap(\.dataURL)
+        let submittedAttachments = attachments
+        let imageAttachments = submittedAttachments.compactMap(\.dataURL)
         if question.isEmpty, !attachments.isEmpty {
             let separator = languageStore.language == .zh ? "、" : ", "
             question = languageStore.copy.attachmentsInstruction(attachments.map(\.name).joined(separator: separator))
         }
-        let selectedProvider = selectedProviderID
-        let selectedModel = selectedModelID
+        let originalProvider = selectedProviderID
+        let originalModel = selectedModelID
+        let generationTarget: (provider: String, model: String)? = {
+            guard let generationSelection else { return nil }
+            switch generationSelection {
+            case .currentModel:
+                return (originalProvider, originalModel)
+            case .configuredModel:
+                return (mothx.imageGeneration.providerID, mothx.imageGeneration.modelID)
+            }
+        }()
+        let selectedProvider = generationTarget?.provider ?? originalProvider
+        let selectedModel = generationTarget?.model ?? originalModel
+        let isImageGeneration = generationTarget != nil
+        if isImageGeneration {
+            let targetExists = mothx.providers.contains { provider in
+                provider.id == selectedProvider
+                    && provider.models.contains { $0.id == selectedModel }
+            }
+            guard targetExists, !selectedProvider.isEmpty, !selectedModel.isEmpty else {
+                attachmentError = languageStore.copy.text(
+                    "图片生成模型不存在，请重新选择当前模型或到设置中重新配置。",
+                    "The image generation model is unavailable. Select the current model again or update the Settings configuration."
+                )
+                return
+            }
+            // Make the temporary route visible in the composer while the
+            // generation conversation is running. It is restored after the
+            // durable Run reaches a terminal state below.
+            selectedProviderID = selectedProvider
+            selectedModelID = selectedModel
+            mothx.recordRuntimeLog(
+                "image-generation-routing",
+                "session=\(sessionID) provider=\(selectedProvider) model=\(selectedModel) route=\(generationSelection == .currentModel ? "current" : "configured")"
+            )
+        }
+        let selectedModelConfig = currentModels.first(where: { $0.id == selectedModel })
+        let currentModelSupportsImages = selectedModelConfig?.input.contains {
+            $0.caseInsensitiveCompare("image") == .orderedSame
+        } == true
+        let recognitionConfig = mothx.imageRecognition
+        let hasConfiguredVisionModel = recognitionConfig.enabled
+            && !recognitionConfig.providerID.isEmpty
+            && !recognitionConfig.modelID.isEmpty
+        let shouldUseConfiguredVision = !isImageGeneration && !imageAttachments.isEmpty && hasConfiguredVisionModel
+        if !isImageGeneration && !imageAttachments.isEmpty {
+            let route = shouldUseConfiguredVision ? "configured-vision-then-current" : "current-multimodal-direct"
+            mothx.recordRuntimeLog(
+                "image-routing",
+                "session=\(sessionID) current=\(selectedProvider)/\(selectedModel) currentInput=\(selectedModelConfig?.input.joined(separator: ",") ?? "unknown") route=\(route) vision=\(recognitionConfig.providerID)/\(recognitionConfig.modelID)"
+            )
+        }
+        if !isImageGeneration && !imageAttachments.isEmpty && recognitionConfig.enabled && !hasConfiguredVisionModel {
+            attachmentError = languageStore.copy.text(
+                "图片识别已启用，但还没有完整选择 Provider 和模型。",
+                "Image recognition is enabled, but its Provider and model are incomplete."
+            )
+            return
+        }
+        if !isImageGeneration && !imageAttachments.isEmpty && !hasConfiguredVisionModel && !currentModelSupportsImages {
+            attachmentError = languageStore.copy.text(
+                "当前模型不支持图片，请配置图片识别 Provider 和模型，或选择支持图片的当前模型。",
+                "The active model cannot accept images. Configure an image recognition Provider/model or choose a multimodal active model."
+            )
+            return
+        }
+        if shouldUseConfiguredVision {
+            let visionProviderExists = mothx.providers.contains { provider in
+                provider.id == recognitionConfig.providerID
+                    && provider.models.contains { $0.id == recognitionConfig.modelID }
+            }
+            guard visionProviderExists else {
+                attachmentError = languageStore.copy.text(
+                    "图片识别设置中的 Provider 或模型已不存在，请重新选择。",
+                    "The Provider or model selected for image recognition no longer exists. Please select it again."
+                )
+                return
+            }
+        }
         let selectedMode = selectedMode
         let selectedTools = Array(selectedTools).sorted()
         let selectedSkills = Array(selectedSkills).sorted()
+        let workDir = mothx.workDir(for: sessionID)
         prompt = ""; attachments = []
         mothx.setSessionProvider(selectedProvider, for: sessionID)
         mothx.setSessionModel(selectedModel, for: sessionID)
         Task {
+            defer {
+                if isImageGeneration {
+                    selectedProviderID = originalProvider
+                    selectedModelID = originalModel
+                    mothx.setSessionProvider(originalProvider, for: sessionID)
+                    mothx.setSessionModel(originalModel, for: sessionID)
+                    imageGenerationSelection = nil
+                    imageGenerationMenuOpen = false
+                }
+            }
             // v1.2.95+: the run API takes provider/model directly per run,
             // so the global defaults no longer need to be rewritten here.
-            if let runID = await mothx.submitRun(sessionID: sessionID, message: question, images: imageAttachments, workDir: mothx.workDir(for: sessionID), provider: selectedProvider, model: selectedModel, mode: selectedMode, tools: selectedTools, skills: selectedSkills) {
+            var finalQuestion = question
+            var finalImages = imageAttachments
+            if shouldUseConfiguredVision {
+                do {
+                    let recognition = try await mothx.recognizeImages(
+                        images: imageAttachments,
+                        provider: recognitionConfig.providerID,
+                        model: recognitionConfig.modelID,
+                        workDir: workDir,
+                        sessionID: sessionID
+                    )
+                    let paths = submittedAttachments.map { attachment in
+                        relativePath(for: attachment.path, workDir: workDir)
+                    }.joined(separator: "\n- ")
+                    finalQuestion = """
+                    用户原始请求：
+                    \(question)
+
+                    图片文件已保存到当前工作目录，可按需读取：
+                    - \(paths)
+
+                    独立视觉模型的识别结果：
+                    \(recognition)
+
+                    请基于以上图片识别结果和原始请求继续完成任务。不要把识别结果当作绝对事实；必要时可读取工作目录中的原图核对。
+                    """
+                    finalImages = []
+                    // Give the user a short opportunity to see the child
+                    // Agent's returned description before the main Run takes
+                    // ownership of the composer and closes the card.
+                    try? await Task.sleep(for: .milliseconds(350))
+                } catch {
+                    attachmentError = languageStore.copy.text(
+                        "图片识别失败：\(error.localizedDescription)",
+                        "Image recognition failed: \(error.localizedDescription)"
+                    )
+                    return
+                }
+            }
+            if isImageGeneration {
+                finalQuestion = """
+                请使用图片生成能力完成下面的请求，并将生成的图片作为最终结果返回给用户。
+
+                生图提示词：
+                \(question)
+                """
+            }
+            if let runID = await mothx.submitRun(sessionID: sessionID, message: finalQuestion, images: finalImages, workDir: workDir, provider: selectedProvider, model: selectedModel, mode: selectedMode, tools: selectedTools, skills: selectedSkills, forceServe: isImageGeneration) {
                 await mothx.pollRun(runID: runID, sessionID: sessionID)
                 await mothx.updateSessionTitle(id: sessionID, title: String((question.components(separatedBy: .newlines).first ?? question).prefix(48)))
                 await mothx.loadMessages(sessionID: sessionID)
@@ -613,24 +860,73 @@ struct WorkspaceView: View {
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = true
         guard panel.runModal() == .OK else { return }
+        addAttachmentFiles(panel.urls)
+    }
+
+    private func addAttachmentFiles(_ urls: [URL]) {
         let directory = mothx.workDir(for: sessionID ?? "")
         guard !directory.isEmpty else {
             attachmentError = languageStore.copy.noWorkDirForAttachment
             return
         }
         do {
-            try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
-            for source in panel.urls {
-                let destination = uniqueDestination(for: source, in: URL(fileURLWithPath: directory))
+            let uploadDirectory = URL(fileURLWithPath: directory, isDirectory: true)
+                .appendingPathComponent("uploadimg", isDirectory: true)
+            try FileManager.default.createDirectory(at: uploadDirectory, withIntermediateDirectories: true)
+            var unsupported = false
+            for source in urls {
+                guard isImageURL(source) else { unsupported = true; continue }
+                let destination = uniqueDestination(for: source, in: uploadDirectory)
                 if source.standardizedFileURL != destination.standardizedFileURL {
                     try FileManager.default.copyItem(at: source, to: destination)
                 }
                 let dataURL = try imageDataURL(for: destination)
-                attachments.append(ComposerAttachment(name: destination.lastPathComponent, dataURL: dataURL))
+                attachments.append(ComposerAttachment(name: destination.lastPathComponent, path: destination.path, dataURL: dataURL))
+            }
+            if unsupported {
+                attachmentError = languageStore.copy.text(
+                    "目前只支持拖入或选择图片（PNG、JPG、GIF、WebP、HEIC、TIFF）。",
+                    "Only image files are supported here (PNG, JPG, GIF, WebP, HEIC, TIFF)."
+                )
             }
         } catch {
             attachmentError = languageStore.copy.addAttachmentFailedPrefix(error.localizedDescription)
         }
+    }
+
+    private func addPastedImage(_ image: NSImage) {
+        guard let tiffData = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiffData),
+              let pngData = bitmap.representation(using: .png, properties: [:]) else {
+            attachmentError = languageStore.copy.text(
+                "无法读取剪贴板中的截图。",
+                "The screenshot on the clipboard could not be read."
+            )
+            return
+        }
+        let temporaryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mothx-pasted-\(UUID().uuidString).png")
+        do {
+            try pngData.write(to: temporaryURL, options: .atomic)
+            addAttachmentFiles([temporaryURL])
+            try? FileManager.default.removeItem(at: temporaryURL)
+        } catch {
+            attachmentError = languageStore.copy.addAttachmentFailedPrefix(error.localizedDescription)
+        }
+    }
+
+    private func isImageURL(_ url: URL) -> Bool {
+        ["png", "jpg", "jpeg", "gif", "webp", "heic", "tif", "tiff"]
+            .contains(url.pathExtension.lowercased())
+    }
+
+    private func relativePath(for path: String, workDir: String) -> String {
+        guard !path.isEmpty, !workDir.isEmpty else { return path }
+        let root = URL(fileURLWithPath: workDir, isDirectory: true).standardizedFileURL.path
+        let normalizedRoot = root.hasSuffix("/") ? root : root + "/"
+        if path == root { return "." }
+        if path.hasPrefix(normalizedRoot) { return String(path.dropFirst(normalizedRoot.count)) }
+        return path
     }
 
     private func uniqueDestination(for source: URL, in directory: URL) -> URL {
@@ -652,6 +948,140 @@ struct WorkspaceView: View {
         guard imageExtensions.contains(url.pathExtension.lowercased()) else { return nil }
         let mime = url.pathExtension.lowercased() == "jpg" ? "jpeg" : url.pathExtension.lowercased()
         return "data:image/\(mime);base64,\(try Data(contentsOf: url).base64EncodedString())"
+    }
+}
+
+private struct ImageRecognitionProgressCard: View {
+    let progress: MothxImageRecognitionProgress
+
+    private var isCompleted: Bool {
+        !progress.result.isEmpty && !progress.isError
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            if progress.isError {
+                Image(systemName: "xmark.octagon.fill")
+                    .foregroundStyle(.red)
+                    .font(.title3)
+            } else if isCompleted {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                    .font(.title3)
+            } else {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 18, height: 18)
+            }
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 7) {
+                    Text("图片识别 Agent").font(.caption.weight(.semibold))
+                    Text("·").foregroundStyle(.tertiary)
+                    Text("\(progress.provider)/\(progress.model)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Text(progress.status)
+                    .font(.caption)
+                    .foregroundStyle(progress.isError ? .red : .secondary)
+                    .lineLimit(2)
+                if !progress.result.isEmpty {
+                    Text("子 Agent 返回：\(progress.result)")
+                        .font(.caption2)
+                        .foregroundStyle(.primary.opacity(0.82))
+                        .lineLimit(5)
+                        .textSelection(.enabled)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(progress.isError ? Color.red.opacity(0.35) : Color.orange.opacity(0.35), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+        .animation(.easeInOut(duration: 0.18), value: progress)
+    }
+}
+
+private struct ImageGenerationChoiceCard: View {
+    let selection: ImageGenerationSelection?
+    let configuredProvider: String
+    let configuredModel: String
+    let configuredEnabled: Bool
+    let onSelect: (ImageGenerationSelection) -> Void
+    let onCancel: () -> Void
+
+    private var configuredReady: Bool {
+        configuredEnabled && !configuredProvider.isEmpty && !configuredModel.isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "photo.badge.plus")
+                    .foregroundStyle(.orange)
+                Text("图片生成模型")
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                Button(action: onCancel) {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+            }
+
+            if let selection {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text(selection == .currentModel
+                         ? "已选择当前会话模型，请输入生图提示词"
+                         : "已选择配置模型 (configuredProvider)/(configuredModel)，请输入生图提示词")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            } else {
+                Text("请选择本次生图使用的模型")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Button("1  使用本模型") {
+                        onSelect(.currentModel)
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button("2  使用配置的生图模型") {
+                        onSelect(.configuredModel)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!configuredReady)
+                }
+                if !configuredReady {
+                    Text("选项 2 需要先在设置中启用并选择生图 Provider/模型。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.orange.opacity(0.4), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+        .transition(.move(edge: .bottom).combined(with: .opacity))
     }
 }
 
@@ -783,6 +1213,7 @@ struct CurrentDirectoryMenu: View {
 struct ComposerAttachment: Identifiable, Hashable {
     let id = UUID()
     let name: String
+    let path: String
     let dataURL: String?
 }
 
@@ -802,10 +1233,13 @@ struct PromptComposer: View {
     @Binding var selectedTools: Set<String>
     let models: [MothxModelConfig]
     let isRunning: Bool
+    let promptPlaceholder: String
     let contextUsedTokens: Int?
     let contextWindowTokens: Int?
     let cacheHitRate: Double?
     let chooseFiles: () -> Void
+    let addAttachmentFiles: ([URL]) -> Void
+    let onPasteImage: (NSImage) -> Void
     let submit: () -> Void
     let stop: () -> Void
     @State private var plusMenuOpen = false
@@ -819,6 +1253,7 @@ struct PromptComposer: View {
     @GestureState private var planPanelDragTranslation: CGSize = .zero
     @State private var providerSearchText = ""
     @State private var modelSearchText = ""
+    @State private var isDropTargeted = false
 
     private let toolOptions = [("browser", "browser"), ("delegate", "delegate"), ("multi-agent", "muti-agent"), ("workflow", "workflow")]
 
@@ -887,13 +1322,13 @@ struct PromptComposer: View {
                     Button { attachments.removeAll() } label: { Image(systemName: "xmark") }.buttonStyle(.plain).hoverHighlight()
                 }.padding(.horizontal, 12).padding(.top, 10)
             }
-            RetSubmitTextEditor(text: $prompt, placeholder: c.askAnything, isRunning: isRunning, onSubmit: submit)
+            RetSubmitTextEditor(text: $prompt, placeholder: promptPlaceholder, isRunning: isRunning, onPasteImage: onPasteImage, onSubmit: submit)
                 .frame(height: editorHeight)
                 .padding(.horizontal, 12)
                 .padding(.top, 12)
                 .overlay(alignment: .topLeading) {
                     if prompt.isEmpty {
-                        Text(c.askAnything)
+                        Text(promptPlaceholder)
                             .foregroundStyle(.tertiary)
                             .padding(.leading, 17)
                             .padding(.top, 11)
@@ -1027,6 +1462,14 @@ struct PromptComposer: View {
         .background(composerBackground)
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.12)))
+        .overlay {
+            if isDropTargeted {
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(Color.orange, style: StrokeStyle(lineWidth: 2, dash: [6]))
+                    .background(Color.orange.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+            }
+        }
+        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted, perform: handleDrop)
         // Keep session metrics visible above the composer before, during, and
         // after a run. Unknown values remain explicit rather than hiding the row.
         .overlay(alignment: .topTrailing) {
@@ -1091,6 +1534,24 @@ struct PromptComposer: View {
 
     private var composerBackground: Color {
         colorScheme == .light ? .white : .codexCard
+    }
+
+    private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        var accepted = false
+        for provider in providers {
+            guard provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) else { continue }
+            accepted = true
+            provider.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { data, _ in
+                guard let data else { return }
+                let url = URL(dataRepresentation: data, relativeTo: nil)
+                    ?? (String(data: data, encoding: .utf8).flatMap(URL.init(fileURLWithPath:)))
+                guard let url else { return }
+                DispatchQueue.main.async {
+                    addAttachmentFiles([url])
+                }
+            }
+        }
+        return accepted
     }
 
     private var editorHeight: CGFloat {
@@ -1196,6 +1657,8 @@ private struct ConversationScrollObserver: NSViewRepresentable {
         var lastBottomState: Bool?
         weak var observedScrollView: NSScrollView?
         var boundsObserver: NSObjectProtocol?
+        var documentFrameObserver: NSObjectProtocol?
+        var documentBoundsObserver: NSObjectProtocol?
 
         init(onBottomChanged: @escaping (Bool) -> Void) {
             self.onBottomChanged = onBottomChanged
@@ -1208,11 +1671,18 @@ private struct ConversationScrollObserver: NSViewRepresentable {
                 guard self.observedScrollView !== scrollView else {
                     self.refreshLayoutIfNeeded()
                     self.refreshScrollIfNeeded()
+                    self.scheduleScrollOffsetClamp()
                     self.updateBottomState()
                     return
                 }
                 if let boundsObserver = self.boundsObserver {
                     NotificationCenter.default.removeObserver(boundsObserver)
+                }
+                if let documentFrameObserver = self.documentFrameObserver {
+                    NotificationCenter.default.removeObserver(documentFrameObserver)
+                }
+                if let documentBoundsObserver = self.documentBoundsObserver {
+                    NotificationCenter.default.removeObserver(documentBoundsObserver)
                 }
                 self.observedScrollView = scrollView
                 scrollView.contentView.postsBoundsChangedNotifications = true
@@ -1221,10 +1691,30 @@ private struct ConversationScrollObserver: NSViewRepresentable {
                     object: scrollView.contentView,
                     queue: .main
                 ) { [weak self] _ in
+                    self?.clampScrollOffsetIfNeeded()
                     self?.updateBottomState()
+                }
+                if let documentView = scrollView.documentView {
+                    documentView.postsFrameChangedNotifications = true
+                    documentView.postsBoundsChangedNotifications = true
+                    self.documentFrameObserver = NotificationCenter.default.addObserver(
+                        forName: NSView.frameDidChangeNotification,
+                        object: documentView,
+                        queue: .main
+                    ) { [weak self] _ in
+                        self?.scheduleScrollOffsetClamp()
+                    }
+                    self.documentBoundsObserver = NotificationCenter.default.addObserver(
+                        forName: NSView.boundsDidChangeNotification,
+                        object: documentView,
+                        queue: .main
+                    ) { [weak self] _ in
+                        self?.scheduleScrollOffsetClamp()
+                    }
                 }
                 self.refreshLayoutIfNeeded()
                 self.refreshScrollIfNeeded()
+                self.scheduleScrollOffsetClamp()
                 self.updateBottomState()
             }
         }
@@ -1249,6 +1739,40 @@ private struct ConversationScrollObserver: NSViewRepresentable {
             DispatchQueue.main.async { [weak self] in
                 self?.scrollToBottomNow()
             }
+        }
+
+        /// Content can become shorter when the streaming/final message
+        /// projection replaces a long in-progress view with the final text.
+        /// AppKit may retain the old clip origin in that case, leaving the
+        /// viewport below the new document and rendering a blank area until
+        /// the user scrolls. Clamp only invalid origins, so a user who is
+        /// reading earlier content keeps their position.
+        func scheduleScrollOffsetClamp() {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.clampScrollOffsetIfNeeded()
+                DispatchQueue.main.async { [weak self] in
+                    self?.clampScrollOffsetIfNeeded()
+                }
+            }
+        }
+
+        func clampScrollOffsetIfNeeded() {
+            guard let scrollView = observedScrollView,
+                  let documentView = scrollView.documentView else { return }
+            scrollView.needsLayout = true
+            scrollView.layoutSubtreeIfNeeded()
+            let clipView = scrollView.contentView
+            let documentHeight = documentView.bounds.height
+            let clipHeight = clipView.bounds.height
+            guard documentHeight > 0, clipHeight > 0 else { return }
+            let maxY = max(0, documentHeight - clipHeight)
+            let currentOrigin = clipView.bounds.origin
+            let clampedY = min(max(0, currentOrigin.y), maxY)
+            guard abs(currentOrigin.y - clampedY) > 0.5 else { return }
+            clipView.scroll(to: NSPoint(x: currentOrigin.x, y: clampedY))
+            scrollView.reflectScrolledClipView(clipView)
+            updateBottomState()
         }
 
         func scrollToBottomNow() {
@@ -1301,6 +1825,12 @@ private struct ConversationScrollObserver: NSViewRepresentable {
         deinit {
             if let boundsObserver {
                 NotificationCenter.default.removeObserver(boundsObserver)
+            }
+            if let documentFrameObserver {
+                NotificationCenter.default.removeObserver(documentFrameObserver)
+            }
+            if let documentBoundsObserver {
+                NotificationCenter.default.removeObserver(documentBoundsObserver)
             }
         }
     }
@@ -1356,17 +1886,30 @@ private struct RetSubmitTextEditor: NSViewRepresentable {
     @Binding var text: String
     let placeholder: String
     let isRunning: Bool
+    let onPasteImage: (NSImage) -> Void
     let onSubmit: () -> Void
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSTextView.scrollableTextView()
-        guard let textView = scrollView.documentView as? NSTextView else { return scrollView }
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        let textView = PasteAwareTextView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
+        textView.minSize = NSSize(width: 0, height: 0)
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        scrollView.documentView = textView
         textView.delegate = context.coordinator
+        textView.onPasteImage = { [weak coordinator = context.coordinator] image in
+            coordinator?.parent.onPasteImage(image)
+        }
         textView.isRichText = false
         textView.font = .preferredFont(forTextStyle: .body)
         textView.drawsBackground = false
-        textView.autoresizingMask = [.width]
-        textView.isVerticallyResizable = true
         textView.textContainer?.widthTracksTextView = true
         textView.textContainer?.lineBreakMode = .byWordWrapping
         return scrollView
@@ -1375,6 +1918,9 @@ private struct RetSubmitTextEditor: NSViewRepresentable {
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = scrollView.documentView as? NSTextView else { return }
         context.coordinator.parent = self
+        (textView as? PasteAwareTextView)?.onPasteImage = { [weak coordinator = context.coordinator] image in
+            coordinator?.parent.onPasteImage(image)
+        }
         if textView.string != text {
             textView.string = text
         }
@@ -1414,5 +1960,19 @@ private struct RetSubmitTextEditor: NSViewRepresentable {
             guard !isInternalUpdate else { return }
             parent.text = textView.string
         }
+    }
+}
+
+private final class PasteAwareTextView: NSTextView {
+    var onPasteImage: ((NSImage) -> Void)?
+
+    override func paste(_ sender: Any?) {
+        let pasteboard = NSPasteboard.general
+        if pasteboard.canReadObject(forClasses: [NSImage.self], options: nil),
+           let image = NSImage(pasteboard: pasteboard) {
+            onPasteImage?(image)
+            return
+        }
+        super.paste(sender)
     }
 }

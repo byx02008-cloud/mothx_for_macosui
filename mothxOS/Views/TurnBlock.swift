@@ -44,6 +44,18 @@ struct ToolInvocationSummary: Identifiable, Hashable {
     let resultSummary: String
     let hasDetail: Bool
     let isError: Bool
+    let imagePreviews: [MothxImagePreview]
+
+    init(id: String, toolName: String, argumentsPreview: String, arguments: String, resultSummary: String, hasDetail: Bool, isError: Bool, imagePreviews: [MothxImagePreview] = []) {
+        self.id = id
+        self.toolName = toolName
+        self.argumentsPreview = argumentsPreview
+        self.arguments = arguments
+        self.resultSummary = resultSummary
+        self.hasDetail = hasDetail
+        self.isError = isError
+        self.imagePreviews = imagePreviews
+    }
 }
 
 func computeTurns(_ messages: [MothxMessage]) -> [Turn] {
@@ -58,12 +70,13 @@ func computeTurns(_ messages: [MothxMessage]) -> [Turn] {
         var resultCount = 0
         var fileCalls: [MothxMessage] = []
         for msg in messages {
-            if msg.isAssistant, !msg.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                results.append(MothxMessage(id: msg.id, seq: msg.seq, role: msg.role, content: msg.content.trimmingCharacters(in: .whitespacesAndNewlines), toolCallId: msg.toolCallId, toolName: msg.toolName, arguments: msg.arguments, plan: msg.plan, summary: msg.summary, hasDetail: msg.hasDetail, createdAt: msg.createdAt))
+            if msg.isAssistant,
+               !msg.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !msg.imagePreviews.isEmpty {
+                results.append(MothxMessage(id: msg.id, seq: msg.seq, role: msg.role, content: msg.content.trimmingCharacters(in: .whitespacesAndNewlines), toolCallId: msg.toolCallId, toolName: msg.toolName, arguments: msg.arguments, plan: msg.plan, summary: msg.summary, hasDetail: msg.hasDetail, createdAt: msg.createdAt, imagePreviews: msg.imagePreviews))
             } else if msg.isToolCall {
                 let id = msg.toolCallId ?? msg.id
                 let name = msg.toolName ?? "tool"
-                calls[id] = ToolInvocationSummary(id: id, toolName: name, argumentsPreview: toolArgSummary(toolName: name, arguments: msg.arguments) ?? "", arguments: msg.arguments, resultSummary: "", hasDetail: false, isError: false)
+                calls[id] = ToolInvocationSummary(id: id, toolName: name, argumentsPreview: toolArgSummary(toolName: name, arguments: msg.arguments) ?? "", arguments: msg.arguments, resultSummary: "", hasDetail: false, isError: false, imagePreviews: msg.imagePreviews)
                 order.append(id)
                 if ["edit", "write", "insert", "edit_file", "write_file", "insert_file", "insert_text"].contains((msg.toolName ?? "").lowercased().replacingOccurrences(of: "-", with: "_")) {
                     fileCalls.append(msg)
@@ -71,8 +84,12 @@ func computeTurns(_ messages: [MothxMessage]) -> [Turn] {
             } else if msg.isToolResult {
                 resultCount += 1
                 let id = msg.toolCallId ?? msg.id
-                let old = calls[id] ?? ToolInvocationSummary(id: id, toolName: msg.toolName ?? "tool", argumentsPreview: "", arguments: "", resultSummary: "", hasDetail: false, isError: false)
-                calls[id] = ToolInvocationSummary(id: id, toolName: old.toolName, argumentsPreview: old.argumentsPreview, arguments: old.arguments, resultSummary: compactToolSummary(msg.summary ?? ""), hasDetail: msg.hasDetail, isError: false)
+                let old = calls[id] ?? ToolInvocationSummary(id: id, toolName: msg.toolName ?? "tool", argumentsPreview: "", arguments: "", resultSummary: "", hasDetail: false, isError: false, imagePreviews: [])
+                var previews = old.imagePreviews
+                for preview in msg.imagePreviews where !previews.contains(where: { $0.source == preview.source }) {
+                    previews.append(preview)
+                }
+                calls[id] = ToolInvocationSummary(id: id, toolName: old.toolName, argumentsPreview: old.argumentsPreview, arguments: old.arguments, resultSummary: compactToolSummary(msg.summary ?? ""), hasDetail: msg.hasDetail, isError: false, imagePreviews: previews)
                 if !order.contains(id) { order.append(id) }
             }
         }
@@ -118,6 +135,7 @@ struct TurnBlock: View {
     var onReviewChanges: ((MothxTurnChanges) -> Void)? = nil
     var onPreviewSkill: ((MothxSkill) -> Void)? = nil
     var onPreviewTool: ((ToolInvocationSummary) -> Void)? = nil
+    var onPreviewImage: ((MothxImagePreview) -> Void)? = nil
 
     /// Explicit message forks are accepted only at the final assistant text
     /// entry of a completed turn. This mirrors mothx's `fork_unavailable`
@@ -180,6 +198,38 @@ struct TurnBlock: View {
         return candidateIDs.compactMap { mothx.historicalRunsByMessage[sessionID]?[$0]?.id }.first
     }
 
+    /// Resolves the Run that owns this turn's artifacts. A live final turn
+    /// must use the current Run; a historical turn must use the Run mapped to
+    /// its own user message. Do not fall back to a session-level latest Run.
+    private var turnRunID: String? {
+        if turn.isLast, isCurrentRunSession, let currentRunID = mothx.currentRunID {
+            return currentRunID
+        }
+        return historicalRunID
+    }
+
+    /// Locally published image files found in this turn's tool outputs or
+    /// reply text (`publish_artifact <path>`), resolved against the session
+    /// working directory. Shown as a card after the final answer so the user
+    /// can click through to the right-sidebar preview.
+    private var turnPublishArtifactImages: [MothxImagePreview] {
+        guard turnRunID != nil else { return [] }
+        let workDir = mothx.workDir(for: sessionID)
+        let directPreviews = turn.toolSummaries.flatMap(\.imagePreviews)
+        let texts = turn.resultMessages.map(\.content)
+            + turn.toolSummaries.map(\.arguments)
+            + turn.toolSummaries.map(\.resultSummary)
+        var seen = Set<String>()
+        var result: [MothxImagePreview] = []
+        for preview in directPreviews where seen.insert(preview.source).inserted {
+            result.append(preview)
+        }
+        for preview in texts.flatMap({ MothxImagePreview.publishArtifactPreviews(from: $0, workDirectory: workDir) }) {
+            if seen.insert(preview.source).inserted { result.append(preview) }
+        }
+        return result
+    }
+
     /// Status for this turn: current-run live status for the last turn,
     /// otherwise historical run summary looked up from any message ID.
     private var turnStatus: (status: String, elapsed: TimeInterval, error: String?)? {
@@ -220,7 +270,8 @@ struct TurnBlock: View {
                             message: turn.userMessage,
                             isCurrentRunning: false,
                             onFork: forkAction,
-                            isForking: forkingMessageID == forkableAssistantMessage?.id
+                            isForking: forkingMessageID == forkableAssistantMessage?.id,
+                            onPreviewImage: onPreviewImage
                         )
                         if turn.hasResponded { agentResponseBlock }
                         // Show status for the last turn before the agent responds,
@@ -270,7 +321,8 @@ struct TurnBlock: View {
             ForEach(turn.resultMessages) { message in
                 MessageBubble(
                     message: message,
-                    isCurrentRunning: isTurnRunActive && mothx.currentRunningMessageID == message.id
+                    isCurrentRunning: isTurnRunActive && mothx.currentRunningMessageID == message.id,
+                    onPreviewImage: onPreviewImage
                 )
             }
             if !isTurnRunActive, let turnChanges, !turnChanges.files.isEmpty {
@@ -279,6 +331,13 @@ struct TurnBlock: View {
                     onReview: { onReviewChanges?(turnChanges) },
                     onPreview: { onReviewChanges?(turnChanges) }
                 )
+            }
+            let artifactImages = turnPublishArtifactImages
+            if let runID = turnRunID, !artifactImages.isEmpty {
+                PublishArtifactCard(images: artifactImages, runID: runID) { image in
+                    onPreviewImage?(image)
+                }
+                .padding(.top, 2)
             }
             // One status per turn, always below the change card.
             // Current run: use live status.  Historical: look up via any
@@ -348,6 +407,11 @@ struct TurnBlock: View {
         .background(Color.orange.opacity(0.03))
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.orange.opacity(0.15), lineWidth: 1))
+        .onAppear {
+            if turn.toolSummaries.contains(where: { $0.toolName == "image_generation" }) {
+                loadProcessPage(0)
+            }
+        }
     }
 
     private var currentProcessSummaries: ArraySlice<ToolInvocationSummary> {

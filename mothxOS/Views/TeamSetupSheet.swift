@@ -69,18 +69,17 @@ struct TeamSetupSheet: View {
                         if members.isEmpty {
                             Text(c.noMembersConfigured).font(.callout).foregroundStyle(.secondary)
                         } else {
-                            ForEach(members) { member in
-                                AgentSummaryRow(profile: member) {
-                                    editingAgent = member
+                            VStack(spacing: 10) {
+                                ForEach(members) { member in
+                                    AgentSummaryRow(profile: member) {
+                                        editingAgent = member
+                                    }
                                 }
                             }
                         }
-                        Button {
+                        AddMemberButton {
                             editingAgent = MothxAgentProfile.new(projectID: activeProjectID, role: .member)
-                        } label: {
-                            Label(c.addMember, systemImage: "person.badge.plus")
                         }
-                        .buttonStyle(.bordered)
                     }
                 }
             }
@@ -144,33 +143,95 @@ struct TeamSetupSheet: View {
     }
 }
 
-private struct AgentSummaryRow: View {
+/// 虚线边框的"新增成员"按钮
+private struct AddMemberButton: View {
     @EnvironmentObject private var languageStore: LanguageStore
-    let profile: MothxAgentProfile
-    let edit: () -> Void
+    @Environment(\.colorScheme) private var colorScheme
+    let action: () -> Void
     @State private var isHovered = false
 
     var body: some View {
         let c = languageStore.copy
-        return HStack(spacing: 10) {
-            Image(systemName: profile.role == .manager ? "person.crop.circle.fill" : "person.crop.circle")
-                .foregroundStyle(profile.role == .manager ? .orange : .secondary)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(profile.name).font(.system(size: 13, weight: .medium))
-                Text(summary(c: c)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: "person.badge.plus")
+                    .font(.system(size: 14))
+                Text(c.addMember)
+                    .font(.system(size: 14, weight: .medium))
             }
-            Spacer()
-            Text(profile.enabled ? c.enabledBadge : c.disabledBadge)
-                .font(.caption2).foregroundStyle(profile.enabled ? .green : .secondary)
-            if isHovered {
-                Button(action: edit) {
-                    Image(systemName: "pencil").foregroundStyle(.secondary)
-                }.buttonStyle(.plain).hoverHighlight().help(c.editAgent)
-            }
+            .foregroundStyle(isHovered ? .orange : .secondary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 14)
         }
-        .padding(10)
-        .background(Color.primary.opacity(isHovered ? 0.22 : 0.16))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .buttonStyle(.plain)
+        .background(Color.white.opacity(colorScheme == .light ? 1.0 : 0.0))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(style: StrokeStyle(lineWidth: 1, dash: [5, 4]))
+                .foregroundColor(isHovered ? .orange : Color.primary.opacity(colorScheme == .light ? 0.2 : 0.3))
+        )
+        .onHover { isHovered = $0 }
+    }
+}
+
+private struct AgentSummaryRow: View {
+    @EnvironmentObject private var languageStore: LanguageStore
+    @Environment(\.colorScheme) private var colorScheme
+    let profile: MothxAgentProfile
+    let edit: () -> Void
+    @State private var isHovered = false
+
+    private var cardBackground: Color {
+        colorScheme == .light ? .white : Color(nsColor: .underPageBackgroundColor)
+    }
+
+    var body: some View {
+        let c = languageStore.copy
+        return Button(action: edit) {
+            HStack(spacing: 14) {
+                // Circular icon with colored background
+                ZStack {
+                    Circle()
+                        .fill(profile.role == .manager ? Color.orange.opacity(0.12) : Color.primary.opacity(0.08))
+                        .frame(width: 40, height: 40)
+                    Image(systemName: profile.role == .manager ? "person.crop.circle.fill" : "person.crop.circle")
+                        .font(.system(size: 18))
+                        .foregroundStyle(profile.role == .manager ? .orange : .secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(profile.name)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.primary)
+                    Text(summary(c: c))
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer()
+
+                // Status badge
+                Text(profile.enabled ? c.enabledBadge : c.disabledBadge)
+                    .font(.system(size: 11, weight: .medium))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 3)
+                    .background(profile.enabled ? Color.green.opacity(0.14) : Color.primary.opacity(0.08))
+                    .foregroundStyle(profile.enabled ? .green : .secondary)
+                    .clipShape(Capsule())
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .background(cardBackground)
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(Color.primary.opacity(colorScheme == .light ? 0.12 : 0.1), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
         .onHover { isHovered = $0 }
     }
 
@@ -216,132 +277,182 @@ struct AgentEditorSheet: View {
                 Button(c.saveAgent) { save() }.buttonStyle(.borderedProminent).tint(.orange).disabled(profile.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || profile.providerID.isEmpty || profile.modelID.isEmpty)
             }
             ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    SettingsField(title: c.agentName, text: $profile.name)
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(c.agentSummary).font(.caption).foregroundStyle(.secondary)
-                        TextEditor(text: $profile.summary)
-                            .font(.system(size: 13))
-                            .scrollContentBackground(.hidden)
-                            .frame(minHeight: 54, maxHeight: 90)
-                            .padding(8)
-                            .background(Color.primary.opacity(0.18))
-                            .clipShape(RoundedRectangle(cornerRadius: 6))
-                            .overlay(alignment: .topLeading) {
-                                if profile.summary.isEmpty {
-                                    Text(c.agentSummaryPlaceholder).font(.system(size: 13)).foregroundStyle(.tertiary).padding(.horizontal, 12).padding(.vertical, 10).allowsHitTesting(false)
-                                }
-                            }
-                    }
-                    HStack {
-                        Text(c.agentRole).frame(width: 150, alignment: .leading)
-                        Picker(c.agentRole, selection: $profile.role) {
-                            Text(c.roleManager).tag(MothxAgentRole.manager)
-                            Text(c.roleMember).tag(MothxAgentRole.member)
-                        }
-                        .labelsHidden()
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .disabled(profile.role == .manager)
-                    }
-                    .padding(10)
-                    .background(Color.primary.opacity(0.18))
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                VStack(alignment: .leading, spacing: 16) {
+                    // MARK: - 基本信息
+                    VStack(alignment: .leading, spacing: 10) {
+                        SettingsField(title: c.agentName, text: $profile.name)
 
-                    HStack(alignment: .top, spacing: 12) {
-                        VStack(alignment: .leading, spacing: 7) {
-                            Text(c.agentProvider).font(.caption).foregroundStyle(.secondary)
-                            Picker(c.agentProvider, selection: $profile.providerID) {
-                                Text(c.defaultProviderLabel).tag("")
-                                ForEach(providerIDs, id: \.self) { Text($0).tag($0) }
-                            }
-                            .labelsHidden()
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        VStack(alignment: .leading, spacing: 7) {
-                            Text(c.agentModel).font(.caption).foregroundStyle(.secondary)
-                            Picker(c.agentModel, selection: $profile.modelID) {
-                                Text(c.defaultProviderLabel).tag("")
-                                ForEach(models) { model in Text(model.displayName).tag(model.id) }
-                            }
-                            .labelsHidden()
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .disabled(models.isEmpty || profile.providerID.isEmpty)
-                        }
-                    }
-                    .onChange(of: profile.providerID) { _, newID in
-                        guard let provider = mothx.providers.first(where: { $0.id == newID }) else {
-                            profile.modelID = ""
-                            return
-                        }
-                        if !provider.models.contains(where: { $0.id == profile.modelID }) {
-                            profile.modelID = provider.models.first?.id ?? ""
-                        }
-                    }
-
-                    HStack(spacing: 8) {
-                        SettingsField(title: c.agentWorkDir, text: $profile.workDir)
-                        Button(c.chooseDirectory) { chooseWorkDirectory() }.buttonStyle(.bordered)
-                    }
-
-                    HStack(spacing: 16) {
-                        Text(c.agentMode).font(.caption).foregroundStyle(.secondary)
-                        Picker(c.agentMode, selection: $profile.mode) {
-                            Text(c.agent).tag("agent")
-                            Text(c.plan).tag("plan")
-                            Text(c.yolo).tag("yolo")
-                        }
-                        .labelsHidden()
-                        .pickerStyle(.segmented)
-                        .frame(width: 240)
-                    }
-                    .padding(10)
-                    .background(Color.primary.opacity(0.18))
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-
-                    SettingsField(title: c.agentTools, text: $toolsText)
-                    SettingsField(title: c.agentSkills, text: $skillsText)
-
-                    HStack {
-                        Text(c.agentMaxIterations).frame(width: 150, alignment: .leading)
-                        TextField("", value: $profile.maxIterations, format: .number)
-                            .textFieldStyle(.plain)
-                            .frame(width: 120)
-                    }
-                    .padding(10)
-                    .background(Color.primary.opacity(0.18))
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-
-                    Toggle(c.agentEnabledTitle, isOn: $profile.enabled)
-                    Text(c.agentEnabledHint).font(.caption).foregroundStyle(.secondary)
-
-                    Divider()
-                    HStack {
-                        Text(c.testRunAgent).font(.headline)
-                        Spacer()
-                        Button {
-                            Task { await runTest() }
-                        } label: {
-                            Label(isTesting ? c.testRunInProgress : c.testRunAgent, systemImage: "play")
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.orange)
-                        .disabled(isTesting || profile.providerID.isEmpty || profile.modelID.isEmpty)
-                    }
-                    if let testError {
-                        Text(testError).font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
-                    }
-                    if let testResult {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text(c.testRunResultTitle).font(.caption).foregroundStyle(.secondary)
-                            ScrollView {
-                                Text(testResult).font(.callout).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                            Text(c.agentSummary).font(.caption).foregroundStyle(.secondary)
+                            TextEditor(text: $profile.summary)
+                                .font(.system(size: 13))
+                                .scrollContentBackground(.hidden)
+                                .frame(minHeight: 54, maxHeight: 90)
+                                .padding(8)
+                                .background(Color.white)
+                                .clipShape(RoundedRectangle(cornerRadius: 6))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .stroke(Color.primary.opacity(0.14), lineWidth: 1)
+                                )
+                                .overlay(alignment: .topLeading) {
+                                    if profile.summary.isEmpty {
+                                        Text(c.agentSummaryPlaceholder).font(.system(size: 13)).foregroundStyle(.tertiary).padding(.horizontal, 12).padding(.vertical, 10).allowsHitTesting(false)
+                                    }
+                                }
+                        }
+
+                        HStack {
+                            Text(c.agentRole).frame(width: 150, alignment: .leading)
+                            Picker(c.agentRole, selection: $profile.role) {
+                                Text(c.roleManager).tag(MothxAgentRole.manager)
+                                Text(c.roleMember).tag(MothxAgentRole.member)
                             }
-                            .frame(maxHeight: 180)
-                            .padding(10)
-                            .background(Color.primary.opacity(0.06))
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            .labelsHidden()
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .disabled(profile.role == .manager)
+                        }
+                        .padding(10)
+                        .background(Color.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(Color.primary.opacity(0.14), lineWidth: 1)
+                        )
+                    }
+
+                    // MARK: - Provider / Model
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(alignment: .top, spacing: 12) {
+                            VStack(alignment: .leading, spacing: 7) {
+                                Text(c.agentProvider).font(.caption).foregroundStyle(.secondary)
+                                Picker(c.agentProvider, selection: $profile.providerID) {
+                                    Text(c.defaultProviderLabel).tag("")
+                                    ForEach(providerIDs, id: \.self) { Text($0).tag($0) }
+                                }
+                                .labelsHidden()
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            VStack(alignment: .leading, spacing: 7) {
+                                Text(c.agentModel).font(.caption).foregroundStyle(.secondary)
+                                Picker(c.agentModel, selection: $profile.modelID) {
+                                    Text(c.defaultProviderLabel).tag("")
+                                    ForEach(models) { model in Text(model.displayName).tag(model.id) }
+                                }
+                                .labelsHidden()
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .disabled(models.isEmpty || profile.providerID.isEmpty)
+                            }
+                        }
+                        .onChange(of: profile.providerID) { _, newID in
+                            guard let provider = mothx.providers.first(where: { $0.id == newID }) else {
+                                profile.modelID = ""
+                                return
+                            }
+                            if !provider.models.contains(where: { $0.id == profile.modelID }) {
+                                profile.modelID = provider.models.first?.id ?? ""
+                            }
+                        }
+
+                        HStack(spacing: 8) {
+                            SettingsField(title: c.agentWorkDir, text: $profile.workDir)
+                            Button(c.chooseDirectory) { chooseWorkDirectory() }.buttonStyle(.bordered)
+                        }
+
+                        HStack(spacing: 16) {
+                            Text(c.agentMode).font(.caption).foregroundStyle(.secondary)
+                            Picker(c.agentMode, selection: $profile.mode) {
+                                Text(c.agent).tag("agent")
+                                Text(c.plan).tag("plan")
+                                Text(c.yolo).tag("yolo")
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.segmented)
+                            .frame(width: 240)
+                        }
+                        .padding(10)
+                        .background(Color.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(Color.primary.opacity(0.14), lineWidth: 1)
+                        )
+                    }
+                    .padding(16)
+                    .background(Color.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+                    )
+
+                    // MARK: - 工具与配置
+                    VStack(alignment: .leading, spacing: 10) {
+                        SettingsField(title: c.agentTools, text: $toolsText)
+                        SettingsField(title: c.agentSkills, text: $skillsText)
+
+                        HStack {
+                            Text(c.agentMaxIterations).frame(width: 150, alignment: .leading)
+                            TextField("", value: $profile.maxIterations, format: .number)
+                                .textFieldStyle(.plain)
+                                .frame(width: 120)
+                        }
+                        .padding(10)
+                        .background(Color.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(Color.primary.opacity(0.14), lineWidth: 1)
+                        )
+
+                        Toggle(c.agentEnabledTitle, isOn: $profile.enabled)
+                        Text(c.agentEnabledHint).font(.caption).foregroundStyle(.secondary)
+                    }
+                    .padding(16)
+                    .background(Color.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+                    )
+
+                    // MARK: - 测试运行
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Text(c.testRunAgent).font(.headline)
+                            Spacer()
+                            Button {
+                                Task { await runTest() }
+                            } label: {
+                                Label(isTesting ? c.testRunInProgress : c.testRunAgent, systemImage: "play")
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.orange)
+                            .disabled(isTesting || profile.providerID.isEmpty || profile.modelID.isEmpty)
+                        }
+                        if let testError {
+                            Text(testError).font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+                        }
+                        if let testResult {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(c.testRunResultTitle).font(.caption).foregroundStyle(.secondary)
+                                ScrollView {
+                                    Text(testResult).font(.callout).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .frame(maxHeight: 180)
+                                .padding(10)
+                                .background(Color.primary.opacity(0.06))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                            }
                         }
                     }
+                    .padding(16)
+                    .background(Color.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+                    )
                 }
             }
         }

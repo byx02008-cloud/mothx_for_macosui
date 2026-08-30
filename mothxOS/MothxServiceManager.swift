@@ -9,6 +9,7 @@ struct MothxToolResultDetail: Decodable {
     let isError: Bool
     let oldText: String?
     let newText: String?
+    let imagePreviews: [MothxImagePreview]
 
     private struct DiffPayload: Decodable {
         let oldText: String?
@@ -40,13 +41,14 @@ struct MothxToolResultDetail: Decodable {
         case toolDiffSnake = "tool_diff"
     }
 
-    init(toolCallID: String, toolName: String?, content: String, isError: Bool, oldText: String?, newText: String?) {
+    init(toolCallID: String, toolName: String?, content: String, isError: Bool, oldText: String?, newText: String?, imagePreviews: [MothxImagePreview] = []) {
         self.toolCallID = toolCallID
         self.toolName = toolName
         self.content = content
         self.isError = isError
         self.oldText = oldText
         self.newText = newText
+        self.imagePreviews = imagePreviews
     }
 
     init(from decoder: Decoder) throws {
@@ -69,6 +71,7 @@ struct MothxToolResultDetail: Decodable {
         newText = try container.decodeIfPresent(String.self, forKey: .newText)
             ?? container.decodeIfPresent(String.self, forKey: .newTextSnake)
             ?? diff?.newText
+        imagePreviews = []
     }
 }
 
@@ -140,6 +143,16 @@ struct MothxSessionMetrics: Equatable, Sendable {
     }
 }
 
+struct MothxImageRecognitionProgress: Equatable, Sendable {
+    var isVisible = false
+    var sessionID = ""
+    var provider = ""
+    var model = ""
+    var status = ""
+    var result = ""
+    var isError = false
+}
+
 final class MothxServiceManager: ObservableObject {
     enum State: Equatable {
         case checking
@@ -161,6 +174,8 @@ final class MothxServiceManager: ObservableObject {
     @Published private(set) var skillsDir = ""
     @Published private(set) var sessionDir = ""
     @Published private(set) var imageGeneration = MothxImageGenerationConfig()
+    @Published private(set) var imageRecognition = MothxImageRecognitionConfig()
+    @Published private(set) var imageRecognitionProgress = MothxImageRecognitionProgress()
     @Published private(set) var projects: [MothxProject] = []
     @Published private(set) var sessions: [MothxSession] = []
     @Published private(set) var workspaceSyncState: WorkspaceSyncState = .pending
@@ -243,7 +258,12 @@ final class MothxServiceManager: ObservableObject {
 
     private var copy: Copy { Copy(resolvedLanguage: languageStore?.language ?? AppLanguage.resolve(setting: "auto")) }
 
+    private static let imageRecognitionDefaultsKey = "mothxOS.imageRecognition"
+    private static let imageGenerationDefaultsKey = "mothxOS.imageGeneration"
+
     init() {
+        imageGeneration = Self.loadImageGenerationConfig()
+        imageRecognition = Self.loadImageRecognitionConfig()
         let stored = changeStore.load()
         changesByRun = stored.turns
         fileChangesByRun = stored.turns.mapValues { turn in
@@ -523,7 +543,18 @@ final class MothxServiceManager: ObservableObject {
             tuilang = root["tuilang"] as? String ?? "auto"
             skillsDir = root["skillsDir"] as? String ?? ""
             sessionDir = root["sessionDir"] as? String ?? ""
-            imageGeneration = decodeImageGeneration(object: root["imageGeneration"] as? [String: Any])
+            // Image generation routing is app-owned, just like image
+            // recognition routing. The server's legacy imageGeneration
+            // object may still be present in rawSettings and is deliberately
+            // left untouched, but it no longer supplies credentials or a
+            // second model selection UI.
+            if !Self.hasStoredImageGenerationConfig,
+               let legacy = decodeLegacyImageGeneration(object: root["imageGeneration"] as? [String: Any]),
+               !legacy.providerID.isEmpty,
+               !legacy.modelID.isEmpty {
+                imageGeneration = legacy
+                persistImageGeneration(legacy)
+            }
             if providers.isEmpty && !providerObjects.isEmpty {
                 throw SettingsLoadError.noProvidersDecoded
             }
@@ -886,7 +917,7 @@ final class MothxServiceManager: ObservableObject {
         recordRuntimeLog("messages", "load start session=\(sessionID)")
         do {
             let data = try await request(path: "api/sessions/\(sessionID)/messages?limit=200", method: "GET")
-            let messages = decodeMessages(data)
+            let messages = decodeMessages(data, sessionID: sessionID)
             recordRuntimeLog("messages", "load complete session=\(sessionID) count=\(messages.count) bytes=\(data.count) elapsedMs=\(Int(Date().timeIntervalSince(started) * 1000))")
             messagesBySession[sessionID] = messages
             await loadHistoricalRuns(sessionID: sessionID, messages: messages)
@@ -923,6 +954,7 @@ final class MothxServiceManager: ObservableObject {
         do {
             let data = try await request(path: "api/sessions/\(escapedSession)/tool-results/\(escapedCall)", method: "GET")
             let decoded = try JSONDecoder().decode(MothxToolResultDetail.self, from: data)
+            let rawObject = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
             recordRuntimeLog("tool-detail", "load complete session=\(sessionID) call=\(toolCallID) bytes=\(data.count) elapsedMs=\(Int(Date().timeIntervalSince(started) * 1000))")
             return MothxToolResultDetail(
                 toolCallID: decoded.toolCallID,
@@ -930,7 +962,8 @@ final class MothxServiceManager: ObservableObject {
                 content: boundedToolDetail(decoded.content),
                 isError: decoded.isError,
                 oldText: decoded.oldText,
-                newText: decoded.newText
+                newText: decoded.newText,
+                imagePreviews: decodeImagePreviews(rawObject, sessionID: sessionID)
             )
         } catch {
             recordRuntimeLog("tool-detail", "load failed session=\(sessionID) call=\(toolCallID) elapsedMs=\(Int(Date().timeIntervalSince(started) * 1000)) error=\(describe(error))")
@@ -1421,9 +1454,11 @@ final class MothxServiceManager: ObservableObject {
         return nil
     }
 
-    func submitRun(sessionID: String, message: String, images: [String], workDir: String = "", provider: String = "", model: String = "", mode: String = "agent", tools: [String] = [], skills: [String] = []) async -> String? {
+    func submitRun(sessionID: String, message: String, images: [String], workDir: String = "", provider: String = "", model: String = "", mode: String = "agent", tools: [String] = [], skills: [String] = [], forceServe: Bool = false) async -> String? {
         guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !images.isEmpty else { return nil }
+        clearImageRecognitionProgress()
         if preferredAgentTransport == .acp,
+           !forceServe,
            pendingSessions[sessionID] == nil,
            images.isEmpty,
            skills.isEmpty {
@@ -1512,6 +1547,180 @@ final class MothxServiceManager: ObservableObject {
             settingsError = copy.submitRunFailedPrefix(describe(error))
             return nil
         }
+    }
+
+    /// Runs the configured vision model in an isolated, disposable Serve
+    /// session. This deliberately does not use submitRun/pollRun because
+    /// those methods publish state for the visible conversation.
+    func recognizeImages(images: [String], provider: String, model: String, workDir: String, sessionID: String = "") async throws -> String {
+        guard !images.isEmpty else { throw ImageRecognitionError.noImages }
+        guard !provider.isEmpty, !model.isEmpty else { throw ImageRecognitionError.notConfigured }
+
+        imageRecognitionProgress = MothxImageRecognitionProgress(
+            isVisible: true,
+            sessionID: sessionID,
+            provider: provider,
+            model: model,
+            status: "正在准备图片识别 Agent…",
+            result: "",
+            isError: false
+        )
+
+        // The Serve admission check uses the model's persisted `input` list,
+        // while many provider model catalogs omit or misreport image support.
+        // A model explicitly selected by the user as the vision model is an
+        // intentional capability override. Persist `image` for that model so
+        // the vision Run is not rejected before the provider is contacted.
+        do {
+            imageRecognitionProgress.status = "正在确认识别模型配置…"
+            try await ensureVisionModelAcceptsImages(providerID: provider, modelID: model)
+        } catch {
+            updateImageRecognitionFailure(error)
+            throw error
+        }
+
+        let temporarySessionID: String
+        do {
+            let sessionData = try await request(path: "api/session-id", method: "POST")
+            guard let sessionObject = try JSONSerialization.jsonObject(with: sessionData) as? [String: Any],
+                  let sessionID = sessionObject["sessionId"] as? String,
+                  !sessionID.isEmpty else {
+                throw ImageRecognitionError.invalidSessionResponse
+            }
+            temporarySessionID = sessionID
+        } catch {
+            updateImageRecognitionFailure(error)
+            throw error
+        }
+
+        imageRecognitionProgress.status = "正在调用 \(provider)/\(model) 识别图片…"
+        recordRuntimeLog("image-recognition", "start provider=\(provider) model=\(model) images=\(images.count)")
+        do {
+            defer {
+                Task { [weak self] in
+                    guard let self else { return }
+                    try? await self.request(path: "api/sessions/\(temporarySessionID)", method: "DELETE")
+                }
+            }
+
+            let payload: [String: Any] = [
+                "message": "请详细识别图片内容，包括文字（OCR）、布局、关键对象、图表/代码结构、可执行信息和不确定之处。只返回供另一个 Agent 使用的客观识别结果。",
+                "provider": provider,
+                "model": model,
+                "mode": "yolo",
+                "tools": [],
+                "skills": [],
+                "images": images,
+                "transcript": false,
+                "workDir": workDir
+            ]
+            let body = try jsonData(payload)
+            let response = try await request(
+                path: "api/sessions/\(temporarySessionID)/runs",
+                method: "POST",
+                body: body,
+                headers: ["Idempotency-Key": UUID().uuidString]
+            )
+            guard let responseObject = try JSONSerialization.jsonObject(with: response) as? [String: Any],
+                  let runID = (responseObject["runId"] as? String) ?? (responseObject["runID"] as? String),
+                  !runID.isEmpty else {
+                throw ImageRecognitionError.noRunID
+            }
+
+            imageRecognitionProgress.status = "识别 Agent 运行中（Run \(runID.prefix(12))…）"
+
+            var terminalStatus = ""
+            var lastRunObject: [String: Any] = [:]
+            while !Task.isCancelled {
+                let runData = try await request(path: "api/runs/\(runID)", method: "GET")
+                let runObject = (try JSONSerialization.jsonObject(with: runData) as? [String: Any]) ?? [:]
+                lastRunObject = runObject
+                terminalStatus = (runObject["status"] as? String) ?? (runObject["state"] as? String) ?? "running"
+                imageRecognitionProgress.status = "识别 Agent：\(terminalStatus)"
+                let normalized = terminalStatus.lowercased()
+                if ["completed", "succeeded", "failed", "error", "cancelled", "canceled", "timed_out", "timeout", "expired", "incomplete"].contains(normalized) {
+                    if ["failed", "error", "timed_out", "timeout", "expired", "incomplete", "cancelled", "canceled"].contains(normalized) {
+                        let detail = (runObject["error"] as? String) ?? (runObject["errorMessage"] as? String) ?? terminalStatus
+                        throw ImageRecognitionError.runFailed(detail)
+                    }
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(500))
+            }
+
+            let messagesData = try await request(path: "api/sessions/\(temporarySessionID)/messages?limit=200", method: "GET")
+            let object = try JSONSerialization.jsonObject(with: messagesData)
+            let values: [[String: Any]]
+            if let direct = object as? [[String: Any]] {
+                values = direct
+            } else {
+                values = (object as? [String: Any])?["messages"] as? [[String: Any]] ?? []
+            }
+            let texts = values.compactMap { item -> String? in
+                guard (item["role"] as? String) == "assistant" else { return nil }
+                let text = (item["content"] as? String) ?? (item["text"] as? String) ?? ""
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }
+            guard !texts.isEmpty else {
+                let status = terminalStatus.isEmpty ? ((lastRunObject["status"] as? String) ?? "completed") : terminalStatus
+                throw ImageRecognitionError.emptyResult(status)
+            }
+            let result = texts.joined(separator: "\n\n")
+            imageRecognitionProgress.status = "识别完成，正在启动主会话…"
+            imageRecognitionProgress.result = result
+            recordRuntimeLog("image-recognition", "completed provider=\(provider) model=\(model) chars=\(result.count)")
+            return result
+        } catch {
+            updateImageRecognitionFailure(error)
+            recordRuntimeLog("image-recognition", "failed provider=\(provider) model=\(model) error=\(error.localizedDescription)")
+            throw error
+        }
+    }
+
+    func clearImageRecognitionProgress() {
+        imageRecognitionProgress = MothxImageRecognitionProgress()
+    }
+
+    private func updateImageRecognitionFailure(_ error: Error) {
+        imageRecognitionProgress.status = "图片识别失败"
+        imageRecognitionProgress.result = error.localizedDescription
+        imageRecognitionProgress.isError = true
+    }
+
+    private func ensureVisionModelAcceptsImages(providerID: String, modelID: String) async throws {
+        guard let provider = providers.first(where: { $0.id == providerID }),
+              let model = provider.models.first(where: { $0.id == modelID }) else {
+            throw ImageRecognitionError.modelNotFound(providerID, modelID)
+        }
+        guard !model.input.contains(where: { $0.caseInsensitiveCompare("image") == .orderedSame }) else { return }
+
+        // Start from the raw settings object so provider fields not modeled by
+        // the client survive the capability correction.
+        var providerJSON = ((rawSettings["providers"] as? [String: Any])?[providerID] as? [String: Any]) ?? [:]
+        if providerJSON.isEmpty {
+            providerJSON = try jsonDictionary(provider)
+        }
+        guard var modelObjects = providerJSON["models"] as? [[String: Any]],
+              let index = modelObjects.firstIndex(where: { ($0["id"] as? String) == modelID }) else {
+            throw ImageRecognitionError.modelNotFound(providerID, modelID)
+        }
+        var modelJSON = modelObjects[index]
+        var input = (modelJSON["input"] as? [String]) ?? ["text"]
+        if !input.contains(where: { $0.caseInsensitiveCompare("image") == .orderedSame }) {
+            input.append("image")
+        }
+        modelJSON["input"] = input
+        modelObjects[index] = modelJSON
+        providerJSON["models"] = modelObjects
+
+        var providersJSON = (rawSettings["providers"] as? [String: Any]) ?? [:]
+        providersJSON[providerID] = providerJSON
+        rawSettings["providers"] = providersJSON
+        let data = try JSONSerialization.data(withJSONObject: rawSettings)
+        _ = try await request(path: "api/settings", method: "PUT", body: data)
+        await loadSettings()
+        recordRuntimeLog("image-recognition", "marked provider=\(providerID) model=\(modelID) input=image")
     }
 
     func cancelRun() async {
@@ -2522,7 +2731,7 @@ final class MothxServiceManager: ObservableObject {
         return formatter.date(from: value)
     }
 
-    private func decodeMessages(_ data: Data) -> [MothxMessage] {
+    private func decodeMessages(_ data: Data, sessionID: String = "") -> [MothxMessage] {
         guard let object = try? JSONSerialization.jsonObject(with: data) else { return [] }
         let values: [[String: Any]]
         if let direct = object as? [[String: Any]] { values = direct }
@@ -2539,6 +2748,7 @@ final class MothxServiceManager: ObservableObject {
             var plan: MothxPlan?
             let summary: String?
             let hasDetail: Bool
+            let imagePreviews = decodeImagePreviews(item, sessionID: sessionID)
 
             switch role {
             case "toolCall":
@@ -2577,6 +2787,43 @@ final class MothxServiceManager: ObservableObject {
                 hasDetail = false
             }
 
+            var combinedPreviews = imagePreviews
+            // `publish_artifact` stores its tool name separately from the
+            // JSON arguments. Resolve the relative `path` against this
+            // session's work directory while the session context is known.
+            if role == "toolCall" {
+                for candidate in MothxImagePreview.publishArtifactPreviews(
+                    toolName: toolName,
+                    arguments: arguments,
+                    workDirectory: workDir(for: sessionID)
+                ) where !combinedPreviews.contains(where: { $0.source == candidate.source }) {
+                    combinedPreviews.append(candidate)
+                }
+            }
+            // Assistant/user replies frequently reference locally generated
+            // images as Markdown, e.g. `![图表](outputs/chart.png)`, or as
+            // `publish_artifact <path>` lines. Surface those as clickable
+            // previews too, deduplicated against the structured attachment
+            // previews above.
+            if role != "toolCall", role != "toolResult",
+               !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                for candidates in [markdownImagePreviews(from: content, sessionID: sessionID),
+                                   publishArtifactImagePreviews(from: content, sessionID: sessionID)] {
+                    for candidate in candidates where !combinedPreviews.contains(where: { $0.source == candidate.source }) {
+                        combinedPreviews.append(candidate)
+                    }
+                }
+            }
+            // Tool results publish generated files with the same notation, e.g.
+            // `publish_artifact uploadimg/midautumn/20260830_200215_1.png`; keep
+            // those visible in the process area of the same turn.
+            if role == "toolResult", let summary, !summary.isEmpty {
+                for candidate in publishArtifactImagePreviews(from: summary, sessionID: sessionID)
+                    where !combinedPreviews.contains(where: { $0.source == candidate.source }) {
+                    combinedPreviews.append(candidate)
+                }
+            }
+
             return MothxMessage(
                 id: id, seq: seq, role: role,
                 content: content, toolCallId: toolCallId,
@@ -2586,12 +2833,113 @@ final class MothxServiceManager: ObservableObject {
                 createdAt: (item["createdAt"] as? String)
                     ?? (item["created_at"] as? String)
                     ?? (item["timestamp"] as? String)
-                    ?? (item["createdAt"] as? NSNumber).map { ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: $0.doubleValue)) }
+                    ?? (item["createdAt"] as? NSNumber).map { ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: $0.doubleValue)) },
+                imagePreviews: combinedPreviews
             )
         }.filter { msg in
             if msg.isToolCall || msg.isToolResult { return true }
-            return !msg.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            return !msg.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !msg.imagePreviews.isEmpty
         }
+    }
+
+    /// Extracts local image references written as Markdown images
+    /// (`![alt](path)`) from message text so they appear as clickable
+    /// previews in the conversation. Only sources that resolve to an existing
+    /// file on disk are included; remote URLs and data URLs are not treated
+    /// as locally generated images here.
+    private func markdownImagePreviews(from text: String, sessionID: String) -> [MothxImagePreview] {
+        let pattern = #"!\[[^\]]*\]\(\s*([^)\s]+)\s*\)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(text.startIndex..., in: text)
+        let workDir = workDir(for: sessionID)
+        var previews: [MothxImagePreview] = []
+        var index = 0
+        for match in regex.matches(in: text, range: range) {
+            guard match.numberOfRanges > 1,
+                  let urlRange = Range(match.range(at: 1), in: text) else { continue }
+            let raw = String(text[urlRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !raw.isEmpty,
+                  let url = MothxImagePreview.resolvedFileURL(for: raw, workDirectory: workDir) else { continue }
+            previews.append(MothxImagePreview(
+                id: "markdown-\(index)-\(UUID().uuidString)",
+                source: url.path,
+                mediaType: "image/png",
+                name: url.lastPathComponent
+            ))
+            index += 1
+        }
+        return previews
+    }
+
+    /// Extracts locally published image files (`publish_artifact <path>`)
+    /// from text, resolving relative paths against the session work
+    /// directory. Only existing image files are included.
+    private func publishArtifactImagePreviews(from text: String, sessionID: String) -> [MothxImagePreview] {
+        MothxImagePreview.publishArtifactPreviews(from: text, workDirectory: workDir(for: sessionID))
+    }
+
+    private func decodeImagePreviews(_ item: [String: Any], sessionID: String = "") -> [MothxImagePreview] {
+        var previews: [MothxImagePreview] = []
+        var index = 0
+
+        if let contents = item["contents"] as? [[String: Any]] {
+            for block in contents where (block["type"] as? String)?.lowercased() == "image" {
+                let image = (block["image"] as? [String: Any]) ?? block
+                let mimeType = (image["mimeType"] as? String) ?? (image["mediaType"] as? String) ?? "image/png"
+                if let data = image["data"] as? String, !data.isEmpty {
+                    previews.append(MothxImagePreview(
+                        id: "content-\(index)-\(item["id"] as? String ?? UUID().uuidString)",
+                        source: data.hasPrefix("data:") ? data : "data:\(mimeType);base64,\(data)",
+                        mediaType: mimeType,
+                        name: image["filename"] as? String
+                    ))
+                    index += 1
+                } else if let url = (image["url"] as? String) ?? (image["source"] as? String), !url.isEmpty {
+                    previews.append(MothxImagePreview(
+                        id: "content-\(index)-\(item["id"] as? String ?? UUID().uuidString)",
+                        source: normalizedImageSource(url, sessionID: sessionID),
+                        mediaType: mimeType,
+                        name: image["filename"] as? String
+                    ))
+                    index += 1
+                }
+            }
+        }
+
+        if let attachments = item["attachments"] as? [[String: Any]] {
+            for attachment in attachments where (attachment["kind"] as? String)?.lowercased() == "image" {
+                guard let url = attachment["url"] as? String, !url.isEmpty else { continue }
+                let normalized = normalizedImageSource(url, sessionID: sessionID)
+                if previews.contains(where: { $0.source == normalized }) { continue }
+                previews.append(MothxImagePreview(
+                    id: "attachment-\(index)-\(item["id"] as? String ?? UUID().uuidString)",
+                    source: normalized,
+                    mediaType: attachment["mediaType"] as? String ?? "image/png",
+                    name: attachment["name"] as? String
+                ))
+                index += 1
+            }
+        }
+        return previews
+    }
+
+    /// Normalizes an image preview URL/path returned by the server into a
+    /// form the preview UI can load directly:
+    /// - `file://` URLs become absolute file paths;
+    /// - relative paths are resolved against the session's working directory;
+    /// - `data:` and `http(s)` sources pass through unchanged.
+    private func normalizedImageSource(_ source: String, sessionID: String) -> String {
+        if source.hasPrefix("data:") || source.hasPrefix("http://") || source.hasPrefix("https://") {
+            return source
+        }
+        var path = source
+        if path.hasPrefix("file://"), let url = URL(string: path) {
+            path = url.path
+        }
+        if path.hasPrefix("/") { return path }
+        let workDir = workDir(for: sessionID)
+        guard !workDir.isEmpty else { return source }
+        return URL(fileURLWithPath: workDir).appendingPathComponent(path).path
     }
 
     func setSessionProvider(_ provider: String, for sessionID: String) {
@@ -2738,15 +3086,17 @@ final class MothxServiceManager: ObservableObject {
         await saveGlobalSettings(["skillsDir": skillsDir, "sessionDir": sessionDir])
     }
 
-    func saveImageGeneration(_ config: MothxImageGenerationConfig) async {
-        var imageJSON = (rawSettings["imageGeneration"] as? [String: Any]) ?? [:]
-        imageJSON["enabled"] = config.enabled
-        imageJSON["provider"] = config.provider
-        imageJSON["apiType"] = config.apiType
-        imageJSON["baseUrl"] = config.baseUrl
-        imageJSON["token"] = config.token
-        imageJSON["model"] = config.model
-        await saveGlobalSettings(["imageGeneration": imageJSON])
+    func saveImageGeneration(_ config: MothxImageGenerationConfig) {
+        imageGeneration = config
+        persistImageGeneration(config)
+    }
+
+    /// Persists only the selected provider/model locally. The credentials and
+    /// provider definition continue to be owned by mothx's settings document.
+    func saveImageRecognition(_ config: MothxImageRecognitionConfig) {
+        imageRecognition = config
+        guard let data = try? JSONEncoder().encode(config) else { return }
+        UserDefaults.standard.set(data, forKey: Self.imageRecognitionDefaultsKey)
     }
 
     func deleteProvider(id: String) async {
@@ -2787,10 +3137,46 @@ final class MothxServiceManager: ObservableObject {
         do {
             let body = try jsonData(["api": provider.api, "baseUrl": provider.baseUrl, "apiKey": provider.apiKey, "httpProxy": provider.httpProxy, "forceHTTP11": provider.forceHTTP11, "headers": provider.headers])
             let data = try await request(path: "api/provider/models", method: "POST", body: body)
-            return decodeDiscoveredModels(data)
+            let discovered = decodeDiscoveredModels(data)
+            // Most OpenAI-compatible /models endpoints only return IDs and
+            // names. Keep the values already configured for matching models
+            // when the probe cannot provide context/output limits, otherwise
+            // a refresh silently turns known values into zero.
+            return mergeDiscoveredModels(discovered, with: provider.models)
         } catch {
             settingsError = copy.discoverModelsFailedPrefix(describe(error))
             return []
+        }
+    }
+
+    private func mergeDiscoveredModels(
+        _ discovered: [MothxModelConfig],
+        with existing: [MothxModelConfig]
+    ) -> [MothxModelConfig] {
+        let existingByID = Dictionary(existing.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        return discovered.map { remote in
+            guard let previous = existingByID[remote.id] else { return remote }
+
+            var merged = remote
+            if merged.contextWindow <= 0 {
+                merged.contextWindow = previous.contextWindow
+            }
+            if merged.maxTokens <= 0 {
+                merged.maxTokens = previous.maxTokens
+            }
+            // The probe schema has no presence bit for optional capability
+            // flags. Preserve a previously enabled flag when the upstream
+            // response omits it, while still accepting an explicit true.
+            if !merged.reasoning, previous.reasoning {
+                merged.reasoning = true
+            }
+            if merged.input == ["text"], !previous.input.isEmpty {
+                merged.input = previous.input
+            }
+            if merged.name == merged.id, !previous.name.isEmpty {
+                merged.name = previous.name
+            }
+            return merged
         }
     }
 
@@ -2842,16 +3228,38 @@ final class MothxServiceManager: ObservableObject {
         return data
     }
 
-    private func decodeImageGeneration(object: [String: Any]?) -> MothxImageGenerationConfig {
-        guard let object else { return MothxImageGenerationConfig() }
+    private func decodeLegacyImageGeneration(object: [String: Any]?) -> MothxImageGenerationConfig? {
+        guard let object else { return nil }
         return MothxImageGenerationConfig(
             enabled: object["enabled"] as? Bool ?? false,
-            provider: object["provider"] as? String ?? "openai",
-            apiType: object["apiType"] as? String ?? "openai-images",
-            baseUrl: object["baseUrl"] as? String ?? "https://api.openai.com/v1",
-            token: object["token"] as? String ?? "",
-            model: object["model"] as? String ?? "gpt-image-1"
+            providerID: object["provider"] as? String ?? "",
+            modelID: object["model"] as? String ?? ""
         )
+    }
+
+    private static var hasStoredImageGenerationConfig: Bool {
+        UserDefaults.standard.data(forKey: imageGenerationDefaultsKey) != nil
+    }
+
+    private static func loadImageGenerationConfig() -> MothxImageGenerationConfig {
+        guard let data = UserDefaults.standard.data(forKey: imageGenerationDefaultsKey),
+              let config = try? JSONDecoder().decode(MothxImageGenerationConfig.self, from: data) else {
+            return MothxImageGenerationConfig()
+        }
+        return config
+    }
+
+    private func persistImageGeneration(_ config: MothxImageGenerationConfig) {
+        guard let data = try? JSONEncoder().encode(config) else { return }
+        UserDefaults.standard.set(data, forKey: Self.imageGenerationDefaultsKey)
+    }
+
+    private static func loadImageRecognitionConfig() -> MothxImageRecognitionConfig {
+        guard let data = UserDefaults.standard.data(forKey: imageRecognitionDefaultsKey),
+              let config = try? JSONDecoder().decode(MothxImageRecognitionConfig.self, from: data) else {
+            return MothxImageRecognitionConfig()
+        }
+        return config
     }
 
     private func decodeProvider(id: String, object: [String: Any]) -> MothxProviderConfig? {
@@ -3107,6 +3515,30 @@ private struct MothxAPIError: LocalizedError {
     let statusCode: Int
     let detail: String
     var errorDescription: String? { "HTTP \(statusCode)：\(detail)" }
+}
+
+private enum ImageRecognitionError: LocalizedError {
+    case noImages
+    case notConfigured
+    case invalidSessionResponse
+    case noRunID
+    case invalidMessagesResponse
+    case modelNotFound(String, String)
+    case emptyResult(String)
+    case runFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .noImages: return "没有可识别的图片"
+        case .notConfigured: return "尚未配置图片识别 Provider 和模型"
+        case .invalidSessionResponse: return "图片识别临时会话创建失败"
+        case .noRunID: return "图片识别接口没有返回 Run ID"
+        case .invalidMessagesResponse: return "图片识别结果格式无效"
+        case .modelNotFound(let provider, let model): return "图片识别模型不存在：\(provider)/\(model)"
+        case .emptyResult(let status): return "图片识别没有返回文字结果（状态：\(status)）"
+        case .runFailed(let detail): return "图片识别运行失败：\(detail)"
+        }
+    }
 }
 
 private enum WorkspaceError: LocalizedError {

@@ -9,6 +9,7 @@ struct TextMessageBubble: View {
     /// carries the completed assistant reply used as the API boundary.
     var onFork: (() -> Void)? = nil
     var isForking = false
+    var onPreviewImage: ((MothxImagePreview) -> Void)? = nil
 
     private var isUser: Bool { message.isUser }
 
@@ -41,6 +42,9 @@ struct TextMessageBubble: View {
                                 .textSelection(.enabled)
                                 .lineSpacing(4)
                                 .frame(maxWidth: 560, alignment: .leading)
+                        }
+                        if !message.imagePreviews.isEmpty {
+                            ImagePreviewStrip(images: message.imagePreviews, onSelect: onPreviewImage ?? { _ in })
                         }
                         if isTyping {
                             Rectangle().fill(Color.primary.opacity(0.6)).frame(width: 8, height: 16)
