@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import AppKit
 
 struct MothxToolResultDetail: Decodable {
     let toolCallID: String
@@ -126,6 +127,19 @@ private struct AnyCodableValue: Decodable {
     }
 }
 
+struct MothxSessionMetrics: Equatable, Sendable {
+    var contextUsedTokens: Int?
+    var contextWindowTokens: Int?
+    var cacheHitRate: Double?
+
+    var contextUsageRate: Double? {
+        guard let contextUsedTokens,
+              let contextWindowTokens,
+              contextWindowTokens > 0 else { return nil }
+        return min(1, max(0, Double(contextUsedTokens) / Double(contextWindowTokens)))
+    }
+}
+
 final class MothxServiceManager: ObservableObject {
     enum State: Equatable {
         case checking
@@ -160,13 +174,29 @@ final class MothxServiceManager: ObservableObject {
     @Published private(set) var runError: String?
     @Published private(set) var runStatus: String?
     @Published private(set) var runElapsed: TimeInterval = 0
-    /// Portion of the current run's input context served from the provider cache.
-    /// This is nil until the provider reports usage for the first turn.
-    @Published private(set) var runCacheHitRate: Double?
+    /// Last known context occupancy and cache hit rate for each session.
+    /// Keeping this state per session lets a reopened historical conversation
+    /// show the latest turn's metrics without borrowing data from another tab.
+    @Published private(set) var metricsBySession: [String: MothxSessionMetrics] = [:]
     @Published private(set) var runSessionID: String?
     @Published private(set) var runReplyMessageID: String?
     @Published var settingsError: String?
     private var rawSettings: [String: Any] = [:]
+
+    /// Thinking text is transient UI state. Keep only the tail so a long run
+    /// cannot grow an unbounded string while ACP or Serve streams deltas.
+    private static let maximumThinkingLines = 200
+
+    private func appendThinking(_ text: String, for sessionID: String) {
+        guard !text.isEmpty else { return }
+        let combined = thinkingBySession[sessionID, default: ""] + text
+        let lines = combined.split(separator: "\n", omittingEmptySubsequences: false)
+        if lines.count > Self.maximumThinkingLines {
+            thinkingBySession[sessionID] = lines.suffix(Self.maximumThinkingLines).map(String.init).joined(separator: "\n")
+        } else {
+            thinkingBySession[sessionID] = combined
+        }
+    }
     let baseURL = URL(string: "http://127.0.0.1:7872")!
     /// Browser links are derived from the same endpoint used for health checks
     /// and API requests, rather than maintaining a separate UI-only URL.
@@ -178,6 +208,7 @@ final class MothxServiceManager: ObservableObject {
     private var startupOutput = ""
     private var logStreamTask: Task<Void, Never>?
     private var runtimeHeartbeatTask: Task<Void, Never>?
+    private var runElapsedTask: Task<Void, Never>?
     private var logSocket: URLSessionWebSocketTask?
     private var runStartedAt: Date?
     private var runExistingMessageIDs: Set<String> = []
@@ -186,8 +217,14 @@ final class MothxServiceManager: ObservableObject {
     private var runEventStreamSessionID: String?
     private var runEventLastSeq: Int = 0
     private var monitoredRunIDs: Set<String> = []
+    private let acpClient = MothxACPClient()
+    private var activeAgentTransport: MothxAgentTransport = .serve
+    private var acpToolInputs: [String: [String: Any]] = [:]
+    private var acpToolNames: [String: String] = [:]
+    private var acpDurableRunID: String?
     private let changeStore = MothxChangeStore()
     private var fileChangesByRun: [String: [String: MothxFileChange]] = [:]
+    private var toolChangesByCall: [String: MothxToolChangeRecord] = [:]
     @Published private(set) var currentRunID: String?
     @Published private(set) var sessionModels: [String: String] = [:]
     @Published private(set) var sessionProviders: [String: String] = [:]
@@ -207,9 +244,15 @@ final class MothxServiceManager: ObservableObject {
     private var copy: Copy { Copy(resolvedLanguage: languageStore?.language ?? AppLanguage.resolve(setting: "auto")) }
 
     init() {
-        changesByRun = changeStore.load()
-        // Rewrite any legacy changes.json immediately without file contents.
-        changeStore.save(changesByRun)
+        let stored = changeStore.load()
+        changesByRun = stored.turns
+        fileChangesByRun = stored.turns.mapValues { turn in
+            Dictionary(uniqueKeysWithValues: turn.files.map { ($0.path, $0) })
+        }
+        toolChangesByCall = stored.toolChanges
+        // Rewrite legacy files into the versioned format. Legacy records remain
+        // preview-only because they have no stable ACP tool-call key.
+        persistChanges()
         recordRuntimeLog("lifecycle", "client initialized; runtimeLog=\(RuntimeLog.shared.fileURL.path)")
         runtimeHeartbeatTask = Task { @MainActor in
             while !Task.isCancelled {
@@ -222,6 +265,9 @@ final class MothxServiceManager: ObservableObject {
 
     deinit {
         runtimeHeartbeatTask?.cancel()
+        runElapsedTask?.cancel()
+        let client = acpClient
+        Task { await client.stop() }
     }
 
     /// Records client-side diagnostics alongside the mothx service log and in
@@ -701,6 +747,42 @@ final class MothxServiceManager: ObservableObject {
         return session
     }
 
+    /// Creates a real ACP session up front when ACP is selected. Serve runs
+    /// keep their existing lazy-session behavior because that API creates the
+    /// session together with the first Run.
+    func prepareSessionForSelectedTransport(projectID: String?) async -> MothxSession {
+        guard preferredAgentTransport == .acp,
+              let projectID,
+              let project = projects.first(where: { $0.id == projectID }),
+              !project.workDir.isEmpty else {
+            return prepareSession(projectID: projectID)
+        }
+        do {
+            try await ensureACPClient(tools: [])
+            let sessionID = try await acpClient.createSession(cwd: project.workDir)
+            let session = MothxSession(
+                id: sessionID,
+                title: "New session",
+                projectID: projectID,
+                updatedAt: ISO8601DateFormatter().string(from: Date()),
+                workDir: project.workDir
+            )
+            sessions.removeAll { $0.id == sessionID }
+            sessions.insert(session, at: 0)
+            do {
+                _ = try await setSessionProject(sessionID: sessionID, projectID: projectID)
+            } catch {
+                settingsError = copy.saveSessionProjectLinkFailedPrefix(describe(error))
+            }
+            recordRuntimeLog("acp", "created session=\(sessionID)")
+            return session
+        } catch {
+            settingsError = copy.text("ACP 会话创建失败，已回退到 Serve：\(describe(error))", "ACP session creation failed; falling back to Serve: \(describe(error))")
+            recordRuntimeLog("acp", "session creation failed error=\(describe(error))")
+            return prepareSession(projectID: projectID)
+        }
+    }
+
 
     func deleteSession(id: String) async {
         // New sessions are local drafts until their first run. They have no
@@ -794,6 +876,10 @@ final class MothxServiceManager: ObservableObject {
         return copy.forkSessionFailedPrefix(describe(error))
     }
 
+    func metrics(for sessionID: String) -> MothxSessionMetrics {
+        metricsBySession[sessionID] ?? MothxSessionMetrics()
+    }
+
     @discardableResult
     func loadMessages(sessionID: String) async -> [MothxMessage] {
         let started = Date()
@@ -867,24 +953,513 @@ final class MothxServiceManager: ObservableObject {
         return result
     }
 
+    var preferredAgentTransport: MothxAgentTransport {
+        let raw = UserDefaults.standard.string(forKey: MothxAgentTransport.defaultsKey)
+            ?? MothxAgentTransport.acp.rawValue
+        return MothxAgentTransport(rawValue: raw) ?? .acp
+    }
+
+    private func ensureACPClient(tools: [String]) async throws {
+        guard let executable = await Self.resolveGlobalMothxExecutable() else {
+            throw MothxACPError.invalidResponse("mothx executable was not found")
+        }
+        let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("mothx", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        await acpClient.setHandlers(
+            message: { [weak self] data in
+                Task { @MainActor [weak self] in
+                    await self?.handleACPFrame(data)
+                }
+            },
+            log: { [weak self] output in
+                Task { @MainActor [weak self] in
+                    self?.recordRuntimeLog("acp", output.trimmingCharacters(in: .whitespacesAndNewlines))
+                }
+            }
+        )
+        try await acpClient.start(
+            executable: executable,
+            workingDirectory: directory,
+            environment: await Self.loginShellEnvironment(),
+            options: MothxACPLaunchOptions(tools: tools)
+        )
+    }
+
+    private func submitACPRun(
+        sessionID: String,
+        message: String,
+        workDir: String,
+        provider: String,
+        model: String,
+        mode: String,
+        tools: [String]
+    ) async -> String? {
+        let runID = "acp-client-\(UUID().uuidString)"
+        activeAgentTransport = .acp
+        isSubmittingRun = true
+        isStreaming = true
+        isRunning = true
+        cancelRequested = false
+        runError = nil
+        runStatus = "queued"
+        runElapsed = 0
+        resetRunMetrics(sessionID: sessionID)
+        runSessionID = sessionID
+        runReplyMessageID = nil
+        currentRunID = runID
+        currentPlan = nil
+        currentRunningMessageID = nil
+        acpToolInputs.removeAll(keepingCapacity: true)
+        acpToolNames.removeAll(keepingCapacity: true)
+        acpDurableRunID = nil
+        thinkingBySession[sessionID] = ""
+        // Do not let a previous turn's session-level fallback appear on the
+        // new last turn before this Run captures its own file changes.
+        latestChangesBySession.removeValue(forKey: sessionID)
+        runExistingMessageIDs = Set((messagesBySession[sessionID] ?? []).map(\.id))
+        runStartedAt = Date()
+        startRunElapsedTimer()
+
+        let localMessage = MothxMessage(
+            id: "local-\(UUID().uuidString)", seq: nil, role: "user", content: message,
+            toolCallId: nil, toolName: nil, arguments: "", plan: nil, summary: nil,
+            hasDetail: false, createdAt: ISO8601DateFormatter().string(from: Date())
+        )
+        messagesBySession[sessionID, default: []].append(localMessage)
+
+        do {
+            try await ensureACPClient(tools: tools)
+            let cwd = workDir.isEmpty ? self.workDir(for: sessionID) : workDir
+            try await acpClient.resumeSession(id: sessionID, cwd: cwd)
+            let resolvedProvider = provider.isEmpty
+                ? (sessionProviders[sessionID] ?? defaultProvider)
+                : provider
+            let resolvedModel = model.isEmpty
+                ? (sessionModels[sessionID] ?? defaultModel)
+                : model
+            if !resolvedProvider.isEmpty {
+                try await acpClient.setConfig(sessionID: sessionID, id: "provider", value: resolvedProvider)
+            }
+            if !resolvedModel.isEmpty {
+                let qualifiedModel = resolvedProvider.isEmpty || resolvedModel.hasPrefix("\(resolvedProvider)/")
+                    ? resolvedModel
+                    : "\(resolvedProvider)/\(resolvedModel)"
+                try await acpClient.setConfig(sessionID: sessionID, id: "model", value: qualifiedModel)
+            }
+            if !mode.isEmpty {
+                try await acpClient.setConfig(sessionID: sessionID, id: "mode", value: mode)
+            }
+            startRunEventStream(sessionID: sessionID)
+            runStatus = "running"
+            isSubmittingRun = false
+            let stopReason = try await acpClient.prompt(sessionID: sessionID, text: message)
+            await refreshACPUsage(sessionID: sessionID)
+            runElapsed = elapsedSinceRunStart()
+            stopRunElapsedTimer()
+            isSubmittingRun = false
+            isStreaming = false
+            isRunning = false
+            currentRunningMessageID = nil
+            currentPlan = nil
+            if cancelRequested || stopReason.lowercased() == "cancelled" {
+                runStatus = "cancelled"
+            } else if ["end_turn", "stop", "completed", "success"].contains(stopReason.lowercased()) {
+                runStatus = "completed"
+            } else {
+                runStatus = "incomplete"
+                runError = copy.text("ACP 运行未完整结束：\(stopReason)", "ACP run ended incompletely: \(stopReason)")
+            }
+            return runID
+        } catch {
+            runElapsed = elapsedSinceRunStart()
+            stopRunElapsedTimer()
+            isSubmittingRun = false
+            isStreaming = false
+            isRunning = false
+            currentRunningMessageID = nil
+            currentPlan = nil
+            runStatus = cancelRequested ? "cancelled" : "failed"
+            if !cancelRequested {
+                runError = describe(error)
+                settingsError = copy.text("ACP 运行失败：\(describe(error))", "ACP run failed: \(describe(error))")
+            }
+            recordRuntimeLog("acp", "run failed session=\(sessionID) error=\(describe(error))")
+            return nil
+        }
+    }
+
+    func stopACPClient() async {
+        await acpClient.stop()
+        if activeAgentTransport == .acp {
+            activeAgentTransport = .serve
+        }
+    }
+
+    private func handleACPFrame(_ data: Data) async {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let method = object["method"] as? String else {
+            recordRuntimeLog("acp", "ignored malformed JSON-RPC message")
+            return
+        }
+        if let id = rpcStringID(object["id"]) {
+            await handleACPRequest(id: id, method: method, params: object["params"] as? [String: Any] ?? [:])
+            return
+        }
+        let params = object["params"] as? [String: Any] ?? [:]
+        switch method {
+        case "session/update":
+            handleACPSessionUpdate(params)
+        case "_mothx/session_event":
+            handleACPSessionEvent(params)
+        default:
+            break
+        }
+    }
+
+    private func handleACPSessionUpdate(_ params: [String: Any]) {
+        guard let sessionID = params["sessionId"] as? String,
+              let update = params["update"] as? [String: Any],
+              let kind = update["sessionUpdate"] as? String else { return }
+        switch kind {
+        case "user_message_chunk":
+            guard let messageID = update["messageId"] as? String,
+                  let text = acpText(from: update["content"]), !text.isEmpty else { return }
+            upsertACPTextMessage(sessionID: sessionID, id: messageID, role: "user", chunk: text)
+            if sessionID == runSessionID, activeAgentTransport == .acp, acpDurableRunID == nil {
+                Task { @MainActor [weak self] in
+                    await self?.refreshACPUsage(sessionID: sessionID)
+                }
+            }
+        case "agent_message_chunk":
+            guard let messageID = update["messageId"] as? String,
+                  let text = acpText(from: update["content"]), !text.isEmpty else { return }
+            upsertACPTextMessage(sessionID: sessionID, id: messageID, role: "assistant", chunk: text)
+            runReplyMessageID = messageID
+            currentRunningMessageID = messageID
+        case "agent_thought_chunk":
+            if let text = acpText(from: update["content"]), !text.isEmpty {
+                appendThinking(text, for: sessionID)
+            }
+        case "tool_call":
+            upsertACPToolCall(sessionID: sessionID, update: update)
+        case "tool_call_update":
+            handleACPToolUpdate(sessionID: sessionID, update: update)
+        case "plan":
+            handleACPPlan(update)
+        case "usage_update":
+            if sessionID == runSessionID {
+                updateRunContextUsage(used: update["used"], size: update["size"])
+                Task { @MainActor [weak self] in
+                    await self?.refreshACPUsage(sessionID: sessionID)
+                }
+            }
+        default:
+            break
+        }
+    }
+
+    private func handleACPSessionEvent(_ params: [String: Any]) {
+        guard (params["sessionId"] as? String) == runSessionID else { return }
+        let event = (params["event"] as? String ?? "").lowercased()
+        if event == "terminal" {
+            let status = (params["status"] as? String ?? "completed").lowercased()
+            runStatus = status
+            runElapsed = elapsedSinceRunStart()
+            if ["failed", "error", "incomplete", "timed_out", "timeout"].contains(status) {
+                runError = (params["error"] as? String) ?? copy.runFailedFallback
+            }
+            if ["completed", "cancelled", "canceled", "failed", "error", "incomplete", "timed_out", "timeout"].contains(status) {
+                currentPlan = nil
+            }
+        } else if event == "status", let message = params["message"] as? String, !message.isEmpty {
+            recordRuntimeLog("acp", "session status: \(message)")
+        }
+    }
+
+    private func upsertACPTextMessage(sessionID: String, id: String, role: String, chunk: String) {
+        var messages = messagesBySession[sessionID] ?? []
+        if let index = messages.firstIndex(where: { $0.id == id }) {
+            let old = messages[index]
+            messages[index] = MothxMessage(
+                id: old.id, seq: old.seq, role: old.role, content: old.content + chunk,
+                toolCallId: old.toolCallId, toolName: old.toolName, arguments: old.arguments,
+                plan: old.plan, summary: old.summary, hasDetail: old.hasDetail, createdAt: old.createdAt
+            )
+        } else if role == "user",
+                  let index = messages.lastIndex(where: { $0.id.hasPrefix("local-") && $0.role == "user" && $0.content == chunk }) {
+            let old = messages[index]
+            messages[index] = MothxMessage(
+                id: id, seq: old.seq, role: role, content: chunk,
+                toolCallId: nil, toolName: nil, arguments: "", plan: nil,
+                summary: nil, hasDetail: false, createdAt: old.createdAt
+            )
+        } else {
+            messages.append(MothxMessage(
+                id: id, seq: nil, role: role, content: chunk,
+                toolCallId: nil, toolName: nil, arguments: "", plan: nil,
+                summary: nil, hasDetail: false, createdAt: ISO8601DateFormatter().string(from: Date())
+            ))
+        }
+        messagesBySession[sessionID] = messages
+    }
+
+    private func upsertACPToolCall(sessionID: String, update: [String: Any]) {
+        guard let callID = update["toolCallId"] as? String, !callID.isEmpty else { return }
+        if let input = update["rawInput"] as? [String: Any] { acpToolInputs[callID] = input }
+        let title = update["title"] as? String ?? ""
+        if !title.isEmpty {
+            let candidate = title.split(separator: ":", maxSplits: 1).first.map(String.init)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if let candidate, !candidate.isEmpty, !candidate.contains(" ") {
+                acpToolNames[callID] = candidate
+            }
+        }
+        if acpToolNames[callID] == nil, let kind = update["kind"] as? String {
+            acpToolNames[callID] = kind
+        }
+        let toolName = acpToolNames[callID] ?? "tool"
+        let message = MothxMessage(
+            id: "acp-call-\(callID)", seq: nil, role: "toolCall", content: title.isEmpty ? toolName : title,
+            toolCallId: callID, toolName: toolName, arguments: acpJSONString(acpToolInputs[callID] ?? [:]),
+            plan: nil, summary: nil, hasDetail: false,
+            createdAt: ISO8601DateFormatter().string(from: Date())
+        )
+        var messages = messagesBySession[sessionID] ?? []
+        if let index = messages.firstIndex(where: { $0.id == message.id }) {
+            messages[index] = message
+        } else {
+            messages.append(message)
+        }
+        messagesBySession[sessionID] = messages
+    }
+
+    private func handleACPToolUpdate(sessionID: String, update: [String: Any]) {
+        guard let callID = update["toolCallId"] as? String, !callID.isEmpty else { return }
+        upsertACPToolCall(sessionID: sessionID, update: update)
+        let status = (update["status"] as? String ?? "").lowercased()
+        let text = acpToolOutputText(update)
+        if ["completed", "failed"].contains(status) || !text.isEmpty {
+            let resultID = "acp-result-\(callID)"
+            let bounded = boundedToolDetail(text)
+            let result = MothxMessage(
+                id: resultID, seq: nil, role: "toolResult", content: bounded,
+                toolCallId: callID, toolName: acpToolNames[callID],
+                arguments: "", plan: nil, summary: text.isEmpty ? status : bounded,
+                hasDetail: !text.isEmpty,
+                createdAt: ISO8601DateFormatter().string(from: Date())
+            )
+            var messages = messagesBySession[sessionID] ?? []
+            if let index = messages.firstIndex(where: { $0.id == resultID }) {
+                messages[index] = result
+            } else {
+                messages.append(result)
+            }
+            messagesBySession[sessionID] = messages
+        }
+        captureACPChanges(sessionID: sessionID, update: update, summary: text, toolCallID: callID)
+    }
+
+    private func captureACPChanges(sessionID: String, update: [String: Any], summary: String, toolCallID: String) {
+        guard let runID = currentRunID, runID.hasPrefix("acp-client-"),
+              let contents = update["content"] as? [[String: Any]] else { return }
+        for content in contents where content["type"] as? String == "diff" {
+            guard let rawPath = content["path"] as? String,
+                  let target = captureTarget(rawPath, sessionID: sessionID) else { continue }
+            let change: MothxFileChange
+            if let oldText = content["oldText"] as? String,
+               let newText = content["newText"] as? String {
+                change = MothxDiffBuilder.make(path: target.relativePath, oldText: oldText, newText: newText)
+            } else {
+                let preview = summary.isEmpty
+                    ? copy.text("ACP 返回了文件变更，但缺少完整的 oldText/newText。", "ACP returned a file change without a complete oldText/newText pair.")
+                    : summary
+                change = MothxFileChange(previewPath: target.relativePath, unifiedDiff: preview, added: 0, deleted: 0)
+            }
+            mergeServerChange(change, sessionID: sessionID, runID: runID, toolCallID: toolCallID)
+        }
+    }
+
+    private func handleACPPlan(_ update: [String: Any]) {
+        guard let entries = update["entries"] as? [[String: Any]], !entries.isEmpty else {
+            currentPlan = nil
+            return
+        }
+        let rawMetadata = update["_meta"] as? [String: Any]
+        let metadata = (rawMetadata?["mothx.dev"] as? [String: Any])
+            ?? (rawMetadata?["mothx"] as? [String: Any])
+        let title = metadata?["title"] as? String ?? ""
+        let note = metadata?["note"] as? String
+        let steps = entries.enumerated().compactMap { index, entry -> MothxPlanStep? in
+            guard let content = entry["content"] as? String, !content.isEmpty else { return nil }
+            let rawStatus = (entry["status"] as? String ?? "pending").lowercased()
+            let status = rawStatus == "in_progress" ? "running" : (rawStatus == "completed" ? "done" : "pending")
+            return MothxPlanStep(id: "\(index)-\(content)", title: content, status: status)
+        }
+        guard !steps.isEmpty else { currentPlan = nil; return }
+        currentPlan = MothxPlan(
+            id: title + "|" + steps.map(\.title).joined(separator: "|"),
+            title: title, steps: steps, note: note
+        )
+    }
+
+    private func handleACPRequest(id: String, method: String, params: [String: Any]) async {
+        let result: [String: Any]
+        switch method {
+        case "session/request_permission":
+            runStatus = "waiting_for_approval"
+            result = presentACPPermission(params)
+        case "elicitation/create":
+            runStatus = "waiting_for_question"
+            result = presentACPQuestion(params, standardElicitation: true)
+        case "mothx/requestQuestion", "_mothx/request_question":
+            runStatus = "waiting_for_question"
+            result = presentACPQuestion(params, standardElicitation: false)
+        default:
+            recordRuntimeLog("acp", "unsupported server request method=\(method)")
+            result = [:]
+        }
+        do {
+            try await acpClient.respond(id: id, result: result)
+            if isRunning { runStatus = "running" }
+        } catch {
+            runError = describe(error)
+        }
+    }
+
+    private func presentACPPermission(_ params: [String: Any]) -> [String: Any] {
+        let tool = params["toolCall"] as? [String: Any] ?? [:]
+        let title = tool["title"] as? String ?? copy.text("工具调用", "Tool call")
+        let input = tool["rawInput"] as? [String: Any] ?? [:]
+        let options = params["options"] as? [[String: Any]] ?? []
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = copy.text("允许 mothx 执行“\(title)”吗？", "Allow mothx to run “\(title)”?")
+        alert.informativeText = input.isEmpty ? "" : acpJSONString(input)
+        for option in options { alert.addButton(withTitle: option["name"] as? String ?? "Option") }
+        alert.addButton(withTitle: copy.text("取消", "Cancel"))
+        let selected = alert.runModal().rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+        guard selected >= 0, selected < options.count,
+              let optionID = options[selected]["optionId"] as? String else {
+            return ["outcome": ["outcome": "cancelled"]]
+        }
+        return ["outcome": ["outcome": "selected", "optionId": optionID]]
+    }
+
+    private func presentACPQuestion(_ params: [String: Any], standardElicitation: Bool) -> [String: Any] {
+        let prompt = (params["message"] as? String)
+            ?? (params["prompt"] as? String)
+            ?? copy.text("mothx 需要你的输入", "mothx needs your input")
+        var options = (params["options"] as? [[String: Any]] ?? []).compactMap { option in
+            (option["label"] as? String) ?? (option["id"] as? String)
+        }
+        if standardElicitation,
+           let schema = params["requestedSchema"] as? [String: Any],
+           let properties = schema["properties"] as? [String: Any],
+           let answer = properties["answer"] as? [String: Any],
+           let values = answer["enum"] as? [String] {
+            options = values
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = params["title"] as? String ?? "MothX"
+        alert.informativeText = prompt
+        let answer: String?
+        if options.isEmpty {
+            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+            field.placeholderString = params["placeholder"] as? String
+            alert.accessoryView = field
+            alert.addButton(withTitle: copy.text("确定", "OK"))
+            alert.addButton(withTitle: copy.text("取消", "Cancel"))
+            answer = alert.runModal() == .alertFirstButtonReturn
+                ? field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                : nil
+        } else {
+            for option in options { alert.addButton(withTitle: option) }
+            alert.addButton(withTitle: copy.text("取消", "Cancel"))
+            let selected = alert.runModal().rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+            answer = selected >= 0 && selected < options.count ? options[selected] : nil
+        }
+        if standardElicitation {
+            guard let answer, !answer.isEmpty else { return ["action": "cancel"] }
+            return ["action": "accept", "content": ["answer": answer]]
+        }
+        guard let answer, !answer.isEmpty else { return ["cancelled": true] }
+        return ["answer": answer]
+    }
+
+    private func acpText(from value: Any?) -> String? {
+        guard let content = value as? [String: Any], content["type"] as? String == "text" else { return nil }
+        return content["text"] as? String
+    }
+
+    private func acpToolOutputText(_ update: [String: Any]) -> String {
+        if let contents = update["content"] as? [[String: Any]] {
+            let text = contents.compactMap { item -> String? in
+                guard item["type"] as? String == "content" else { return nil }
+                return acpText(from: item["content"])
+            }.joined(separator: "\n")
+            if !text.isEmpty { return text }
+        }
+        if let output = update["rawOutput"] as? [String: Any],
+           let content = output["content"] as? String {
+            return content
+        }
+        return ""
+    }
+
+    private func acpJSONString(_ value: Any) -> String {
+        guard JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
+              let text = String(data: data, encoding: .utf8) else { return "" }
+        return text
+    }
+
+    private func rpcStringID(_ value: Any?) -> String? {
+        if let value = value as? String { return value }
+        if let value = value as? NSNumber { return value.stringValue }
+        return nil
+    }
+
     func submitRun(sessionID: String, message: String, images: [String], workDir: String = "", provider: String = "", model: String = "", mode: String = "agent", tools: [String] = [], skills: [String] = []) async -> String? {
         guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !images.isEmpty else { return nil }
+        if preferredAgentTransport == .acp,
+           pendingSessions[sessionID] == nil,
+           images.isEmpty,
+           skills.isEmpty {
+            return await submitACPRun(
+                sessionID: sessionID,
+                message: message,
+                workDir: workDir,
+                provider: provider,
+                model: model,
+                mode: mode,
+                tools: tools
+            )
+        }
+        if preferredAgentTransport == .acp {
+            let reason = !images.isEmpty ? "image input" : (!skills.isEmpty ? "explicit skills" : "pending Serve session")
+            recordRuntimeLog("acp", "falling back to Serve session=\(sessionID) reason=\(reason)")
+        }
+        activeAgentTransport = .serve
         isSubmittingRun = true
         isStreaming = true
         cancelRequested = false
         runError = nil
         runStatus = "queued"
         runElapsed = 0
-        runCacheHitRate = nil
+        resetRunMetrics(sessionID: sessionID)
         runSessionID = sessionID
         runReplyMessageID = nil
         currentRunID = nil
         currentPlan = nil
         currentRunningMessageID = nil
         thinkingBySession[sessionID] = ""
+        latestChangesBySession.removeValue(forKey: sessionID)
         isRunning = true
         runExistingMessageIDs = Set((messagesBySession[sessionID] ?? []).map(\.id))
         runStartedAt = Date()
+        startRunElapsedTimer()
         let pendingProjectID = pendingSessions[sessionID]?.projectID
         do {
             var payload: [String: Any] = ["message": message, "mode": mode, "transcript": true]
@@ -907,6 +1482,8 @@ final class MothxServiceManager: ObservableObject {
             let responseObject = (try? JSONSerialization.jsonObject(with: response)) as? [String: Any]
             let runID = responseObject?["runId"] as? String ?? responseObject?["runID"] as? String
             guard let runID else {
+                runElapsed = elapsedSinceRunStart()
+                stopRunElapsedTimer()
                 isSubmittingRun = false
                 runStatus = "failed"
                 currentPlan = nil
@@ -926,6 +1503,8 @@ final class MothxServiceManager: ObservableObject {
             }
             return runID
         } catch {
+            runElapsed = elapsedSinceRunStart()
+            stopRunElapsedTimer()
             isSubmittingRun = false
             runStatus = "failed"
             currentPlan = nil
@@ -939,12 +1518,26 @@ final class MothxServiceManager: ObservableObject {
         cancelRequested = true
         isSubmittingRun = false
         isStreaming = false
+        if activeAgentTransport == .acp, let sessionID = runSessionID {
+            do {
+                try await acpClient.cancel(sessionID: sessionID)
+                runStatus = "cancelled"
+                currentPlan = nil
+                runElapsed = elapsedSinceRunStart()
+                stopRunElapsedTimer()
+            } catch {
+                runError = copy.stopRunFailedPrefix(describe(error))
+                settingsError = runError
+            }
+            return
+        }
         guard let runID = currentRunID else { return }
         do {
             _ = try await request(path: "api/runs/\(runID)/cancel", method: "POST")
             runStatus = "cancelled"
             currentPlan = nil
             runElapsed = elapsedSinceRunStart()
+            stopRunElapsedTimer()
         } catch {
             runError = copy.stopRunFailedPrefix(describe(error))
             settingsError = runError
@@ -1058,10 +1651,14 @@ final class MothxServiceManager: ObservableObject {
     }
 
     func pollRun(runID: String, sessionID: String) async {
+        // ACP `session/prompt` completes only after the turn is terminal, so
+        // there is no HTTP Run to poll for client-side ACP correlation IDs.
+        if runID.hasPrefix("acp-client-") { return }
         guard monitoredRunIDs.insert(runID).inserted else { return }
         defer {
             monitoredRunIDs.remove(runID)
             runElapsed = elapsedSinceRunStart()
+            stopRunElapsedTimer()
             isSubmittingRun = false
             currentRunningMessageID = nil
             // Keep isRunning and isStreaming for a grace period so the stop
@@ -1083,6 +1680,7 @@ final class MothxServiceManager: ObservableObject {
                 let object = (try JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
                 let status = object["status"] as? String ?? object["state"] as? String ?? "running"
                 runStatus = status
+                updateRunContextUsage(from: object["contextUsage"] ?? object["ContextUsage"] ?? object["context_usage"])
                 // Usage is served by GET /api/sessions/{sessionID}/runs: each
                 // run row carries `Usage` with prompt_tokens / cache_read_tokens.
                 // Read the latest run row directly to compute the cache hit rate.
@@ -1131,6 +1729,7 @@ final class MothxServiceManager: ObservableObject {
             runSessionID = sessionID
             currentRunID = runID
             runStatus = (active["status"] as? String) ?? (active["state"] as? String) ?? "running"
+            resetRunMetrics(sessionID: sessionID)
             isSubmittingRun = false
             isStreaming = true
             isRunning = true
@@ -1138,6 +1737,7 @@ final class MothxServiceManager: ObservableObject {
             runExistingMessageIDs = Set((messagesBySession[sessionID] ?? []).map(\.id))
             runStartedAt = parseDate(active["startedAt"] ?? active["started_at"]) ?? Date()
             runElapsed = elapsedSinceRunStart()
+            startRunElapsedTimer()
             startRunEventStream(sessionID: sessionID)
             if !monitoredRunIDs.contains(runID) {
                 Task { @MainActor in await self.pollRun(runID: runID, sessionID: sessionID) }
@@ -1153,6 +1753,25 @@ final class MothxServiceManager: ObservableObject {
         return max(0, Date().timeIntervalSince(runStartedAt))
     }
 
+    /// Publishes a live elapsed value once per second while a Run is active.
+    /// The value is derived from the start Date rather than incremented so
+    /// scheduling delays cannot make the displayed duration drift.
+    private func startRunElapsedTimer() {
+        runElapsedTask?.cancel()
+        runElapsedTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self, self.isRunning else { return }
+                self.runElapsed = self.elapsedSinceRunStart()
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+    }
+
+    private func stopRunElapsedTimer() {
+        runElapsedTask?.cancel()
+        runElapsedTask = nil
+    }
+
     /// Usage may arrive in mothx's OpenAI `CompletionUsage` shape
     /// (prompt_tokens / completion_tokens / total_tokens / cache_read_tokens /
     /// cache_write_tokens) or the normalized provider shape (input / output /
@@ -1164,21 +1783,80 @@ final class MothxServiceManager: ObservableObject {
     /// fall back to `input + cacheRead + cacheWrite`. The ratio therefore means
     /// "what portion of this turn's full prompt came from cache", matching the
     /// TUI's `CacheInfo` display.
-    private func updateRunCacheHitRate(from rawUsage: Any?) {
-        guard let usage = rawUsage as? [String: Any] else { return }
+    @discardableResult
+    private func updateRunCacheHitRate(from rawUsage: Any?, sessionID: String? = nil) -> Bool {
+        guard let usage = rawUsage as? [String: Any] else { return false }
         let input = integerValue(usage["input"] ?? usage["Input"] ?? usage["inputTokens"] ?? usage["input_tokens"] ?? usage["prompt_tokens"])
         let output = integerValue(usage["output"] ?? usage["Output"] ?? usage["outputTokens"] ?? usage["completion_tokens"])
         let total = integerValue(usage["totalTokens"] ?? usage["TotalTokens"] ?? usage["total_tokens"])
         let cacheRead = integerValue(usage["cacheRead"] ?? usage["CacheRead"] ?? usage["cache_read_tokens"] ?? usage["cached_tokens"])
         let cacheWrite = integerValue(usage["cacheWrite"] ?? usage["CacheWrite"] ?? usage["cache_write_tokens"])
+        return updateRunCacheHitRate(
+            input: input,
+            output: output,
+            total: total,
+            cacheRead: cacheRead,
+            cacheWrite: cacheWrite,
+            sessionID: sessionID
+        )
+    }
+
+    @discardableResult
+    private func updateRunCacheHitRate(
+        input: Int,
+        output: Int,
+        total: Int,
+        cacheRead: Int,
+        cacheWrite: Int,
+        sessionID: String? = nil
+    ) -> Bool {
         let totalInput: Int
         if total > 0 {
             totalInput = max(0, total - output)
         } else {
             totalInput = input + cacheRead + cacheWrite
         }
-        guard totalInput > 0 else { return }
-        runCacheHitRate = min(1, max(0, Double(cacheRead) / Double(totalInput)))
+        guard totalInput > 0,
+              let sessionID = sessionID ?? runSessionID else { return false }
+        var metrics = metricsBySession[sessionID] ?? MothxSessionMetrics()
+        metrics.cacheHitRate = min(1, max(0, Double(cacheRead) / Double(totalInput)))
+        metricsBySession[sessionID] = metrics
+        return true
+    }
+
+    @discardableResult
+    private func updateRunContextUsage(
+        from rawUsage: Any?,
+        fallbackSize: Int? = nil,
+        sessionID: String? = nil
+    ) -> Bool {
+        guard let usage = rawUsage as? [String: Any] else { return false }
+        let used = usage["total_tokens"] ?? usage["totalTokens"] ?? usage["tokens"] ?? usage["used"]
+        let size = usage["context_window"]
+            ?? usage["contextWindow"]
+            ?? usage["size"]
+            ?? fallbackSize.map { $0 as Any }
+        return updateRunContextUsage(used: used, size: size, sessionID: sessionID)
+    }
+
+    @discardableResult
+    private func updateRunContextUsage(
+        used rawUsed: Any?,
+        size rawSize: Any?,
+        sessionID: String? = nil
+    ) -> Bool {
+        guard let used = optionalIntegerValue(rawUsed), used >= 0,
+              let size = optionalIntegerValue(rawSize), size > 0,
+              let sessionID = sessionID ?? runSessionID else { return false }
+        var metrics = metricsBySession[sessionID] ?? MothxSessionMetrics()
+        metrics.contextUsedTokens = used
+        metrics.contextWindowTokens = size
+        metricsBySession[sessionID] = metrics
+        return true
+    }
+
+    private func resetRunMetrics(sessionID: String) {
+        metricsBySession[sessionID] = MothxSessionMetrics()
     }
 
     /// Fetches the latest persisted usage for the active run from
@@ -1203,6 +1881,78 @@ final class MothxServiceManager: ObservableObject {
         } catch {
             return nil
         }
+    }
+
+    /// ACP's standard `usage_update` reports context occupancy (`used/size`),
+    /// not provider cache tokens. Resolve the exact durable run and prefer its
+    /// authoritative Usage object. Current mothx ACP builds can leave that
+    /// object empty while persisting provider usage on assistant entries, so
+    /// use a read-only, exact-turn fallback in that case.
+    private func refreshACPUsage(sessionID: String) async {
+        guard activeAgentTransport == .acp,
+              runSessionID == sessionID,
+              currentRunID?.hasPrefix("acp-client-") == true else { return }
+        do {
+            let data = try await request(path: "api/sessions/\(sessionID)/runs?limit=5", method: "GET")
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let runs = object["runs"] as? [[String: Any]] else { return }
+            let selected: [String: Any]?
+            if let acpDurableRunID {
+                selected = runs.first { row in
+                    (row["ID"] as? String) == acpDurableRunID || (row["id"] as? String) == acpDurableRunID
+                }
+            } else if let started = runStartedAt {
+                selected = runs.first { row in
+                    guard let candidateStart = parseDate(row["StartedAt"] ?? row["startedAt"]) else { return false }
+                    return candidateStart >= started.addingTimeInterval(-2)
+                }
+            } else {
+                selected = nil
+            }
+            guard let selected else { return }
+            if acpDurableRunID == nil {
+                acpDurableRunID = (selected["ID"] as? String) ?? (selected["id"] as? String)
+            }
+            updateRunContextUsage(from: selected["ContextUsage"] ?? selected["contextUsage"] ?? selected["context_usage"])
+            let usage = (selected["Usage"] as? [String: Any]) ?? (selected["usage"] as? [String: Any])
+            if !updateRunCacheHitRate(from: usage),
+               let durableRunID = acpDurableRunID {
+                await refreshACPStoredUsage(sessionID: sessionID, runID: durableRunID)
+            }
+        } catch {
+            // Cache information is optional UI metadata. ACP text streaming
+            // and the run lifecycle must continue if Serve is unavailable.
+            if let durableRunID = acpDurableRunID {
+                await refreshACPStoredUsage(sessionID: sessionID, runID: durableRunID)
+            }
+        }
+    }
+
+    private func refreshACPStoredUsage(sessionID: String, runID: String) async {
+        guard !sessionDir.isEmpty else { return }
+        let configuredSessionDirectory = sessionDir
+        let usage = await Task.detached(priority: .utility) {
+            MothxACPUsageReader.usage(
+                sessionDirectory: configuredSessionDirectory,
+                sessionID: sessionID,
+                runID: runID
+            )
+        }.value
+        guard let usage else { return }
+        updateRunCacheHitRate(
+            input: usage.input,
+            output: usage.output,
+            total: usage.totalTokens,
+            cacheRead: usage.cacheRead,
+            cacheWrite: usage.cacheWrite,
+            sessionID: sessionID
+        )
+    }
+
+    private func optionalIntegerValue(_ value: Any?) -> Int? {
+        if let value = value as? Int { return value }
+        if let value = value as? NSNumber { return value.intValue }
+        return nil
     }
 
     private func integerValue(_ value: Any?) -> Int {
@@ -1241,7 +1991,8 @@ final class MothxServiceManager: ObservableObject {
                 deleted: counts.deleted
             )
         }
-        mergeServerChange(change, sessionID: sessionID, runID: runID)
+        let toolCallID = (data["toolCallId"] as? String) ?? (data["tool_call_id"] as? String)
+        mergeServerChange(change, sessionID: sessionID, runID: runID, toolCallID: toolCallID)
     }
 
     /// Tool names have changed across mothx releases and adapters. The
@@ -1289,7 +2040,7 @@ final class MothxServiceManager: ObservableObject {
         return (integerValue(addedValue), integerValue(deletedValue))
     }
 
-    private func mergeServerChange(_ change: MothxFileChange, sessionID: String, runID: String) {
+    private func mergeServerChange(_ change: MothxFileChange, sessionID: String, runID: String, toolCallID: String? = nil) {
         var changes = fileChangesByRun[runID] ?? [:]
         changes[change.path] = combinedServerChange(previous: changes[change.path], next: change)
         fileChangesByRun[runID] = changes
@@ -1301,7 +2052,32 @@ final class MothxServiceManager: ObservableObject {
         )
         changesByRun[runID] = turnChanges
         latestChangesBySession[sessionID] = turnChanges
-        changeStore.save(changesByRun)
+
+        if let toolCallID, !toolCallID.isEmpty {
+            let key = toolChangeKey(sessionID: sessionID, toolCallID: toolCallID)
+            var callFiles = Dictionary(uniqueKeysWithValues: (toolChangesByCall[key]?.files ?? []).map { ($0.path, $0) })
+            callFiles[change.path] = combinedServerChange(previous: callFiles[change.path], next: change)
+            toolChangesByCall[key] = MothxToolChangeRecord(
+                sessionID: sessionID,
+                toolCallID: toolCallID,
+                files: callFiles.values.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending },
+                capturedAt: Date()
+            )
+        }
+        persistChanges()
+    }
+
+    private func toolChangeKey(sessionID: String, toolCallID: String) -> String {
+        "\(sessionID)\u{0}\(toolCallID)"
+    }
+
+    private func localChange(sessionID: String, toolCallID: String, path: String) -> MothxFileChange? {
+        let key = toolChangeKey(sessionID: sessionID, toolCallID: toolCallID)
+        return toolChangesByCall[key]?.files.first { $0.path == path }
+    }
+
+    private func persistChanges() {
+        changeStore.save(turns: changesByRun, toolChanges: toolChangesByCall)
     }
 
     private func combinedServerChange(previous: MothxFileChange?, next: MothxFileChange) -> MothxFileChange {
@@ -1328,9 +2104,9 @@ final class MothxServiceManager: ObservableObject {
         workDir(for: sessionID)
     }
 
-    /// Rebuilds the summary card for runs that happened while the app was
-    /// closed. Authoritative oldText/newText values come only from the tool
-    /// detail API. Older servers without those fields remain preview-only.
+    /// Rebuilds the change card for runs that happened while the app was
+    /// closed. Complete ACP captures come from the local tool-call store;
+    /// Server tool details remain the compatibility fallback for old turns.
     private func rebuildHistoricalChanges(sessionID: String, messages: [MothxMessage]) async {
         guard let runMapping = historicalRunsByMessage[sessionID], !runMapping.isEmpty else { return }
         recordRuntimeLog("changes", "historical rebuild session=\(sessionID) runs=\(runMapping.count) messages=\(messages.count)")
@@ -1350,16 +2126,28 @@ final class MothxServiceManager: ObservableObject {
             var files = fileChangesByRun[run.id] ?? [:]
             for (call, _, target, result) in calls {
                 var summary = result?.summary ?? ""
-                let detail: MothxToolResultDetail?
-                if let callID = call.toolCallId {
-                    detail = await loadToolResultDetail(sessionID: sessionID, toolCallID: callID)
+                let local = call.toolCallId.flatMap {
+                    localChange(sessionID: sessionID, toolCallID: $0, path: target.relativePath)
+                }
+                let change: MothxFileChange?
+                if let local, local.isReviewable {
+                    // ACP is the authoritative source for complete before /
+                    // after content. Server history is only a fallback for
+                    // conversations that predate local ACP persistence.
+                    change = local
                 } else {
-                    detail = nil
+                    let detail: MothxToolResultDetail?
+                    if let callID = call.toolCallId {
+                        detail = await loadToolResultDetail(sessionID: sessionID, toolCallID: callID)
+                    } else {
+                        detail = nil
+                    }
+                    if !summary.contains("Diff:"), let detail {
+                        summary = detail.content
+                    }
+                    change = historicalChange(target: target, summary: summary, detail: detail)
                 }
-                if !summary.contains("Diff:"), let detail {
-                    summary = detail.content
-                }
-                guard let change = historicalChange(target: target, summary: summary, detail: detail) else { continue }
+                guard let change else { continue }
                 files[change.path] = combinedServerChange(previous: files[change.path], next: change)
             }
             guard !files.isEmpty else {
@@ -1409,7 +2197,7 @@ final class MothxServiceManager: ObservableObject {
             }
         }
         await flush()
-        changeStore.save(changesByRun)
+        persistChanges()
     }
 
     private func historicalChange(target: (url: URL, relativePath: String), summary: String, detail: MothxToolResultDetail?) -> MothxFileChange? {
@@ -1453,9 +2241,19 @@ final class MothxServiceManager: ObservableObject {
                   let args = (try? JSONSerialization.jsonObject(with: argsData)) as? [String: Any],
                   let path = toolPath(from: args),
                   let target = captureTarget(path, sessionID: sessionID),
-                  let callID = call.toolCallId,
-                  let detail = await loadToolResultDetail(sessionID: sessionID, toolCallID: callID),
-                  let change = historicalChange(target: target, summary: detail.content, detail: detail) else { continue }
+                  let callID = call.toolCallId else { continue }
+            let change: MothxFileChange?
+            if let local = localChange(sessionID: sessionID, toolCallID: callID, path: target.relativePath),
+               local.isReviewable {
+                change = local
+            } else if let detail = await loadToolResultDetail(sessionID: sessionID, toolCallID: callID) {
+                // Compatibility path for conversations created before ACP
+                // file changes were persisted locally.
+                change = historicalChange(target: target, summary: detail.content, detail: detail)
+            } else {
+                change = nil
+            }
+            guard let change else { continue }
             files[change.path] = combinedServerChange(previous: files[change.path], next: change)
         }
         guard !files.isEmpty else { return }
@@ -1467,7 +2265,7 @@ final class MothxServiceManager: ObservableObject {
             capturedAt: Date()
         )
         latestChangesBySession[sessionID] = changesByRun[resolvedRunID]
-        changeStore.save(changesByRun)
+        persistChanges()
     }
 
     private func loadHistoricalRuns(sessionID: String, messages: [MothxMessage]) async {
@@ -1475,6 +2273,13 @@ final class MothxServiceManager: ObservableObject {
             let data = try await request(path: "api/sessions/\(sessionID)/runs?limit=200", method: "GET")
             guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let values = object["runs"] as? [[String: Any]] else { return }
+
+            // Historical Runs are newest-first. When no turn is currently
+            // executing in this session, restore the metric row from the
+            // latest turn so reopening a conversation does not show dashes.
+            if runSessionID != sessionID || !isRunning {
+                await restoreLatestRunMetrics(sessionID: sessionID, runs: values)
+            }
 
             // The API returns newest-first and may contain multiple attempts
             // for one user turn. Keep only the latest attempt per intent, then
@@ -1518,6 +2323,92 @@ final class MothxServiceManager: ObservableObject {
             // from being displayed when an older server lacks this endpoint.
             historicalRunsByMessage[sessionID] = [:]
         }
+    }
+
+    private func restoreLatestRunMetrics(sessionID: String, runs: [[String: Any]]) async {
+        guard let latest = runs.first else {
+            metricsBySession[sessionID] = MothxSessionMetrics()
+            return
+        }
+
+        metricsBySession[sessionID] = MothxSessionMetrics()
+        let modelWindow = contextWindow(for: latest, sessionID: sessionID)
+        let restoredContext = updateRunContextUsage(
+            from: latest["ContextUsage"] ?? latest["contextUsage"] ?? latest["context_usage"],
+            fallbackSize: modelWindow,
+            sessionID: sessionID
+        )
+        let restoredCache = updateRunCacheHitRate(
+            from: latest["Usage"] ?? latest["usage"],
+            sessionID: sessionID
+        )
+        guard !restoredContext || !restoredCache,
+              !sessionDir.isEmpty,
+              let runID = (latest["ID"] as? String) ?? (latest["id"] as? String),
+              !runID.isEmpty else { return }
+
+        let configuredSessionDirectory = sessionDir
+        let storedUsage = await Task.detached(priority: .utility) {
+            MothxACPUsageReader.usage(
+                sessionDirectory: configuredSessionDirectory,
+                sessionID: sessionID,
+                runID: runID
+            )
+        }.value
+        guard let storedUsage,
+              runSessionID != sessionID || !isRunning else { return }
+
+        if !restoredCache {
+            updateRunCacheHitRate(
+                input: storedUsage.input,
+                output: storedUsage.output,
+                total: storedUsage.totalTokens,
+                cacheRead: storedUsage.cacheRead,
+                cacheWrite: storedUsage.cacheWrite,
+                sessionID: sessionID
+            )
+        }
+        if !restoredContext, let modelWindow {
+            updateRunContextUsage(
+                used: storedUsage.lastTotalTokens,
+                size: modelWindow,
+                sessionID: sessionID
+            )
+        }
+    }
+
+    private func contextWindow(for run: [String: Any], sessionID: String) -> Int? {
+        let runModel = ((run["Model"] as? String) ?? (run["model"] as? String) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let savedModel = modelForSession(sessionID) ?? defaultModel
+        let rawModel = runModel.isEmpty ? savedModel : runModel
+        guard !rawModel.isEmpty else { return nil }
+
+        let runProvider = ((run["Provider"] as? String) ?? (run["provider"] as? String) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let savedProvider = providerForSession(sessionID) ?? defaultProvider
+        let providerID = runProvider.isEmpty ? savedProvider : runProvider
+        let unqualifiedModel: String
+        if !providerID.isEmpty, rawModel.hasPrefix("\(providerID)/") {
+            unqualifiedModel = String(rawModel.dropFirst(providerID.count + 1))
+        } else {
+            unqualifiedModel = rawModel
+        }
+
+        if let provider = providers.first(where: { $0.id == providerID }),
+           let model = provider.models.first(where: { $0.id == rawModel || $0.id == unqualifiedModel }),
+           model.contextWindow > 0 {
+            return model.contextWindow
+        }
+        return providers.lazy
+            .flatMap(\.models)
+            .first { model in
+                model.contextWindow > 0
+                    && (model.id == rawModel
+                        || model.id == unqualifiedModel
+                        || rawModel.hasSuffix("/\(model.id)"))
+            }?
+            .contextWindow
     }
 
     private func decodeRunSummary(_ item: [String: Any]) -> MothxRunSummary? {
@@ -1574,11 +2465,20 @@ final class MothxServiceManager: ObservableObject {
                     }
                     if object["stream"] as? String == "run",
                        object["event"] as? String == "usage",
-                       object["runId"] as? String == self.currentRunID,
+                       let eventRunID = object["runId"] as? String,
                        let eventData = object["data"] as? [String: Any],
                        let usage = eventData["usage"] as? [String: Any] {
-                        await MainActor.run {
-                            self.updateRunCacheHitRate(from: usage)
+                        let shouldApply = await MainActor.run {
+                            eventRunID == self.currentRunID
+                                || (self.activeAgentTransport == .acp
+                                    && self.runSessionID == sessionID
+                                    && self.acpDurableRunID == eventRunID)
+                        }
+                        if shouldApply {
+                            await MainActor.run {
+                                self.updateRunCacheHitRate(from: usage)
+                                self.updateRunContextUsage(from: eventData["contextUsage"] ?? eventData["ContextUsage"] ?? eventData["context_usage"])
+                            }
                         }
                         continue
                     }
@@ -1597,7 +2497,7 @@ final class MothxServiceManager: ObservableObject {
                     if eventData["type"] as? String == "thinking_delta",
                        let delta = messageObject["content"] as? String {
                         await MainActor.run {
-                            self.thinkingBySession[sessionID, default: ""] += delta
+                            self.appendThinking(delta, for: sessionID)
                         }
                     } else if eventData["type"] as? String == "plan_update",
                               let planObject = messageObject["plan"],

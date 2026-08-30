@@ -390,10 +390,31 @@ private struct AdvancedSettingsSection: View {
     @EnvironmentObject private var mothx: MothxServiceManager
     @EnvironmentObject private var languageStore: LanguageStore
     @AppStorage("mothxOS.reuseExistingService") private var reuseExistingService = false
+    @AppStorage(MothxAgentTransport.defaultsKey) private var agentTransport = MothxAgentTransport.acp.rawValue
 
     var body: some View {
         let c = languageStore.copy
         return VStack(alignment: .leading, spacing: 16) {
+            SettingsCard(
+                title: c.text("Agent 连接方式", "Agent transport"),
+                subtitle: c.text("ACP 直接承载对话运行；Serve API 继续负责设置、项目、历史与统计。", "ACP carries agent runs directly; the Serve API still manages settings, projects, history, and statistics.")
+            ) {
+                Picker(c.text("连接方式", "Transport"), selection: $agentTransport) {
+                    Text(c.text("ACP（实验性）", "ACP (Experimental)"))
+                        .tag(MothxAgentTransport.acp.rawValue)
+                    Text("Serve API")
+                        .tag(MothxAgentTransport.serve.rawValue)
+                }
+                .pickerStyle(.segmented)
+                Text(c.text("ACP 为此分支的默认方式。图片或显式选择 Skill 时会自动回退 Serve API。", "ACP is the default on this branch. Image input or explicitly selected Skills automatically fall back to the Serve API."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .onChange(of: agentTransport) { _, value in
+                if value == MothxAgentTransport.serve.rawValue {
+                    Task { await mothx.stopACPClient() }
+                }
+            }
             SettingsCard(title: c.advancedSettings, subtitle: c.advancedSettingsSubtitle) {
             Button {
                 NSWorkspace.shared.open(mothx.advancedTestURL)

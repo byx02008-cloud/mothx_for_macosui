@@ -113,12 +113,13 @@ struct Copy {
     var fileCreated: String { text("已创建", "Created") }
     var fileModified: String { text("已修改", "Modified") }
     var fileDeleted: String { text("已删除", "Deleted") }
-    var diffTooLarge: String { text("Diff 过大", "Diff too large") }
+    var diffTooLarge: String { text("文件较大，已切换为前后文查看", "Large file; showing before/after content") }
     func filesChanged(_ count: Int) -> String { text("已编辑 \(count) 个文件", "Edited \(count) files") }
     var explainProject: String { text("解释这个项目", "Explain this project") }
     var runTests: String { text("运行测试", "Run the tests") }
     var findBug: String { text("查找问题", "Find a bug") }
     var askAnything: String { text("请输入任务…", "Ask anything…") }
+    var contextUsage: String { text("上下文占用", "Context usage") }
     var cacheHitRate: String { text("命中率", "Cache hit rate") }
     var attach: String { text("附件", "Attach") }
     var defaultMode: String { text("Agent 模式", "Agent mode") }
@@ -478,14 +479,24 @@ struct Copy {
 
 /// Shared short elapsed-time formatter for run status views (StatusInline, RunStatusRow).
 func formatElapsedShort(_ elapsed: TimeInterval, language: AppLanguage) -> String {
+    let elapsed = max(0, elapsed)
     if elapsed < 60 {
-        return language == .zh ? String(format: "%.1f 秒", elapsed) : String(format: "%.1fs", elapsed)
+        let tenths = floor(elapsed * 10) / 10
+        return language == .zh ? String(format: "%.1f 秒", tenths) : String(format: "%.1fs", tenths)
     }
-    let minutes = floor(elapsed / 60)
-    let seconds = elapsed.truncatingRemainder(dividingBy: 60)
+    let totalSeconds = Int(floor(elapsed))
+    let totalMinutes = totalSeconds / 60
+    let seconds = totalSeconds % 60
+    if totalMinutes < 60 {
+        return language == .zh
+            ? String(format: "%d 分 %d 秒", totalMinutes, seconds)
+            : String(format: "%dm %ds", totalMinutes, seconds)
+    }
+    let hours = totalMinutes / 60
+    let minutes = totalMinutes % 60
     return language == .zh
-        ? String(format: "%.0f 分 %.0f 秒", minutes, seconds)
-        : String(format: "%.0fm %.0fs", minutes, seconds)
+        ? String(format: "%d 小时 %d 分 %d 秒", hours, minutes, seconds)
+        : String(format: "%dh %dm %ds", hours, minutes, seconds)
 }
 
 

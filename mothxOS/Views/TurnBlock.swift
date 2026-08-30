@@ -141,6 +141,9 @@ struct TurnBlock: View {
     }
 
     private var isRunActive: Bool { mothx.runSessionID == sessionID && mothx.isRunning }
+    /// A session-level Run is rendered as live state only by its final turn.
+    /// Earlier turns remain historical while a new turn is executing.
+    private var isTurnRunActive: Bool { turn.isLast && isRunActive }
     private var isCurrentRunSession: Bool { mothx.runSessionID == sessionID }
 
     private var turnChanges: MothxTurnChanges? {
@@ -161,7 +164,12 @@ struct TurnBlock: View {
                 return changes
             }
         }
-        if turn.isLast, let changes = mothx.latestChangesBySession[sessionID] {
+        let expectedLatestRunID = historicalRunID
+            ?? (turn.isLast && isCurrentRunSession ? mothx.currentRunID : nil)
+        if turn.isLast,
+           let changes = mothx.latestChangesBySession[sessionID],
+           let expectedLatestRunID,
+           changes.runID == expectedLatestRunID {
             return changes
         }
         return nil
@@ -215,14 +223,16 @@ struct TurnBlock: View {
                             isForking: forkingMessageID == forkableAssistantMessage?.id
                         )
                         if turn.hasResponded { agentResponseBlock }
-                        if turn.isLast, isRunActive,
-                           mothx.runStatus == "queued" || mothx.runStatus == "running" {
-                            ThinkingIndicator(isActive: true)
-                        }
                         // Show status for the last turn before the agent responds,
                         // so the user sees elapsed time while waiting.
                         if turn.isLast, isCurrentRunSession, let status = mothx.runStatus, !turn.hasResponded {
-                            StatusInline(status: status, elapsed: mothx.runElapsed, error: mothx.runError)
+                            StatusInline(
+                                status: status,
+                                elapsed: mothx.runElapsed,
+                                error: mothx.runError,
+                                thinking: isRunActive ? mothx.thinkingBySession[sessionID] : nil,
+                                allowsExpansion: isRunActive
+                            )
                         }
                     }
                     .padding(.leading, 12)
@@ -260,10 +270,10 @@ struct TurnBlock: View {
             ForEach(turn.resultMessages) { message in
                 MessageBubble(
                     message: message,
-                    isCurrentRunning: isRunActive && mothx.currentRunningMessageID == message.id
+                    isCurrentRunning: isTurnRunActive && mothx.currentRunningMessageID == message.id
                 )
             }
-            if !isRunActive, let turnChanges, !turnChanges.files.isEmpty {
+            if !isTurnRunActive, let turnChanges, !turnChanges.files.isEmpty {
                 ChangeSummaryCard(
                     changes: turnChanges,
                     onReview: { onReviewChanges?(turnChanges) },
@@ -274,7 +284,13 @@ struct TurnBlock: View {
             // Current run: use live status.  Historical: look up via any
             // message ID (result or process) so tool-only turns also show.
             if let s = turnStatus {
-                StatusInline(status: s.status, elapsed: s.elapsed, error: s.error)
+                StatusInline(
+                    status: s.status,
+                    elapsed: s.elapsed,
+                    error: s.error,
+                    thinking: isTurnRunActive ? mothx.thinkingBySession[sessionID] : nil,
+                    allowsExpansion: isTurnRunActive
+                )
             }
         }
         .padding(8)

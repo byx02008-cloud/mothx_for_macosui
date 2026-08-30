@@ -11,7 +11,10 @@ struct MothxRunSummary: Hashable {
 
     var elapsed: TimeInterval {
         guard let startedAt else { return 0 }
-        let end = finishedAt ?? updatedAt ?? Date()
+        // Historical summaries must remain stable when another Run causes
+        // SwiftUI to refresh. Live Run duration is supplied separately by
+        // MothxServiceManager.runElapsed for the final active turn.
+        guard let end = finishedAt ?? updatedAt else { return 0 }
         return max(0, end.timeIntervalSince(startedAt))
     }
 }

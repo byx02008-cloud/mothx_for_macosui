@@ -33,6 +33,12 @@ struct WorkspaceView: View {
     @State private var reviewSidebarWidth: CGFloat = 420
     @State private var conversationWasAtBottomBeforeReview = true
     @State private var conversationLayoutID = 0
+    /// Incremented to ask ConversationScrollObserver to land the viewport at
+    /// the conversation bottom through the underlying NSScrollView, where the
+    /// lazy stack's document height is already committed. SwiftUI's own
+    /// ScrollViewReader.scrollTo can race the LazyVStack layout and leave the
+    /// restored conversation blank until the first user scroll.
+    @State private var scrollToBottomRequest = 0
 
     private let conversationBottomID = "conversation-bottom"
 
@@ -43,6 +49,7 @@ struct WorkspaceView: View {
 
     var body: some View {
         let c = languageStore.copy
+        let sessionMetrics = sessionID.map { mothx.metrics(for: $0) } ?? MothxSessionMetrics()
         return GeometryReader { workspaceProxy in
         HSplitView {
         VStack(spacing: 0) {
@@ -99,7 +106,6 @@ struct WorkspaceView: View {
                         ScrollViewReader { reader in
                         ScrollView {
                             LazyVStack(alignment: .leading, spacing: 6) {
-                                let isRunActive = mothx.runSessionID == sessionID && mothx.isRunning
                                 let visibleTurns = showAllHistory ? currentTurns : Array(currentTurns.suffix(3))
 
                                 ForEach(visibleTurns) { turn in
@@ -117,26 +123,20 @@ struct WorkspaceView: View {
                                     )
                                 }
 
-                                // Thinking indicator + status when running but no messages yet
-                                if isRunActive, currentTurns.isEmpty {
-                                    if mothx.runStatus == "queued" || mothx.runStatus == "running" {
-                                        ThinkingIndicator(isActive: true)
-                                    }
-                                    if mothx.runStatus != nil,
-                                       let status = mothx.runStatus {
-                                        StatusInline(
-                                            status: status,
-                                            elapsed: mothx.runElapsed,
-                                            error: mothx.runError
-                                        )
-                                    }
-                                }
-
-                                if isRunActive {
-                                    if let thinking = mothx.thinkingBySession[sessionID],
-                                       !thinking.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                        ThinkingContentView(text: thinking)
-                                    }
+                                // A session can briefly have no turn while its
+                                // first user message is being attached. Keep
+                                // the same inline status presentation here.
+                                if mothx.runSessionID == sessionID,
+                                   mothx.isRunning,
+                                   currentTurns.isEmpty,
+                                   let status = mothx.runStatus {
+                                    StatusInline(
+                                        status: status,
+                                        elapsed: mothx.runElapsed,
+                                        error: mothx.runError,
+                                        thinking: mothx.thinkingBySession[sessionID],
+                                        allowsExpansion: true
+                                    )
                                 }
 
                                 Color.clear
@@ -147,22 +147,27 @@ struct WorkspaceView: View {
                             .padding(28)
                             .frame(maxWidth: .infinity)
                             .background(
-                                ConversationScrollObserver(layoutToken: conversationLayoutID) { atBottom in
+                                ConversationScrollObserver(
+                                    layoutToken: conversationLayoutID,
+                                    scrollToBottomToken: scrollToBottomRequest
+                                ) { atBottom in
                                     isConversationAtBottom = atBottom
                                 }
                             )
                         }
                         .coordinateSpace(name: "conversation-scroll")
                         .onChange(of: mothx.messagesBySession[sessionID] ?? []) { _, _ in
-                            scrollToBottom(reader, animated: false)
+                            requestScrollToBottom()
                         }
                         .onChange(of: currentTurns.count) { _, _ in
                             // The initial history request completes after the
                             // ScrollView has appeared. Re-apply the bottom
-                            // position after the turn list is committed so a
-                            // restored session does not open on an empty area
-                            // until the user nudges the scrollbar.
-                            scrollToBottom(reader, animated: false)
+                            // position after the turn list is committed. This
+                            // must go through the AppKit-level observer: it
+                            // forces the LazyVStack layout first, so a restored
+                            // session never opens on a blank viewport until the
+                            // user nudges the scrollbar.
+                            requestScrollToBottom()
                         }
                         .onChange(of: mothx.thinkingBySession[sessionID] ?? "") { _, _ in
                             if mothx.runSessionID == sessionID, mothx.isRunning {
@@ -177,12 +182,10 @@ struct WorkspaceView: View {
                         .onChange(of: reviewedChanges == nil) { _, isClosed in
                             conversationLayoutID += 1
                             guard isClosed, conversationWasAtBottomBeforeReview else { return }
-                            DispatchQueue.main.async {
-                                scrollToBottom(reader, animated: false)
-                            }
+                            requestScrollToBottom()
                         }
                         .onAppear {
-                            scrollToBottom(reader, animated: false)
+                            requestScrollToBottom()
                         }
                         .overlay(alignment: .topTrailing) {
                             if currentTurns.count > 3 {
@@ -238,7 +241,9 @@ struct WorkspaceView: View {
                 selectedTools: $selectedTools,
                 models: currentModels,
                 isRunning: mothx.isSubmittingRun || mothx.isStreaming,
-                cacheHitRate: mothx.runCacheHitRate,
+                contextUsedTokens: sessionMetrics.contextUsedTokens,
+                contextWindowTokens: sessionMetrics.contextWindowTokens,
+                cacheHitRate: sessionMetrics.cacheHitRate,
                 chooseFiles: chooseFiles,
                 submit: submit,
                     stop: { Task { await mothx.cancelRun() } }
@@ -293,6 +298,9 @@ struct WorkspaceView: View {
                 preparedTurnIDs = []
                 preparingTurnID = nil
                 if let lastID = currentTurns.last?.id { prepareTurn(lastID) }
+                // Guarantee the restored conversation opens at the bottom even
+                // when the turn count did not change this session switch.
+                requestScrollToBottom()
             }
         }
         .onChange(of: mothx.messagesBySession) { _, _ in
@@ -382,6 +390,10 @@ struct WorkspaceView: View {
                 rightSidebarToggleButton
             }
         }
+    }
+
+    private func requestScrollToBottom() {
+        scrollToBottomRequest += 1
     }
 
     private func scrollToBottom(_ reader: ScrollViewProxy, animated: Bool) {
@@ -562,6 +574,14 @@ struct WorkspaceView: View {
         guard let sessionID else { return }
         var question = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !question.isEmpty || !attachments.isEmpty else { return }
+        // Submission starts a new turn. Collapse every turn that already
+        // belongs to this session; the incoming local user message will form
+        // a new last turn and the message observer will expand that one only.
+        withAnimation(.easeInOut(duration: 0.2)) {
+            expandedTurnIDs.removeAll()
+            preparedTurnIDs.removeAll()
+            preparingTurnID = nil
+        }
         let imageAttachments = attachments.compactMap(\.dataURL)
         if question.isEmpty, !attachments.isEmpty {
             let separator = languageStore.language == .zh ? "、" : ", "
@@ -782,6 +802,8 @@ struct PromptComposer: View {
     @Binding var selectedTools: Set<String>
     let models: [MothxModelConfig]
     let isRunning: Bool
+    let contextUsedTokens: Int?
+    let contextWindowTokens: Int?
     let cacheHitRate: Double?
     let chooseFiles: () -> Void
     let submit: () -> Void
@@ -812,6 +834,34 @@ struct PromptComposer: View {
     private var cacheHitRateLabel: String {
         guard let cacheHitRate else { return "—" }
         return String(format: "%.0f%%", cacheHitRate * 100)
+    }
+
+    private var contextUsageLabel: String {
+        guard let contextUsedTokens,
+              let contextWindowTokens,
+              contextWindowTokens > 0 else { return "—" }
+        let rate = min(1, max(0, Double(contextUsedTokens) / Double(contextWindowTokens)))
+        return "\(String(format: "%.0f", rate * 100))%/\(compactTokenCount(contextWindowTokens))(\(compactTokenCount(contextUsedTokens)))"
+    }
+
+    private func compactTokenCount(_ value: Int) -> String {
+        let absoluteValue = abs(Double(value))
+        // Model catalogs commonly encode advertised binary windows as exact
+        // powers of two (262_144 = 256K), while million-token models use the
+        // decimal value 1_000_000. Preserve both familiar labels.
+        if value != 0, value.isMultiple(of: 1_048_576) {
+            return "\(value / 1_048_576)M"
+        }
+        if absoluteValue >= 1_000_000 {
+            let scaled = Double(value) / 1_000_000
+            if scaled.rounded() == scaled { return "\(Int(scaled))M" }
+            return "\(String(format: "%.1f", scaled))M"
+        }
+        if absoluteValue >= 1_000 {
+            if value.isMultiple(of: 1_024) { return "\(value / 1_024)K" }
+            return "\(Int((Double(value) / 1_000).rounded()))K"
+        }
+        return String(value)
     }
 
     private var filteredProviders: [MothxProviderConfig] {
@@ -977,16 +1027,18 @@ struct PromptComposer: View {
         .background(composerBackground)
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.12)))
-        // Keep the metric outside the composer border, aligned to its upper-right corner.
+        // Keep session metrics visible above the composer before, during, and
+        // after a run. Unknown values remain explicit rather than hiding the row.
         .overlay(alignment: .topTrailing) {
-            if isRunning {
+            HStack(spacing: 14) {
+                Text("\(c.contextUsage)  \(contextUsageLabel)")
                 Text("\(c.cacheHitRate)  \(cacheHitRateLabel)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-                    .padding(.horizontal, 10)
-                    .offset(y: -22)
             }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .monospacedDigit()
+            .padding(.horizontal, 10)
+            .offset(y: -22)
         }
         .overlay(alignment: .topLeading) {
             if isRunning, let plan = mothx.currentPlan {
@@ -1108,29 +1160,11 @@ struct Suggestion: View { let title: String; let icon: String
     var body: some View { Label(title, systemImage: icon).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 12).padding(.vertical, 8).background(Color.primary.opacity(0.06)).clipShape(Capsule()) }
 }
 
-private struct ThinkingContentView: View {
-    @EnvironmentObject private var languageStore: LanguageStore
-    let text: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Label(languageStore.copy.thinkingLabel, systemImage: "brain.head.profile")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.orange)
-            Text(text)
-                .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(10)
-        .background(Color.orange.opacity(0.06))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-}
-
 private struct ConversationScrollObserver: NSViewRepresentable {
     let layoutToken: Int
+    /// Bumped by WorkspaceView whenever the conversation should land at the
+    /// bottom (session restore, history commit, review close).
+    let scrollToBottomToken: Int
     let onBottomChanged: (Bool) -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -1141,6 +1175,7 @@ private struct ConversationScrollObserver: NSViewRepresentable {
         let view = NSView(frame: .zero)
         view.postsFrameChangedNotifications = false
         context.coordinator.layoutToken = layoutToken
+        context.coordinator.scrollToBottomToken = scrollToBottomToken
         context.coordinator.attach(to: view)
         return view
     }
@@ -1148,6 +1183,7 @@ private struct ConversationScrollObserver: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {
         context.coordinator.onBottomChanged = onBottomChanged
         context.coordinator.layoutToken = layoutToken
+        context.coordinator.scrollToBottomToken = scrollToBottomToken
         context.coordinator.attach(to: nsView)
     }
 
@@ -1155,6 +1191,8 @@ private struct ConversationScrollObserver: NSViewRepresentable {
         var onBottomChanged: (Bool) -> Void
         var layoutToken = 0
         var appliedLayoutToken: Int?
+        var scrollToBottomToken = 0
+        var appliedScrollToBottomToken: Int?
         var lastBottomState: Bool?
         weak var observedScrollView: NSScrollView?
         var boundsObserver: NSObjectProtocol?
@@ -1169,6 +1207,7 @@ private struct ConversationScrollObserver: NSViewRepresentable {
                       let scrollView = Self.findScrollView(from: view) else { return }
                 guard self.observedScrollView !== scrollView else {
                     self.refreshLayoutIfNeeded()
+                    self.refreshScrollIfNeeded()
                     self.updateBottomState()
                     return
                 }
@@ -1185,6 +1224,7 @@ private struct ConversationScrollObserver: NSViewRepresentable {
                     self?.updateBottomState()
                 }
                 self.refreshLayoutIfNeeded()
+                self.refreshScrollIfNeeded()
                 self.updateBottomState()
             }
         }
@@ -1196,6 +1236,38 @@ private struct ConversationScrollObserver: NSViewRepresentable {
             scrollView.needsLayout = true
             scrollView.layoutSubtreeIfNeeded()
             scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
+
+        /// AppKit-level "scroll to bottom". Unlike ScrollViewReader.scrollTo,
+        /// this first forces the LazyVStack document to commit its height, so
+        /// the request can never land outside the real content and leave a
+        /// blank viewport until the user scrolls. Runs one runloop after the
+        /// token change so the turn list has been committed.
+        func refreshScrollIfNeeded() {
+            guard appliedScrollToBottomToken != scrollToBottomToken else { return }
+            appliedScrollToBottomToken = scrollToBottomToken
+            DispatchQueue.main.async { [weak self] in
+                self?.scrollToBottomNow()
+            }
+        }
+
+        func scrollToBottomNow() {
+            guard let scrollView = observedScrollView,
+                  let documentView = scrollView.documentView else { return }
+            scrollView.needsLayout = true
+            scrollView.layoutSubtreeIfNeeded()
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+            let clipView = scrollView.contentView
+            let documentHeight = documentView.bounds.height
+            let clipHeight = clipView.bounds.height
+            guard documentHeight > 0, clipHeight > 0 else { return }
+            // SwiftUI hosting documents are flipped: y grows downward and the
+            // bottom of the content is at maxY = height - clipHeight.
+            let maxY = max(0, documentHeight - clipHeight)
+            let currentY = clipView.bounds.origin.y
+            guard abs(currentY - maxY) > 0.5 else { return }
+            clipView.scroll(to: NSPoint(x: 0, y: maxY))
+            scrollView.reflectScrolledClipView(clipView)
         }
 
         func updateBottomState() {

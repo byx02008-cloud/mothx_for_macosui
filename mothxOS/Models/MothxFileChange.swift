@@ -63,7 +63,30 @@ struct MothxTurnChanges: Identifiable, Codable, Hashable {
     var deleted: Int { files.reduce(0) { $0 + $1.deleted } }
 }
 
+/// A file change captured from one ACP tool call. The tool-call key is kept
+/// separately from the turn projection because ACP's client Run ID is
+/// temporary and cannot be used to restore a conversation after relaunch.
+struct MothxToolChangeRecord: Codable, Hashable {
+    let sessionID: String
+    let toolCallID: String
+    let files: [MothxFileChange]
+    let capturedAt: Date
+}
+
+struct MothxChangeStoreState {
+    let turns: [String: MothxTurnChanges]
+    let toolChanges: [String: MothxToolChangeRecord]
+}
+
 final class MothxChangeStore {
+    private static let currentVersion = 2
+
+    private struct Envelope: Codable {
+        let version: Int
+        let turns: [String: MothxTurnChanges]
+        let toolChanges: [String: MothxToolChangeRecord]
+    }
+
     private let url: URL
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
@@ -75,12 +98,23 @@ final class MothxChangeStore {
         url = directory.appendingPathComponent("changes.json")
     }
 
-    func load() -> [String: MothxTurnChanges] {
-        guard let data = try? Data(contentsOf: url),
-              let values = try? decoder.decode([String: MothxTurnChanges].self, from: data) else { return [:] }
-        // Older versions persisted file contents. Strip them while loading so
-        // stale local data can no longer make a historical change reviewable.
-        return values.mapValues { turn in
+    func load() -> MothxChangeStoreState {
+        guard let data = try? Data(contentsOf: url) else {
+            return MothxChangeStoreState(turns: [:], toolChanges: [:])
+        }
+
+        if let envelope = try? decoder.decode(Envelope.self, from: data),
+           envelope.version >= Self.currentVersion {
+            return MothxChangeStoreState(turns: envelope.turns, toolChanges: envelope.toolChanges)
+        }
+
+        // Legacy files were keyed only by the temporary Run ID. They may also
+        // contain content from an older experimental format without a stable
+        // ACP tool-call key, so intentionally downgrade them to preview-only.
+        guard let legacy = try? decoder.decode([String: MothxTurnChanges].self, from: data) else {
+            return MothxChangeStoreState(turns: [:], toolChanges: [:])
+        }
+        let previewTurns = legacy.mapValues { turn in
             MothxTurnChanges(
                 id: turn.id,
                 runID: turn.runID,
@@ -95,28 +129,13 @@ final class MothxChangeStore {
                 capturedAt: turn.capturedAt
             )
         }
+        return MothxChangeStoreState(turns: previewTurns, toolChanges: [:])
     }
 
-    func save(_ values: [String: MothxTurnChanges]) {
+    func save(turns: [String: MothxTurnChanges], toolChanges: [String: MothxToolChangeRecord]) {
         encoder.outputFormatting = [.sortedKeys]
-        // Persist only metadata. oldText/newText/unifiedDiff are intentionally
-        // kept in memory for the active app session, never on disk.
-        let metadata = values.mapValues { turn in
-            MothxTurnChanges(
-                id: turn.id,
-                runID: turn.runID,
-                files: turn.files.map { file in
-                    MothxFileChange(
-                        previewPath: file.path,
-                        unifiedDiff: "历史运行已完成，详细 Diff 未持久化。",
-                        added: file.added,
-                        deleted: file.deleted
-                    )
-                },
-                capturedAt: turn.capturedAt
-            )
-        }
-        guard let data = try? encoder.encode(metadata) else { return }
+        let envelope = Envelope(version: Self.currentVersion, turns: turns, toolChanges: toolChanges)
+        guard let data = try? encoder.encode(envelope) else { return }
         try? data.write(to: url, options: .atomic)
     }
 }

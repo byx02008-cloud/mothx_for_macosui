@@ -92,7 +92,15 @@ struct Sidebar: View {
                         Button { showNewProject = true } label: { Image(systemName: "plus") }.buttonStyle(.plain).hoverHighlight().help(c.addProject)
                     }.padding(.bottom, 8)
                     ForEach(visibleProjects) { project in
-                        ProjectTreeRow(project: project, expanded: expandedProjects.contains(project.id), selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID, selectedTeamProjectID: $selectedTeamProjectID, showSettings: $showSettings, toggle: { toggle(project.id) }, addSession: { let session = mothx.prepareSession(projectID: project.id); selectedTeamProjectID = nil; selectedSessionID = session.id; selectedProjectID = project.id; showSettings = false }, delete: { pendingDelete = .project(project.id) }, requestDeleteSession: { pendingDelete = .session($0) }, openInTUI: { session in
+                        ProjectTreeRow(project: project, expanded: expandedProjects.contains(project.id), selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID, selectedTeamProjectID: $selectedTeamProjectID, showSettings: $showSettings, toggle: { toggle(project.id) }, addSession: {
+                            Task { @MainActor in
+                                let session = await mothx.prepareSessionForSelectedTransport(projectID: project.id)
+                                selectedTeamProjectID = nil
+                                selectedSessionID = session.id
+                                selectedProjectID = project.id
+                                showSettings = false
+                            }
+                        }, delete: { pendingDelete = .project(project.id) }, requestDeleteSession: { pendingDelete = .session($0) }, openInTUI: { session in
                             mothx.requestSwitch(activeRunSessionID: selectedSessionID) {
                                 showSettings = false
                                 selectedTeamProjectID = nil

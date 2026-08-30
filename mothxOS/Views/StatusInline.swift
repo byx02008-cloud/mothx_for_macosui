@@ -6,69 +6,68 @@ struct StatusInline: View {
     let status: String
     let elapsed: TimeInterval
     let error: String?
+    let thinking: String?
+    let allowsExpansion: Bool
 
     @EnvironmentObject private var languageStore: LanguageStore
     @State private var isExpanded = false
     @State private var dotBlink = false
 
+    private let maximumThinkingLines = 200
+    private let thinkingScrollAnchor = "status-inline-thinking-bottom"
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button {
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-                    isExpanded.toggle()
+            if allowsExpansion {
+                Button {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                        isExpanded.toggle()
+                    }
+                } label: {
+                    statusRow
                 }
-            } label: {
-                HStack(spacing: 8) {
-                    // Status dot
-                    Circle()
-                        .fill(statusColor)
-                        .frame(width: 7, height: 7)
-                        .opacity(isRunningStatus ? (dotBlink ? 0.3 : 1.0) : 1.0)
-                        .animation(
-                            isRunningStatus
-                                ? .easeInOut(duration: 0.8).repeatForever()
-                                : .default,
-                            value: dotBlink
-                        )
-
-                    // Status icon (SF Symbol with content transition)
-                    Image(systemName: statusIcon)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(statusColor)
-                        .contentTransition(.symbolEffect(.replace))
-
-                    // Status label
-                    Text(statusLabel)
-                        .font(.caption)
-                        .foregroundStyle(statusTextColor)
-
-                    // Elapsed
-                    Text("·")
-                        .foregroundStyle(.tertiary)
-                    Text(formattedElapsed)
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-
-                    // Expand chevron
-                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-
-                    Spacer()
-                }
-                .padding(.vertical, 5)
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
+            } else {
+                statusRow
             }
-            .buttonStyle(.plain)
 
-            if isExpanded {
-                if let error, !error.isEmpty {
-                    Text(error)
-                        .font(.caption2)
-                        .foregroundStyle(.red)
-                        .padding(.bottom, 5)
-                        .transition(.opacity.combined(with: .move(edge: .top)))
+            if allowsExpansion, isExpanded {
+                VStack(alignment: .leading, spacing: 6) {
+                    if let error, !error.isEmpty {
+                        Text(error)
+                            .font(.caption2)
+                            .foregroundStyle(.red)
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
+
+                    if !thinkingLines.isEmpty {
+                        ScrollViewReader { reader in
+                            ScrollView(.vertical) {
+                                VStack(alignment: .leading, spacing: 0) {
+                                    Text(thinkingText)
+                                        .font(.caption.monospaced())
+                                        .foregroundStyle(.secondary)
+                                        .textSelection(.enabled)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    Color.clear
+                                        .frame(height: 1)
+                                        .id(thinkingScrollAnchor)
+                                }
+                            }
+                            .scrollIndicators(.visible)
+                            .frame(height: 200)
+                            .onAppear {
+                                reader.scrollTo(thinkingScrollAnchor, anchor: .bottom)
+                            }
+                            .onChange(of: thinkingText) { _, _ in
+                                reader.scrollTo(thinkingScrollAnchor, anchor: .bottom)
+                            }
+                        }
+                        .padding(.leading, 22)
+                    }
                 }
+                .padding(.bottom, 5)
+                .transition(.opacity.combined(with: .move(edge: .top)))
                 Divider()
             }
         }
@@ -78,6 +77,60 @@ struct StatusInline: View {
         .onChange(of: status) { _, newStatus in
             dotBlink = isRunningStatus
         }
+    }
+
+    private var statusRow: some View {
+        HStack(spacing: 8) {
+            // Status dot
+            Circle()
+                .fill(statusColor)
+                .frame(width: 7, height: 7)
+                .opacity(isRunningStatus ? (dotBlink ? 0.3 : 1.0) : 1.0)
+                .animation(
+                    isRunningStatus
+                        ? .easeInOut(duration: 0.8).repeatForever()
+                        : .default,
+                    value: dotBlink
+                )
+
+            // Status icon (SF Symbol with content transition)
+            Image(systemName: statusIcon)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(statusColor)
+                .contentTransition(.symbolEffect(.replace))
+
+            // Status label
+            Text(statusLabel)
+                .font(.caption)
+                .foregroundStyle(statusTextColor)
+
+            // Elapsed
+            Text("·")
+                .foregroundStyle(.tertiary)
+            Text(formattedElapsed)
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+
+            if let thinkingPreview {
+                Text("·")
+                    .foregroundStyle(.tertiary)
+                Text(thinkingPreview)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+
+            if allowsExpansion {
+                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+
+            Spacer()
+        }
+        .padding(.vertical, 5)
+        .contentShape(Rectangle())
     }
 
     // MARK: - Computed
@@ -141,5 +194,30 @@ struct StatusInline: View {
 
     private var formattedElapsed: String {
         formatElapsedShort(elapsed, language: languageStore.language)
+    }
+
+    /// Keep the UI projection bounded even if an upstream transport sends a
+    /// long thought update. The service manager also trims its transient
+    /// buffer, but retaining this boundary here keeps this view safe for
+    /// callers that provide an unbounded string.
+    private var thinkingLines: [String] {
+        guard let thinking, !thinking.isEmpty else { return [] }
+        return Array(
+            thinking
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .map(String.init)
+                .suffix(maximumThinkingLines)
+        )
+    }
+
+    private var thinkingText: String {
+        thinkingLines.joined(separator: "\n")
+    }
+
+    private var thinkingPreview: String? {
+        guard !thinkingLines.isEmpty else { return nil }
+        return thinkingLines.reversed()
+            .first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

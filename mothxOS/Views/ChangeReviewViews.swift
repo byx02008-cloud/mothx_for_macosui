@@ -170,8 +170,20 @@ struct ChangeReviewSidebar: View {
                     if file.isReviewable {
                         ScrollView([.vertical, .horizontal]) {
                             if file.truncated {
-                                Text(file.unifiedDiff).foregroundStyle(.secondary)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                VStack(alignment: .leading, spacing: 10) {
+                                    Text("修改前 / Before")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.red)
+                                    Text(file.oldText ?? "")
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    Divider()
+                                    Text("修改后 / After")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.green)
+                                    Text(file.newText ?? "")
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
                             } else {
                                 VStack(alignment: .leading, spacing: 0) {
                                     ForEach(Array(file.unifiedDiff.split(separator: "\n", omittingEmptySubsequences: false).enumerated()), id: \.offset) { _, rawLine in
