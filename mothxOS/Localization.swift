@@ -109,6 +109,7 @@ struct Copy {
     var reviewChanges: String { text("审核", "Review") }
     var viewChanges: String { text("查看更改", "View changes") }
     var preview: String { text("预览", "Preview") }
+    var noPreviewInfo: String { text("暂无可以预览信息", "No preview information available") }
     var reviewChangesTitle: String { text("变更审核", "Review changes") }
     var fileCreated: String { text("已创建", "Created") }
     var fileModified: String { text("已修改", "Modified") }

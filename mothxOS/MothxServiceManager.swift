@@ -245,6 +245,7 @@ final class MothxServiceManager: ObservableObject {
     private var acpToolNames: [String: String] = [:]
     private var acpDurableRunID: String?
     private let changeStore = MothxChangeStore()
+    private var changeSaveGeneration = 0
     private var fileChangesByRun: [String: [String: MothxFileChange]] = [:]
     private var toolChangesByCall: [String: MothxToolChangeRecord] = [:]
     @Published private(set) var currentRunID: String?
@@ -966,7 +967,7 @@ final class MothxServiceManager: ObservableObject {
             return MothxToolResultDetail(
                 toolCallID: decoded.toolCallID,
                 toolName: decoded.toolName,
-                content: boundedToolDetail(decoded.content),
+                content: await Task.detached(priority: .userInitiated) { Self.boundedToolDetail(decoded.content) }.value,
                 isError: decoded.isError,
                 oldText: decoded.oldText,
                 newText: decoded.newText,
@@ -984,7 +985,7 @@ final class MothxServiceManager: ObservableObject {
         return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
     }
 
-    private func boundedToolDetail(_ value: String) -> String {
+    private nonisolated static func boundedToolDetail(_ value: String) -> String {
         let lines = value.components(separatedBy: .newlines)
         let limitedLines = lines.prefix(240)
         var result = limitedLines.joined(separator: "\n")
@@ -1149,7 +1150,7 @@ final class MothxServiceManager: ObservableObject {
         let params = object["params"] as? [String: Any] ?? [:]
         switch method {
         case "session/update":
-            handleACPSessionUpdate(params)
+            await handleACPSessionUpdate(params)
         case "_mothx/session_event":
             handleACPSessionEvent(params)
         default:
@@ -1157,7 +1158,7 @@ final class MothxServiceManager: ObservableObject {
         }
     }
 
-    private func handleACPSessionUpdate(_ params: [String: Any]) {
+    private func handleACPSessionUpdate(_ params: [String: Any]) async {
         guard let sessionID = params["sessionId"] as? String,
               let update = params["update"] as? [String: Any],
               let kind = update["sessionUpdate"] as? String else { return }
@@ -1184,7 +1185,7 @@ final class MothxServiceManager: ObservableObject {
         case "tool_call":
             upsertACPToolCall(sessionID: sessionID, update: update)
         case "tool_call_update":
-            handleACPToolUpdate(sessionID: sessionID, update: update)
+            await handleACPToolUpdate(sessionID: sessionID, update: update)
         case "plan":
             handleACPPlan(update)
         case "usage_update":
@@ -1274,14 +1275,14 @@ final class MothxServiceManager: ObservableObject {
         messagesBySession[sessionID] = messages
     }
 
-    private func handleACPToolUpdate(sessionID: String, update: [String: Any]) {
+    private func handleACPToolUpdate(sessionID: String, update: [String: Any]) async {
         guard let callID = update["toolCallId"] as? String, !callID.isEmpty else { return }
         upsertACPToolCall(sessionID: sessionID, update: update)
         let status = (update["status"] as? String ?? "").lowercased()
         let text = acpToolOutputText(update)
         if ["completed", "failed"].contains(status) || !text.isEmpty {
             let resultID = "acp-result-\(callID)"
-            let bounded = boundedToolDetail(text)
+            let bounded = await Task.detached(priority: .userInitiated) { Self.boundedToolDetail(text) }.value
             let result = MothxMessage(
                 id: resultID, seq: nil, role: "toolResult", content: bounded,
                 toolCallId: callID, toolName: acpToolNames[callID],
@@ -1297,26 +1298,41 @@ final class MothxServiceManager: ObservableObject {
             }
             messagesBySession[sessionID] = messages
         }
-        captureACPChanges(sessionID: sessionID, update: update, summary: text, toolCallID: callID)
+        await captureACPChanges(sessionID: sessionID, update: update, summary: text, toolCallID: callID)
     }
 
-    private func captureACPChanges(sessionID: String, update: [String: Any], summary: String, toolCallID: String) {
+    private func captureACPChanges(sessionID: String, update: [String: Any], summary: String, toolCallID: String) async {
         guard let runID = currentRunID, runID.hasPrefix("acp-client-"),
               let contents = update["content"] as? [[String: Any]] else { return }
+        // Path resolution touches main-actor state (cheap). LCS diff construction
+        // over a large file is the expensive part, so all of it runs off the
+        // main thread before merging sequentially on MainActor — the UI never
+        // waits on it (sidebar push included).
+        var pending: [(relativePath: String, oldText: String?, newText: String?, fallback: MothxFileChange?)] = []
         for content in contents where content["type"] as? String == "diff" {
             guard let rawPath = content["path"] as? String,
                   let target = captureTarget(rawPath, sessionID: sessionID) else { continue }
-            let change: MothxFileChange
             if let oldText = content["oldText"] as? String,
                let newText = content["newText"] as? String {
-                change = MothxDiffBuilder.make(path: target.relativePath, oldText: oldText, newText: newText)
+                pending.append((target.relativePath, oldText, newText, nil))
             } else {
                 let preview = summary.isEmpty
                     ? copy.text("ACP 返回了文件变更，但缺少完整的 oldText/newText。", "ACP returned a file change without a complete oldText/newText pair.")
                     : summary
-                change = MothxFileChange(previewPath: target.relativePath, unifiedDiff: preview, added: 0, deleted: 0)
+                pending.append((target.relativePath, nil, nil, MothxFileChange(previewPath: target.relativePath, unifiedDiff: preview, added: 0, deleted: 0)))
             }
-            mergeServerChange(change, sessionID: sessionID, runID: runID, toolCallID: toolCallID)
+        }
+        guard !pending.isEmpty else { return }
+        let built = await Task.detached(priority: .userInitiated) {
+            pending.map { item in
+                if let oldText = item.oldText, let newText = item.newText {
+                    return MothxDiffBuilder.make(path: item.relativePath, oldText: oldText, newText: newText)
+                }
+                return item.fallback ?? MothxFileChange(previewPath: item.relativePath, unifiedDiff: "", added: 0, deleted: 0)
+            }
+        }.value
+        for change in built {
+            await mergeServerChange(change, sessionID: sessionID, runID: runID, toolCallID: toolCallID)
         }
     }
 
@@ -2193,7 +2209,7 @@ final class MothxServiceManager: ObservableObject {
 
     // MARK: - Server-provided file changes
 
-    private func handleToolEvent(sessionID: String, runID: String, data: [String: Any]) {
+    private func handleToolEvent(sessionID: String, runID: String, data: [String: Any]) async {
         guard runID != "",
               let tool = data["tool"] as? String,
               isWriteLikeTool(tool) else { return }
@@ -2207,22 +2223,28 @@ final class MothxServiceManager: ObservableObject {
             ?? (data["tool_diff"] as? [String: Any])
         guard let rawPath = toolPath(from: diff ?? [:]) ?? toolPath(from: args),
               let target = captureTarget(rawPath, sessionID: sessionID) else { return }
-        let pair = serverBeforeAfter(from: data)
-        let summary = data["summary"] as? String ?? ""
-        let counts = serverDiffCounts(from: data) ?? historicalDiffCounts(summary) ?? (0, 0)
-        let change: MothxFileChange
-        if let pair {
-            change = MothxDiffBuilder.make(path: target.relativePath, oldText: pair.oldText, newText: pair.newText)
-        } else {
-            change = MothxFileChange(
-                previewPath: target.relativePath,
-                unifiedDiff: summary,
-                added: counts.added,
-                deleted: counts.deleted
-            )
-        }
         let toolCallID = (data["toolCallId"] as? String) ?? (data["tool_call_id"] as? String)
-        mergeServerChange(change, sessionID: sessionID, runID: runID, toolCallID: toolCallID)
+        guard let pair = serverBeforeAfter(from: data) else {
+            let summary = data["summary"] as? String ?? ""
+            let counts = serverDiffCounts(from: data) ?? Self.historicalDiffCounts(summary) ?? (0, 0)
+            await mergeServerChange(
+                MothxFileChange(
+                    previewPath: target.relativePath,
+                    unifiedDiff: summary,
+                    added: counts.added,
+                    deleted: counts.deleted
+                ),
+                sessionID: sessionID, runID: runID, toolCallID: toolCallID
+            )
+            return
+        }
+        // LCS diff construction over a large file runs off the main thread;
+        // the result is merged on MainActor when ready. The UI never blocks.
+        let relativePath = target.relativePath
+        let change = await Task.detached(priority: .userInitiated) {
+            MothxDiffBuilder.make(path: relativePath, oldText: pair.oldText, newText: pair.newText)
+        }.value
+        await mergeServerChange(change, sessionID: sessionID, runID: runID, toolCallID: toolCallID)
     }
 
     /// Tool names have changed across mothx releases and adapters. The
@@ -2270,9 +2292,9 @@ final class MothxServiceManager: ObservableObject {
         return (integerValue(addedValue), integerValue(deletedValue))
     }
 
-    private func mergeServerChange(_ change: MothxFileChange, sessionID: String, runID: String, toolCallID: String? = nil) {
+    private func mergeServerChange(_ change: MothxFileChange, sessionID: String, runID: String, toolCallID: String? = nil) async {
         var changes = fileChangesByRun[runID] ?? [:]
-        changes[change.path] = combinedServerChange(previous: changes[change.path], next: change)
+        changes[change.path] = await combinedServerChange(previous: changes[change.path], next: change)
         fileChangesByRun[runID] = changes
         let turnChanges = MothxTurnChanges(
             id: runID,
@@ -2286,7 +2308,7 @@ final class MothxServiceManager: ObservableObject {
         if let toolCallID, !toolCallID.isEmpty {
             let key = toolChangeKey(sessionID: sessionID, toolCallID: toolCallID)
             var callFiles = Dictionary(uniqueKeysWithValues: (toolChangesByCall[key]?.files ?? []).map { ($0.path, $0) })
-            callFiles[change.path] = combinedServerChange(previous: callFiles[change.path], next: change)
+            callFiles[change.path] = await combinedServerChange(previous: callFiles[change.path], next: change)
             toolChangesByCall[key] = MothxToolChangeRecord(
                 sessionID: sessionID,
                 toolCallID: toolCallID,
@@ -2306,18 +2328,32 @@ final class MothxServiceManager: ObservableObject {
         return toolChangesByCall[key]?.files.first { $0.path == path }
     }
 
+    /// Writes the full change database snapshot from a background task.
+    /// Encoding megabyte-sized diffs and the atomic file write can take
+    /// hundreds of milliseconds; keeping that on the main thread freezes the
+    /// whole UI (sidebar push included) on every tool event of a large file.
     private func persistChanges() {
-        changeStore.save(turns: changesByRun, toolChanges: toolChangesByCall)
+        changeSaveGeneration += 1
+        let generation = changeSaveGeneration
+        let snapshotTurns = changesByRun
+        let snapshotToolChanges = toolChangesByCall
+        let store = changeStore
+        Task.detached(priority: .utility) {
+            store.save(turns: snapshotTurns, toolChanges: snapshotToolChanges, generation: generation)
+        }
     }
 
-    private func combinedServerChange(previous: MothxFileChange?, next: MothxFileChange) -> MothxFileChange {
+    private func combinedServerChange(previous: MothxFileChange?, next: MothxFileChange) async -> MothxFileChange {
         guard let previous,
               let firstOldText = previous.oldText,
               next.isReviewable,
               let finalNewText = next.newText else {
             return next
         }
-        return MothxDiffBuilder.make(path: next.path, oldText: firstOldText, newText: finalNewText)
+        let path = next.path
+        return await Task.detached(priority: .userInitiated) {
+            MothxDiffBuilder.make(path: path, oldText: firstOldText, newText: finalNewText)
+        }.value
     }
 
     private func captureTarget(_ rawPath: String, sessionID: String) -> (url: URL, relativePath: String)? {
@@ -2375,10 +2411,13 @@ final class MothxServiceManager: ObservableObject {
                     if !summary.contains("Diff:"), let detail {
                         summary = detail.content
                     }
-                    change = historicalChange(target: target, summary: summary, detail: detail)
+                    let targetCapture = target
+                    change = await Task.detached(priority: .userInitiated) {
+                        Self.historicalChange(target: targetCapture, summary: summary, detail: detail)
+                    }.value
                 }
                 guard let change else { continue }
-                files[change.path] = combinedServerChange(previous: files[change.path], next: change)
+                files[change.path] = await combinedServerChange(previous: files[change.path], next: change)
             }
             guard !files.isEmpty else {
                 calls.removeAll()
@@ -2430,7 +2469,7 @@ final class MothxServiceManager: ObservableObject {
         persistChanges()
     }
 
-    private func historicalChange(target: (url: URL, relativePath: String), summary: String, detail: MothxToolResultDetail?) -> MothxFileChange? {
+    private nonisolated static func historicalChange(target: (url: URL, relativePath: String), summary: String, detail: MothxToolResultDetail?) -> MothxFileChange? {
         guard detail?.isError != true else { return nil }
         if let oldText = detail?.oldText,
            let newText = detail?.newText {
@@ -2446,7 +2485,7 @@ final class MothxServiceManager: ObservableObject {
         )
     }
 
-    private func historicalDiffCounts(_ summary: String) -> (added: Int, deleted: Int)? {
+    private nonisolated static func historicalDiffCounts(_ summary: String) -> (added: Int, deleted: Int)? {
         let pattern = #"Diff:\s*\+(\d+)\s*-(\d+)"#
         guard let regex = try? NSRegularExpression(pattern: pattern),
               let match = regex.firstMatch(in: summary, range: NSRange(summary.startIndex..., in: summary)),
@@ -2479,12 +2518,15 @@ final class MothxServiceManager: ObservableObject {
             } else if let detail = await loadToolResultDetail(sessionID: sessionID, toolCallID: callID) {
                 // Compatibility path for conversations created before ACP
                 // file changes were persisted locally.
-                change = historicalChange(target: target, summary: detail.content, detail: detail)
+                let targetCapture = target
+                change = await Task.detached(priority: .userInitiated) {
+                    Self.historicalChange(target: targetCapture, summary: detail.content, detail: detail)
+                }.value
             } else {
                 change = nil
             }
             guard let change else { continue }
-            files[change.path] = combinedServerChange(previous: files[change.path], next: change)
+            files[change.path] = await combinedServerChange(previous: files[change.path], next: change)
         }
         guard !files.isEmpty else { return }
         fileChangesByRun[resolvedRunID] = files
@@ -2716,9 +2758,12 @@ final class MothxServiceManager: ObservableObject {
                        object["event"] as? String == "tool_event",
                        let eventData = object["data"] as? [String: Any],
                        let eventRunID = (object["runId"] as? String) ?? (eventData["runId"] as? String) {
-                        await MainActor.run {
-                            self.handleToolEvent(sessionID: sessionID, runID: eventRunID, data: eventData)
-                        }
+                        // Runs to completion before the transcript events that
+                        // follow, so merge ordering stays identical to the old
+                        // synchronous MainActor.run path.
+                        await Task { @MainActor in
+                            await self.handleToolEvent(sessionID: sessionID, runID: eventRunID, data: eventData)
+                        }.value
                         continue
                     }
                     guard object["stream"] as? String == "transcript",

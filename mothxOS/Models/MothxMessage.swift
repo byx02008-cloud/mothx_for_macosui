@@ -90,7 +90,7 @@ struct MothxImagePreview: Identifiable, Hashable {
 
 // MARK: - Message
 
-struct MothxMessage: Identifiable, Hashable {
+nonisolated struct MothxMessage: Identifiable, Hashable {
     let id: String
     let seq: Int?
     let role: String           // "user", "assistant", "toolCall", "toolResult"

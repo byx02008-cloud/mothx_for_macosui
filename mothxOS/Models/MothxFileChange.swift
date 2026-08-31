@@ -1,12 +1,12 @@
 import Foundation
 
-enum MothxFileChangeKind: String, Codable, Hashable {
+nonisolated enum MothxFileChangeKind: String, Codable, Hashable {
     case created
     case modified
     case deleted
 }
 
-struct MothxFileChange: Identifiable, Codable, Hashable {
+nonisolated struct MothxFileChange: Identifiable, Codable, Hashable {
     let id: String
     let path: String
     let kind: MothxFileChangeKind
@@ -53,7 +53,7 @@ struct MothxFileChange: Identifiable, Codable, Hashable {
     }
 }
 
-struct MothxTurnChanges: Identifiable, Codable, Hashable {
+nonisolated struct MothxTurnChanges: Identifiable, Codable, Hashable {
     let id: String
     let runID: String
     let files: [MothxFileChange]
@@ -78,7 +78,13 @@ struct MothxChangeStoreState {
     let toolChanges: [String: MothxToolChangeRecord]
 }
 
-final class MothxChangeStore {
+/// Persists the change database off the main thread. `save` is cheap to call
+/// from the UI thread: encoding and the atomic write happen synchronously
+/// inside the caller-started background task, so the main run loop is never
+/// blocked by multi-megabyte diff serialization while a large file is being
+/// edited. A generation counter drops stale snapshots that would otherwise
+/// overwrite a newer save that already landed.
+nonisolated final class MothxChangeStore: @unchecked Sendable {
     private static let currentVersion = 2
 
     private struct Envelope: Codable {
@@ -88,7 +94,8 @@ final class MothxChangeStore {
     }
 
     private let url: URL
-    private let encoder = JSONEncoder()
+    private let saveLock = NSLock()
+    private var lastSavedGeneration = 0
     private let decoder = JSONDecoder()
 
     init() {
@@ -132,7 +139,15 @@ final class MothxChangeStore {
         return MothxChangeStoreState(turns: previewTurns, toolChanges: [:])
     }
 
-    func save(turns: [String: MothxTurnChanges], toolChanges: [String: MothxToolChangeRecord]) {
+    /// Serializes the given snapshot and writes it atomically. Meant to be
+    /// called from a background task; the generation guard ensures an older
+    /// snapshot that finishes late never clobbers a newer one.
+    func save(turns: [String: MothxTurnChanges], toolChanges: [String: MothxToolChangeRecord], generation: Int) {
+        saveLock.lock()
+        defer { saveLock.unlock() }
+        guard generation >= lastSavedGeneration else { return }
+        lastSavedGeneration = generation
+        let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let envelope = Envelope(version: Self.currentVersion, turns: turns, toolChanges: toolChanges)
         guard let data = try? encoder.encode(envelope) else { return }
@@ -140,7 +155,7 @@ final class MothxChangeStore {
     }
 }
 
-enum MothxDiffBuilder {
+nonisolated enum MothxDiffBuilder {
     static func make(path: String, oldText: String, newText: String) -> MothxFileChange {
         let oldLines = lines(oldText)
         let newLines = lines(newText)

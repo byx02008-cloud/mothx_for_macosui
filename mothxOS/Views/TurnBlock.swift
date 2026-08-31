@@ -1,6 +1,6 @@
 import SwiftUI
 
-struct Turn: Identifiable {
+nonisolated struct Turn: Identifiable {
     /// The user message is the durable identity of a turn. A random UUID here
     /// makes every transcript refresh look like a completely new long list to
     /// SwiftUI, which is especially expensive while scrolling.
@@ -36,7 +36,7 @@ struct Turn: Identifiable {
 
 /// A deliberately small projection of a tool call. Full tool messages never
 /// enter the main SwiftUI transcript tree; details are fetched on demand.
-struct ToolInvocationSummary: Identifiable, Hashable {
+nonisolated struct ToolInvocationSummary: Identifiable, Hashable {
     let id: String
     let toolName: String
     let argumentsPreview: String
@@ -58,7 +58,7 @@ struct ToolInvocationSummary: Identifiable, Hashable {
     }
 }
 
-func computeTurns(_ messages: [MothxMessage]) -> [Turn] {
+nonisolated func computeTurns(_ messages: [MothxMessage]) -> [Turn] {
     guard !messages.isEmpty else { return [] }
     var turns: [Turn] = []
     var curUser: MothxMessage?
@@ -113,7 +113,7 @@ func computeTurns(_ messages: [MothxMessage]) -> [Turn] {
     return turns
 }
 
-private func compactToolSummary(_ text: String) -> String {
+private nonisolated func compactToolSummary(_ text: String) -> String {
     let compact = text.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.joined(separator: " ")
     return compact.count > 140 ? String(compact.prefix(140)) + "…" : compact
 }

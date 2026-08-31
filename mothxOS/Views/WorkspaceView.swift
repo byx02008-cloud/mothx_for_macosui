@@ -38,10 +38,14 @@ struct WorkspaceView: View {
     @State private var forkingMessageID: String?
     @State private var forkErrorMessage: String?
     @State private var reviewedChanges: MothxTurnChanges?
+    @State private var showEmptyPreviewSidebar = false
     @State private var previewedSkill: MothxSkill?
     @State private var previewedTool: ToolInvocationSummary?
     @State private var previewedImage: MothxImagePreview?
     @State private var reviewSidebarWidth: CGFloat = 420
+    /// Remembers the sidebar width when a resize drag starts so the new width
+    /// is derived from the pre-drag value rather than the previous frame.
+    @State private var sidebarResizeStartWidth: CGFloat? = nil
     @State private var conversationWasAtBottomBeforeReview = true
     @State private var conversationLayoutID = 0
     /// Incremented to ask ConversationScrollObserver to land the viewport at
@@ -50,6 +54,9 @@ struct WorkspaceView: View {
     /// ScrollViewReader.scrollTo can race the LazyVStack layout and leave the
     /// restored conversation blank until the first user scroll.
     @State private var scrollToBottomRequest = 0
+    /// Guards async turn recomputes: only the newest request may commit,
+    /// otherwise a slower older pass could overwrite fresher turn data.
+    @State private var turnsRecomputeGeneration = 0
 
     private let conversationBottomID = "conversation-bottom"
 
@@ -62,7 +69,14 @@ struct WorkspaceView: View {
         let c = languageStore.copy
         let sessionMetrics = sessionID.map { mothx.metrics(for: $0) } ?? MothxSessionMetrics()
         return GeometryReader { workspaceProxy in
-        HSplitView {
+            // The right sidebar is a ZStack overlay (HSplitView cannot animate
+            // pane insertion/removal). Keep the pane in the hierarchy at all
+            // times and animate its offset together with the main column's
+            // trailing inset so opening slides it in from the trailing edge.
+            let sidebarMaxWidth = max(150, workspaceProxy.size.width * 0.5)
+            let rightSidebarWidth = min(max(reviewSidebarWidth, 150), sidebarMaxWidth)
+            let rightSidebarColumnWidth = rightSidebarWidth + 1 // + 1px separator
+            ZStack(alignment: .trailing) {
         VStack(spacing: 0) {
             if terminalStore.isOpen {
                 TUIPanelHeader(store: terminalStore)
@@ -350,7 +364,9 @@ struct WorkspaceView: View {
                 selectedSkills = mothx.activeSkillsBySession[sessionID] ?? []
                 await mothx.loadMessages(sessionID: sessionID)
                 await mothx.attachToActiveRun(sessionID: sessionID)
-                currentTurns = computeTurns(mothx.messagesBySession[sessionID] ?? [])
+                turnsRecomputeGeneration += 1
+                currentTurns = await computeTurnsAsync(mothx.messagesBySession[sessionID] ?? [])
+                guard !Task.isCancelled else { return }
                 mothx.recordRuntimeLog("workspace", "session ready id=\(sessionID) messages=\(mothx.messagesBySession[sessionID]?.count ?? 0) turns=\(currentTurns.count)")
                 showAllHistory = false
                 expandedTurnIDs = currentTurns.last.map { [$0.id] } ?? []
@@ -360,6 +376,7 @@ struct WorkspaceView: View {
                 // Guarantee the restored conversation opens at the bottom even
                 // when the turn count did not change this session switch.
                 requestScrollToBottom()
+                prefetchPreviewCache()
             }
         }
         .onChange(of: selectedSkills) { _, newValue in
@@ -370,15 +387,28 @@ struct WorkspaceView: View {
         .onChange(of: mothx.messagesBySession) { _, _ in
             if let sessionID {
                 let started = Date()
-                currentTurns = computeTurns(mothx.messagesBySession[sessionID] ?? [])
-                mothx.recordRuntimeLog("workspace", "turns recomputed session=\(sessionID) messages=\(mothx.messagesBySession[sessionID]?.count ?? 0) turns=\(currentTurns.count) elapsedMs=\(Int(Date().timeIntervalSince(started) * 1000))")
-                if currentTurns.count <= 3 { showAllHistory = false }
-                // Keep last turn expanded, preserve other expanded
-                if let lastID = currentTurns.last?.id {
-                    expandedTurnIDs.insert(lastID)
-                    prepareTurn(lastID)
+                let messages = mothx.messagesBySession[sessionID] ?? []
+                turnsRecomputeGeneration += 1
+                let generation = turnsRecomputeGeneration
+                Task { @MainActor in
+                    let turns = await computeTurnsAsync(messages)
+                    guard generation == turnsRecomputeGeneration, !Task.isCancelled else { return }
+                    currentTurns = turns
+                    mothx.recordRuntimeLog("workspace", "turns recomputed session=\(sessionID) messages=\(messages.count) turns=\(turns.count) elapsedMs=\(Int(Date().timeIntervalSince(started) * 1000))")
+                    if turns.count <= 3 { showAllHistory = false }
+                    // Keep last turn expanded, preserve other expanded
+                    if let lastID = turns.last?.id {
+                        expandedTurnIDs.insert(lastID)
+                        prepareTurn(lastID)
+                    }
                 }
             }
+        }
+        .onChange(of: mothx.latestChangesBySession) { _, _ in
+            // A new turn's changes landed (or the run finished). Warm the
+            // preview cache right away so clicking the change card later never
+            // waits for disk reads / markdown parsing / image decoding.
+            prefetchPreviewCache()
         }
         .onChange(of: mothx.defaultProvider) { _, providerID in
             guard selectedProviderID.isEmpty else { return }
@@ -414,51 +444,22 @@ struct WorkspaceView: View {
                   terminalStore.sessionID != newSessionID else { return }
             terminalStore.open(sessionID: newSessionID, workDir: mothx.workDir(for: newSessionID))
         }
-        if let reviewedChanges {
-            ChangeReviewSidebar(changes: reviewedChanges, workDirectory: currentWorkDir, initialPath: nil) {
-                closeRightSidebar()
-            }
-            .frame(
-                minWidth: 150,
-                idealWidth: reviewSidebarWidth,
-                maxWidth: max(150, workspaceProxy.size.width * 0.5)
-            )
-            .layoutPriority(1)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.trailing, isRightSidebarOpen ? rightSidebarColumnWidth : 0)
+        HStack(spacing: 0) {
+            sidebarResizeDivider(maxWidth: sidebarMaxWidth)
+            rightSidebarContent
+                .frame(width: rightSidebarWidth)
+                .frame(maxHeight: .infinity)
         }
-        if let previewedSkill {
-            SkillPreviewSidebar(skill: previewedSkill) {
-                closeRightSidebar()
-            }
-            .frame(
-                minWidth: 150,
-                idealWidth: reviewSidebarWidth,
-                maxWidth: max(150, workspaceProxy.size.width * 0.5)
-            )
-            .layoutPriority(1)
+        .frame(width: rightSidebarColumnWidth)
+        .frame(maxHeight: .infinity)
+        .offset(x: isRightSidebarOpen ? 0 : rightSidebarColumnWidth)
         }
-        if let previewedTool {
-            ToolDetailSidebar(sessionID: sessionID ?? "", item: previewedTool) {
-                closeRightSidebar()
-            }
-            .frame(
-                minWidth: 150,
-                idealWidth: reviewSidebarWidth,
-                maxWidth: max(150, workspaceProxy.size.width * 0.5)
-            )
-            .layoutPriority(1)
-        }
-        if let previewedImage {
-            ImagePreviewSidebar(image: previewedImage) {
-                closeRightSidebar()
-            }
-            .frame(
-                minWidth: 150,
-                idealWidth: reviewSidebarWidth,
-                maxWidth: max(150, workspaceProxy.size.width * 0.5)
-            )
-            .layoutPriority(1)
-        }
-        }
+        // Fixed anchor space for the sidebar divider gesture. The divider's own
+        // frame moves while the width changes, so a local-space measurement
+        // would feed that movement back into the width and shake during drag.
+        .coordinateSpace(name: "workspace")
         }
         .overlay(alignment: .topTrailing) {
             if !isRightSidebarOpen && !terminalStore.isOpen {
@@ -469,6 +470,13 @@ struct WorkspaceView: View {
 
     private func requestScrollToBottom() {
         scrollToBottomRequest += 1
+    }
+
+    /// computeTurns repeatedly splits, trims and copies potentially huge
+    /// tool-result strings. Run it off the main thread so a large file being
+    /// streamed never freezes the conversation, composer or sidebar push.
+    private func computeTurnsAsync(_ messages: [MothxMessage]) async -> [Turn] {
+        await Task.detached(priority: .userInitiated) { computeTurns(messages) }.value
     }
 
     private func scrollToBottom(_ reader: ScrollViewProxy, animated: Bool) {
@@ -496,13 +504,18 @@ struct WorkspaceView: View {
         withAnimation(.easeInOut(duration: 0.22)) {
             if reviewedChanges != nil || previewedSkill != nil || previewedTool != nil || previewedImage != nil {
                 reviewedChanges = nil
+                showEmptyPreviewSidebar = false
                 previewedSkill = nil
                 previewedTool = nil
                 previewedImage = nil
                 return
             }
             guard let sessionID,
-                  let changes = mothx.latestChangesBySession[sessionID] else { return }
+                  let changes = mothx.latestChangesBySession[sessionID] else {
+                conversationWasAtBottomBeforeReview = isConversationAtBottom
+                showEmptyPreviewSidebar = true
+                return
+            }
             conversationWasAtBottomBeforeReview = isConversationAtBottom
             reviewedChanges = changes
         }
@@ -511,11 +524,28 @@ struct WorkspaceView: View {
     private func presentReview(_ changes: MothxTurnChanges) {
         withAnimation(.easeInOut(duration: 0.22)) {
             conversationWasAtBottomBeforeReview = isConversationAtBottom
+            showEmptyPreviewSidebar = false
             previewedSkill = nil
             previewedTool = nil
             previewedImage = nil
             reviewedChanges = changes
         }
+        // Warm the cache for this turn immediately even before the sidebar
+        // appears, so the first file the user clicks is already prepared.
+        ChangePreviewCache.shared.prefetch(changes: changes, workDirectory: currentWorkDir)
+    }
+
+    /// Precomputes the current session's latest turn changes into the preview
+    /// cache as soon as the session opens or new changes arrive, so clicking a
+    /// change card / preview button later loads from cache instead of
+    /// recomputing (disk reads, markdown parsing, image decoding, diff
+    /// splitting) on the spot.
+    private func prefetchPreviewCache() {
+        guard let sessionID,
+              let changes = mothx.latestChangesBySession[sessionID] else { return }
+        let runActive = mothx.runSessionID == sessionID && (mothx.isRunning || mothx.isSubmittingRun)
+        guard !runActive else { return }
+        ChangePreviewCache.shared.prefetch(changes: changes, workDirectory: mothx.workDir(for: sessionID))
     }
 
     private func addSkill(_ skill: MothxSkill) {
@@ -537,6 +567,7 @@ struct WorkspaceView: View {
     private func presentSkillPreview(_ skill: MothxSkill) {
         withAnimation(.easeInOut(duration: 0.22)) {
             conversationWasAtBottomBeforeReview = isConversationAtBottom
+            showEmptyPreviewSidebar = false
             previewedSkill = skill
             previewedTool = nil
             previewedImage = nil
@@ -547,6 +578,7 @@ struct WorkspaceView: View {
     private func presentToolPreview(_ item: ToolInvocationSummary) {
         withAnimation(.easeInOut(duration: 0.22)) {
             conversationWasAtBottomBeforeReview = isConversationAtBottom
+            showEmptyPreviewSidebar = false
             previewedTool = item
             previewedSkill = nil
             previewedImage = nil
@@ -557,6 +589,7 @@ struct WorkspaceView: View {
     private func presentImagePreview(_ image: MothxImagePreview) {
         withAnimation(.easeInOut(duration: 0.22)) {
             conversationWasAtBottomBeforeReview = isConversationAtBottom
+            showEmptyPreviewSidebar = false
             previewedImage = image
             previewedTool = nil
             previewedSkill = nil
@@ -567,6 +600,7 @@ struct WorkspaceView: View {
     private func closeRightSidebar() {
         withAnimation(.easeInOut(duration: 0.22)) {
             reviewedChanges = nil
+            showEmptyPreviewSidebar = false
             previewedSkill = nil
             previewedTool = nil
             previewedImage = nil
@@ -590,7 +624,61 @@ struct WorkspaceView: View {
     }
 
     private var isRightSidebarOpen: Bool {
-        reviewedChanges != nil || previewedSkill != nil || previewedTool != nil || previewedImage != nil
+        showEmptyPreviewSidebar || reviewedChanges != nil || previewedSkill != nil || previewedTool != nil || previewedImage != nil
+    }
+
+    /// The review/preview panel currently shown. Mutators keep these states
+    /// exclusive, so the first match wins exactly like the old HSplitView panes.
+    @ViewBuilder
+    private var rightSidebarContent: some View {
+        if let reviewedChanges {
+            ChangeReviewSidebar(changes: reviewedChanges, workDirectory: currentWorkDir, initialPath: nil) {
+                closeRightSidebar()
+            }
+        } else if let previewedSkill {
+            SkillPreviewSidebar(skill: previewedSkill) {
+                closeRightSidebar()
+            }
+        } else if let previewedTool {
+            ToolDetailSidebar(sessionID: sessionID ?? "", item: previewedTool) {
+                closeRightSidebar()
+            }
+        } else if let previewedImage {
+            ImagePreviewSidebar(image: previewedImage) {
+                closeRightSidebar()
+            }
+        } else if showEmptyPreviewSidebar {
+            EmptyPreviewSidebar {
+                closeRightSidebar()
+            }
+        }
+    }
+
+    /// Thin separator at the sidebar's leading edge. The enlarged content shape
+    /// keeps the drag hit area comfortable without making the divider look wide.
+    private func sidebarResizeDivider(maxWidth: CGFloat) -> some View {
+        Color(nsColor: .separatorColor)
+            .frame(width: 1)
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle().inset(by: -4))
+            .gesture(
+                // Measure against the stable "workspace" space instead of the
+                // divider's local space, otherwise the divider's own movement
+                // feeds back into the width and makes the layout shake. Round
+                // to whole points so subpixel widths cannot shimmer while
+                // re-rasterizing the text on every mouse move.
+                DragGesture(minimumDistance: 1, coordinateSpace: .named("workspace"))
+                    .onChanged { value in
+                        let start = sidebarResizeStartWidth ?? reviewSidebarWidth
+                        sidebarResizeStartWidth = start
+                        let delta = value.startLocation.x - value.location.x
+                        reviewSidebarWidth = min(max((start + delta).rounded(), 150), max(150, maxWidth))
+                    }
+                    .onEnded { _ in sidebarResizeStartWidth = nil }
+            )
+            .onHover { inside in
+                if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+            }
     }
 
     // MARK: - Turn accordion
