@@ -28,6 +28,7 @@ struct WorkspaceView: View {
     @State private var imageGenerationMenuOpen = false
     @State private var imageGenerationSelection: ImageGenerationSelection?
     @State private var attachmentError: String?
+    @State private var skillActionMessage: String?
     @State private var currentTurns: [Turn] = []
     @State private var expandedTurnIDs: Set<String> = []
     @State private var preparedTurnIDs: Set<String> = []
@@ -277,6 +278,8 @@ struct WorkspaceView: View {
                             modelID: $selectedModelID,
                             providers: mothx.providers,
                             skills: mothx.installedSkills,
+                            discoverable: mothx.discoverableSkills,
+                            onAddSkill: addSkill,
                             selectedSkills: $selectedSkills,
                             selectedTools: $selectedTools,
                             models: currentModels,
@@ -309,6 +312,11 @@ struct WorkspaceView: View {
             Button(c.ok) { forkErrorMessage = nil }
         } message: {
             Text(forkErrorMessage ?? "")
+        }
+        .alert("技能 / Skills", isPresented: Binding(get: { skillActionMessage != nil }, set: { if !$0 { skillActionMessage = nil } })) {
+            Button(c.ok) { skillActionMessage = nil }
+        } message: {
+            Text(skillActionMessage ?? "")
         }
         .task(id: sessionID) {
             if let sessionID {
@@ -352,6 +360,11 @@ struct WorkspaceView: View {
                 // Guarantee the restored conversation opens at the bottom even
                 // when the turn count did not change this session switch.
                 requestScrollToBottom()
+            }
+        }
+        .onChange(of: selectedSkills) { _, newValue in
+            if let sessionID {
+                Task { await mothx.setActiveSkills(sessionID: sessionID, names: newValue) }
             }
         }
         .onChange(of: mothx.messagesBySession) { _, _ in
@@ -502,6 +515,22 @@ struct WorkspaceView: View {
             previewedTool = nil
             previewedImage = nil
             reviewedChanges = changes
+        }
+    }
+
+    private func addSkill(_ skill: MothxSkill) {
+        let workDir = currentWorkDir
+        Task { @MainActor in
+            if let error = mothx.installSkillToProject(skill, workDir: workDir) {
+                skillActionMessage = error
+            } else {
+                if let sessionID {
+                    await mothx.loadSkills(for: sessionID)
+                } else {
+                    mothx.refreshInstalledSkills(workDirs: [workDir])
+                }
+                skillActionMessage = languageStore.copy.addSkillSuccess(skill.name)
+            }
         }
     }
 
@@ -1218,7 +1247,7 @@ struct ComposerAttachment: Identifiable, Hashable {
 }
 
 struct PromptComposer: View {
-    enum PlusSubmenu { case skills, tools }
+    enum PlusSubmenu { case skills, tools, addSkills }
     @EnvironmentObject private var mothx: MothxServiceManager
     @Environment(\.colorScheme) private var colorScheme
     @EnvironmentObject private var languageStore: LanguageStore
@@ -1229,6 +1258,8 @@ struct PromptComposer: View {
     @Binding var modelID: String
     let providers: [MothxProviderConfig]
     let skills: [MothxSkill]
+    let discoverable: [MothxSkill]
+    let onAddSkill: (MothxSkill) -> Void
     @Binding var selectedSkills: Set<String>
     @Binding var selectedTools: Set<String>
     let models: [MothxModelConfig]
@@ -1562,12 +1593,18 @@ struct PromptComposer: View {
     @ViewBuilder
     private var plusPopover: some View {
         let copy = languageStore.copy
+        let localSkills = skills.filter { $0.scope == .local }
+        let localSkillNames = Set(localSkills.map(\.name))
+        let addableSkills = discoverable.filter { $0.scope != .local && !localSkillNames.contains($0.name) }
         return VStack(alignment: .leading, spacing: 4) {
             if let plusSubmenu {
                 HStack(spacing: 8) {
-                    Button { self.plusSubmenu = nil } label: { Image(systemName: "chevron.left") }.buttonStyle(.plain).hoverHighlight()
+                    Button {
+                        if plusSubmenu == .addSkills { self.plusSubmenu = .skills } else { self.plusSubmenu = nil }
+                    } label: { Image(systemName: "chevron.left") }.buttonStyle(.plain).hoverHighlight()
                     switch plusSubmenu {
                     case .skills: Text(copy.skillsActivatedLabel(selectedSkills.count)).font(.headline)
+                    case .addSkills: Text(copy.addSkill).font(.headline)
                     case .tools: Text(copy.toolsLabel).font(.headline)
                     }
                     Spacer()
@@ -1576,19 +1613,48 @@ struct PromptComposer: View {
                     VStack(alignment: .leading, spacing: 2) {
                         switch plusSubmenu {
                         case .skills:
-                            if skills.isEmpty { Text(copy.noInstalledSkills).foregroundStyle(.secondary).padding(8) }
-                            ForEach(skills) { skill in
+                            if localSkills.isEmpty { Text(copy.noInstalledSkills).foregroundStyle(.secondary).padding(8) }
+                            ForEach(localSkills) { skill in
                                 let active = selectedSkills.contains(skill.name)
                                 Button {
                                     if active { selectedSkills.remove(skill.name) } else { selectedSkills.insert(skill.name) }
                                 } label: {
-                                    HStack {
-                                        Text(skill.name)
+                                    HStack(spacing: 6) {
+                                        Image(systemName: "folder").font(.system(size: 11)).foregroundStyle(.orange)
+                                        Text(skill.name).lineLimit(1)
                                         Spacer()
                                         Text(active ? "active" : "pending").font(.caption).foregroundStyle(.secondary)
                                         Image(systemName: active ? "checkmark.square.fill" : "square").foregroundStyle(active ? .orange : .secondary)
                                     }.padding(.horizontal, 10).padding(.vertical, 9).frame(maxWidth: .infinity, minHeight: 42, alignment: .leading).contentShape(Rectangle())
-                                }.buttonStyle(.plain).hoverHighlight().foregroundStyle(.primary).frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(.plain).hoverHighlight().foregroundStyle(.primary)
+                                .frame(maxWidth: .infinity)
+                                .help(copy.skillProjectScope)
+                            }
+                        case .addSkills:
+                            if addableSkills.isEmpty { Text(copy.noAddableSkills).foregroundStyle(.secondary).padding(8) }
+                            ForEach(addableSkills) { skill in
+                                let canAdd = !skill.directory.isEmpty
+                                HStack(spacing: 4) {
+                                    Image(systemName: skill.scope == .global ? "globe" : "server.rack")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(skill.scope == .global ? .blue : .secondary)
+                                    Text(skill.name).lineLimit(1)
+                                    Spacer()
+                                    if canAdd {
+                                        Button { onAddSkill(skill) } label: {
+                                            Text(copy.addSkill).font(.caption)
+                                                .padding(.horizontal, 8).padding(.vertical, 4)
+                                        }
+                                        .buttonStyle(.bordered).controlSize(.small)
+                                        .help(copy.addSkill)
+                                    } else {
+                                        Text(copy.addSkillServerOnly).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                                    }
+                                }
+                                .padding(.horizontal, 10).padding(.vertical, 9)
+                                .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
+                                .contentShape(Rectangle())
                             }
                         case .tools:
                             ForEach(toolOptions, id: \.0) { tool, label in
@@ -1607,6 +1673,16 @@ struct PromptComposer: View {
                         }
                     }
                 }.frame(maxHeight: 300)
+                if plusSubmenu == .skills {
+                    Divider().padding(.vertical, 4)
+                    Button { self.plusSubmenu = .addSkills } label: {
+                        Label(copy.addSkill, systemImage: "plus.circle")
+                            .padding(.horizontal, 10).padding(.vertical, 8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain).hoverHighlight().foregroundStyle(.orange)
+                }
             } else {
                 Text(copy.moreOptionsHelp).font(.headline).padding(.bottom, 6)
                 Button { plusSubmenu = .skills } label: { HStack { Label(copy.skills, systemImage: "sparkles"); Spacer(); Image(systemName: "chevron.right") }.padding(.horizontal, 10).padding(.vertical, 10).frame(maxWidth: .infinity, minHeight: 48, alignment: .leading).contentShape(Rectangle()) }.buttonStyle(.plain).hoverHighlight().frame(maxWidth: .infinity)

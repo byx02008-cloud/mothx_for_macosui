@@ -437,6 +437,13 @@ struct Copy {
     var skillsActivatedLabel: (Int) -> String { { n in self.text("技能（已激活 \(n) 个）", "Skills (\(n) active)") } }
     var toolsLabel: String { text("工具", "Tools") }
     var noInstalledSkills: String { text("暂无已安装技能", "No installed skills") }
+    var skillProjectScope: String { text("当前项目", "This project") }
+    var addSkill: String { text("添加技能", "Add skill") }
+    var noAddableSkills: String { text("暂无其他可添加的技能", "No other skills to add") }
+    var addSkillNoWorkDir: String { text("当前会话没有可用的工作目录，无法添加技能", "This session has no working directory; cannot add skills") }
+    var addSkillServerOnly: String { text("该技能来自服务器，暂不支持添加到当前目录", "This skill comes from the server and cannot be added locally") }
+    var addSkillSuccess: (String) -> String { { name in self.text("已将技能 \(name) 添加到当前目录", "Added \(name) to the current directory") } }
+    var addSkillFailedPrefix: (String) -> String { { detail in self.text("添加技能失败：\(detail)", "Failed to add skill: \(detail)") } }
     var scrollRunningHelp: String { text("正在输出，滚动到底部", "Streaming output, scroll to bottom") }
     var scrollBottomHelp: String { text("滚动到底部", "Scroll to bottom") }
 

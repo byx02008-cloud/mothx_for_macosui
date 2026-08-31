@@ -169,6 +169,13 @@ final class MothxServiceManager: ObservableObject {
     @Published private(set) var defaultThinkingLevel = ""
     @Published private(set) var defaultMode = "agent"
     @Published private(set) var installedSkills: [MothxSkill] = []
+    /// Last installed-skill payload returned by the mothx server. Kept so the
+    /// filesystem-driven skill list can still surface marketplace-managed skills
+    /// that are not present on disk.
+    private var remoteInstalledSkills: [MothxSkill] = []
+    /// Full set of skills offered by the "添加技能" picker: everything the
+    /// server knows (installed) plus skills discovered by local directory scan.
+    @Published private(set) var discoverableSkills: [MothxSkill] = []
     @Published private(set) var activeSkillsBySession: [String: Set<String>] = [:]
     @Published private(set) var tuilang = "auto"
     @Published private(set) var skillsDir = ""
@@ -1503,13 +1510,27 @@ final class MothxServiceManager: ObservableObject {
             if !provider.isEmpty { payload["provider"] = provider }
             if !model.isEmpty { payload["model"] = model }
             if !tools.isEmpty { payload["tools"] = tools }
-            if !skills.isEmpty { payload["skills"] = skills }
+            // Directory-scanned skills (global ~/.skill etc.) are not registered
+            // in mothx's SkillHub, and sending them in the skills payload fails
+            // server validation with "the requested skill configuration is
+            // invalid". Only server-known skills go into the payload; the rest
+            // are attached as /skill:<name> directives in the message — the
+            // same path that works when typed directly in the prompt.
+            let serverKnownSkillNames = Set(remoteInstalledSkills.map(\.name))
+            let payloadSkills = skills.filter { serverKnownSkillNames.contains($0) }
+            if !payloadSkills.isEmpty { payload["skills"] = payloadSkills }
+            let directiveSkills = skills.filter { !serverKnownSkillNames.contains($0) }
+            var submittedMessage = message
+            if !directiveSkills.isEmpty {
+                submittedMessage = message + "\n\n" + directiveSkills.map { "/skill:\($0)" }.joined(separator: "  ")
+                payload["message"] = submittedMessage
+            }
             if !workDir.isEmpty { payload["workDir"] = workDir }
             if !images.isEmpty { payload["images"] = images }
             // Show the submitted question immediately. The API returns 202 and
             // runs the agent in the background, so the assistant message is not
             // available in the first history response yet.
-            let localMessage = MothxMessage(id: "local-\(UUID().uuidString)", seq: nil, role: "user", content: message, toolCallId: nil, toolName: nil, arguments: "", plan: nil, summary: nil, hasDetail: false, createdAt: ISO8601DateFormatter().string(from: Date()))
+            let localMessage = MothxMessage(id: "local-\(UUID().uuidString)", seq: nil, role: "user", content: submittedMessage, toolCallId: nil, toolName: nil, arguments: "", plan: nil, summary: nil, hasDetail: false, createdAt: ISO8601DateFormatter().string(from: Date()))
             messagesBySession[sessionID, default: []].append(localMessage)
             let body = try jsonData(payload)
             let response = try await request(path: "api/sessions/\(sessionID)/runs", method: "POST", body: body, headers: ["Idempotency-Key": UUID().uuidString])
@@ -2978,33 +2999,204 @@ final class MothxServiceManager: ObservableObject {
     }
 
     private func loadInstalledSkills() async {
+        // Global (bootstrap) skill sync. This must NOT clobber the per-session
+        // skill list owned by loadSkills(for:): the workspace re-syncs after
+        // every run (updateSessionTitle → loadWorkspace) while a session is
+        // open, and overwriting would wipe the session's project skills.
         do {
             let data = try await request(path: "api/skillhub/installed", method: "GET")
             guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let values = object["installed"] as? [[String: Any]] else { return }
-            installedSkills = values.compactMap { item in
-                guard let name = item["name"] as? String else { return nil }
-                return MothxSkill(id: name, name: name, directory: item["dir"] as? String ?? "")
-            }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            let skills = decodeInstalledSkills(values, workDir: "")
+            remoteInstalledSkills = skills
+            // Only seed the list when nothing is loaded yet (true bootstrap).
+            if installedSkills.isEmpty {
+                installedSkills = skills
+            }
         } catch {
-            installedSkills = []
+            remoteInstalledSkills = []
         }
+        discoverableSkills = mergeInstalledSkills(disk: installedSkillsFromDisk(workDirs: []), remote: remoteInstalledSkills)
     }
 
+    /// Reloads the skill list for the current session from the server
+    /// (`api/skillhub/installed`), matching the official web client: the
+    /// session's workDir is passed so the server returns the project-local
+    /// skills too. Called every time the workspace switches to a session.
     func loadSkills(for sessionID: String) async {
+        let sessionWorkDir = workDir(for: sessionID)
+        var path = "api/skillhub/installed?sessionId=\(sessionID)"
+        if !sessionWorkDir.isEmpty {
+            let encoded = sessionWorkDir.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? sessionWorkDir
+            path += "&workDir=\(encoded)"
+        }
         do {
-            let data = try await request(path: "api/skillhub/installed?sessionId=\(sessionID)", method: "GET")
+            let data = try await request(path: path, method: "GET")
             guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            // The server echoes the session's own workDir; prefer it for
+            // scoping so project skills are marked local even when our local
+            // session cache is not populated yet.
+            let responseWorkDir = ((object["session"] as? [String: Any])?["workDir"] as? String) ?? sessionWorkDir
+            let effectiveWorkDir = responseWorkDir.isEmpty ? sessionWorkDir : responseWorkDir
             if let values = object["installed"] as? [[String: Any]] {
-                installedSkills = values.compactMap { item in
-                    guard let name = item["name"] as? String else { return nil }
-                    return MothxSkill(id: name, name: name, directory: item["dir"] as? String ?? "")
-                }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                let skills = decodeInstalledSkills(values, workDir: effectiveWorkDir)
+                remoteInstalledSkills = skills
+                installedSkills = skills
             }
             let active = ((object["session"] as? [String: Any])?["activeSkills"] as? [String]) ?? []
             activeSkillsBySession[sessionID] = Set(active)
         } catch {
             activeSkillsBySession[sessionID] = []
+            installedSkills = installedSkillsFromDisk(workDirs: [sessionWorkDir])
+        }
+        discoverableSkills = mergeInstalledSkills(disk: installedSkillsFromDisk(workDirs: [sessionWorkDir]), remote: remoteInstalledSkills)
+    }
+
+    private func decodeInstalledSkills(_ values: [[String: Any]], workDir: String) -> [MothxSkill] {
+        values.compactMap { item in
+            guard let name = item["name"] as? String else { return nil }
+            let directory = item["dir"] as? String ?? ""
+            return MothxSkill(id: name, name: name, directory: directory, scope: scopeForSkill(directory: directory, workDir: workDir))
+        }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    /// Tags a skill directory with its discovery source: inside the session's
+    /// workDir → project-local; inside a global root → global; otherwise
+    /// server-managed.
+    private func scopeForSkill(directory: String, workDir: String) -> MothxSkillScope {
+        guard !directory.isEmpty else { return .remote }
+        let standard = URL(fileURLWithPath: directory).standardizedFileURL.path
+        if !workDir.isEmpty {
+            let root = URL(fileURLWithPath: workDir).standardizedFileURL.path
+            if standard.hasPrefix(root + "/") { return .local }
+        }
+        for root in Self.globalSkillRoots {
+            let standardRoot = URL(fileURLWithPath: root).standardizedFileURL.path
+            if standard.hasPrefix(standardRoot + "/") { return .global }
+        }
+        return .remote
+    }
+
+    private func mergeInstalledSkills(disk: [MothxSkill], remote: [MothxSkill]) -> [MothxSkill] {
+        var byName: [String: MothxSkill] = [:]
+        for skill in disk where byName[skill.name] == nil { byName[skill.name] = skill }
+        for skill in remote where byName[skill.name] == nil {
+            byName[skill.name] = MothxSkill(id: skill.name, name: skill.name, directory: skill.directory)
+        }
+        return byName.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    // MARK: - Filesystem skill discovery
+
+    /// Global skill roots that are scanned (in priority order). Skills live in
+    /// `<root>/<skill-name>/SKILL.md`. The mothx server's own default skills
+    /// directory comes first so promoted/global skills are visible server-side.
+    static var globalSkillRoots: [String] {
+        [
+            (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/mothx/.skills"),
+            "~/.skill",
+            "~/.skills",
+            "~/.agents/skills",
+        ].map { ($0 as NSString).expandingTildeInPath }
+    }
+
+    /// Project-local skill roots for a working directory.
+    static func projectSkillRoots(workDir: String) -> [String] {
+        guard !workDir.isEmpty else { return [] }
+        return [workDir + "/.skill", workDir + "/.skills", workDir + "/.agents/skills"]
+    }
+
+    /// Scans `<root>/<name>/SKILL.md` entries under the given roots.
+    static func scanSkillDirectories(roots: [String], scope: MothxSkillScope) -> [MothxSkill] {
+        let fileManager = FileManager.default
+        var found: [String: MothxSkill] = [:]
+        for root in roots {
+            guard let entries = try? fileManager.contentsOfDirectory(atPath: root) else { continue }
+            for entry in entries where !entry.hasPrefix(".") {
+                guard found[entry] == nil else { continue }
+                let skillDir = (root as NSString).appendingPathComponent(entry)
+                var isDirectory: ObjCBool = false
+                guard fileManager.fileExists(atPath: skillDir, isDirectory: &isDirectory), isDirectory.boolValue,
+                      fileManager.fileExists(atPath: (skillDir as NSString).appendingPathComponent("SKILL.md")) else { continue }
+                found[entry] = MothxSkill(id: entry, name: entry, directory: skillDir, scope: scope)
+            }
+        }
+        return found.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    /// Union of global skills and every given workDir's local skills (deduped by name).
+    /// Local copies win over same-named global skills so a project can shadow a
+    /// global skill, which keeps the per-session list reflecting the local copy.
+    func installedSkillsFromDisk(workDirs: [String]) -> [MothxSkill] {
+        var byName: [String: MothxSkill] = [:]
+        for workDir in workDirs {
+            let local = Self.scanSkillDirectories(roots: Self.projectSkillRoots(workDir: workDir), scope: .local)
+            for skill in local where byName[skill.name] == nil { byName[skill.name] = skill }
+        }
+        let global = Self.scanSkillDirectories(roots: Self.globalSkillRoots, scope: .global)
+        for skill in global where byName[skill.name] == nil { byName[skill.name] = skill }
+        return byName.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    /// Re-runs filesystem discovery and merges with the last server payload.
+    func refreshInstalledSkills(workDirs: [String]) {
+        installedSkills = mergeInstalledSkills(disk: installedSkillsFromDisk(workDirs: workDirs), remote: remoteInstalledSkills)
+        discoverableSkills = mergeInstalledSkills(disk: installedSkillsFromDisk(workDirs: workDirs), remote: remoteInstalledSkills)
+    }
+
+    /// First existing project skill root under the workDir, falling back to
+    /// `<workDir>/.skill` (created on demand).
+    static func primaryProjectSkillRoot(workDir: String) -> String? {
+        guard !workDir.isEmpty else { return nil }
+        let fileManager = FileManager.default
+        let roots = projectSkillRoots(workDir: workDir)
+        for root in roots where fileManager.fileExists(atPath: root) { return root }
+        return roots.first
+    }
+
+    /// Copies a non-local skill (usually global) into the session's working
+    /// directory so it becomes a project-local skill. Returns nil on success,
+    /// or a user-facing error.
+    @discardableResult
+    func installSkillToProject(_ skill: MothxSkill, workDir: String) -> String? {
+        guard skill.scope != .local else { return nil }
+        guard !workDir.isEmpty else { return copy.addSkillNoWorkDir }
+        guard !skill.directory.isEmpty else { return copy.addSkillServerOnly }
+        let fileManager = FileManager.default
+        guard let targetRoot = Self.primaryProjectSkillRoot(workDir: workDir) else { return copy.addSkillNoWorkDir }
+        do {
+            try fileManager.createDirectory(atPath: targetRoot, withIntermediateDirectories: true)
+            let destination = (targetRoot as NSString).appendingPathComponent(skill.name)
+            // The server's project-skill scan skips symlinked entries, so replace
+            // any stray symlink with a real directory copy.
+            if (try? fileManager.destinationOfSymbolicLink(atPath: destination)) != nil {
+                try fileManager.removeItem(atPath: destination)
+            }
+            // Already present locally: not an error — the caller still reloads so
+            // the server's workDir scan picks it up, which is what matters.
+            if !fileManager.fileExists(atPath: destination) {
+                // Dereference symlinked sources (e.g. ~/.agents/skills entries)
+                // so the copied skill is a real directory the server can scan.
+                let source = URL(fileURLWithPath: skill.directory).resolvingSymlinksInPath().path
+                try fileManager.copyItem(atPath: source, toPath: destination)
+            }
+        } catch {
+            return copy.addSkillFailedPrefix(describe(error))
+        }
+        installedSkills = mergeInstalledSkills(disk: installedSkillsFromDisk(workDirs: [workDir]), remote: remoteInstalledSkills)
+        discoverableSkills = mergeInstalledSkills(disk: installedSkillsFromDisk(workDirs: [workDir]), remote: remoteInstalledSkills)
+        return nil
+    }
+
+    /// Persists the session's active skill set on the server (same contract as
+    /// the official web client's `POST /api/skillhub/set-active`).
+    func setActiveSkills(sessionID: String, names: Set<String>) async {
+        guard !sessionID.isEmpty else { return }
+        do {
+            let body = try jsonData(["sessionId": sessionID, "names": Array(names).sorted()])
+            _ = try await request(path: "api/skillhub/set-active", method: "POST", body: body)
+        } catch {
+            // Best-effort persist; the run payload still carries the selection.
         }
     }
 
