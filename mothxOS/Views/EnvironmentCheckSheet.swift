@@ -51,7 +51,7 @@ struct EnvironmentCheckSheet: View {
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
 
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 10) {
                 checklistRow(label: c.envCheckNodeLabel, state: nodeState)
                 checklistRow(label: c.envCheckMothxLabel, state: mothxState)
                 checklistRow(label: c.envCheckSyncLabel, state: syncCheckState)
@@ -62,11 +62,15 @@ struct EnvironmentCheckSheet: View {
                 EmptyView()
             case .nodeMissing(let hasBrew):
                 nodeMissingView(hasBrew: hasBrew, c: c)
-            case .installingBrewNode, .installingMothx, .connecting:
+            case .installingBrewNode, .installingMothx:
+                VStack(alignment: .leading, spacing: 12) {
+                    progressView(c: c)
+                    logView(c: c)
+                }
+            case .connecting:
                 progressView(c: c)
             case .allPassed:
-                Label(c.envCheckPassed, systemImage: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
+                passedBadge(c: c)
             case .mothxNeedsAdmin:
                 mothxNeedsAdminView(c: c)
             case .failed(let message):
@@ -78,15 +82,10 @@ struct EnvironmentCheckSheet: View {
                 }
             }
 
-            // Keep the log area mounted for every phase. A fixed height keeps
-            // the sheet layout stable while checks and installation progress
-            // update asynchronously.
-            logView(c: c)
-
             Spacer(minLength: 0)
         }
         .padding(24)
-        .frame(width: 520, height: 450)
+        .frame(minWidth: 520, maxWidth: 520)
         .interactiveDismissDisabled()
         .task { await runChecklist() }
     }
@@ -110,16 +109,23 @@ struct EnvironmentCheckSheet: View {
 
     @ViewBuilder
     private func checklistRow(label: String, state: CheckState) -> some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 10) {
             switch state {
             case .pending:
-                ProgressView().controlSize(.small).frame(width: 16, height: 16)
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 18, height: 18)
             case .passed:
-                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                    .font(.system(size: 18))
             case .failed:
-                Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.red)
+                    .font(.system(size: 18))
             }
             Text(label)
+                .font(.body)
         }
     }
 
@@ -193,17 +199,38 @@ struct EnvironmentCheckSheet: View {
 
     @ViewBuilder
     private func logView(c: Copy) -> some View {
-        ScrollView {
-            Text(log.isEmpty ? c.installWaitingForOutput : log)
-                .font(.system(.caption, design: .monospaced))
-                .foregroundStyle(log.isEmpty ? .secondary : .primary)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, minHeight: 54, alignment: .topLeading)
-                .padding(10)
+        VStack(alignment: .leading, spacing: 6) {
+            Text("安装日志")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ScrollView {
+                Text(log.isEmpty ? c.installWaitingForOutput : log)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(log.isEmpty ? .secondary : .primary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, minHeight: 40, alignment: .topLeading)
+                    .padding(10)
+            }
+            .frame(height: 80)
+            .background(Color.primary.opacity(0.05))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
         }
-        .frame(height: 65)
-        .background(Color.primary.opacity(0.06))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    @ViewBuilder
+    private func passedBadge(c: Copy) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .font(.system(size: 18))
+            Text(c.envCheckPassed)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.green)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
+        .background(Color.green.opacity(0.1))
+        .clipShape(Capsule())
     }
 
     private func stageLabel(_ c: Copy) -> String {
@@ -221,22 +248,23 @@ struct EnvironmentCheckSheet: View {
         mothxState = .pending
         log = ""
 
-        async let nodeVersionResult = EnvironmentCheckSheet.detectNodeVersion()
-        async let mothxInstalledResult = MothxServiceManager.isMothxInstalled()
-        let (nodeVersion, mothxInstalled) = await (nodeVersionResult, mothxInstalledResult)
+        // Phase 1: Check Node.js
+        let nodeVersion = await EnvironmentCheckSheet.detectNodeVersion()
         nodeState = nodeVersion != nil ? .passed : .failed
-        mothxState = mothxInstalled ? .passed : .failed
-
         guard nodeVersion != nil else {
             phase = .nodeMissing(hasBrew: await EnvironmentCheckSheet.commandExists("brew"))
             return
         }
 
+        // Phase 2: Check mothx
+        let mothxInstalled = await MothxServiceManager.isMothxInstalled()
+        mothxState = mothxInstalled ? .passed : .failed
         guard mothxInstalled else {
             await installMothx()
             return
         }
 
+        // Phase 3: Node + mothx passed — now sync
         await proceedNowThatChecksPassed()
     }
 
