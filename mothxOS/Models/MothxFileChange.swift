@@ -159,34 +159,12 @@ nonisolated enum MothxDiffBuilder {
     static func make(path: String, oldText: String, newText: String) -> MothxFileChange {
         let oldLines = lines(oldText)
         let newLines = lines(newText)
-        let truncated = oldLines.count * max(newLines.count, 1) > 200_000
-        if truncated {
-            return MothxFileChange(path: path, oldText: oldText, newText: newText,
-                                   unifiedDiff: "详细 Diff 过大，无法在此处展开。",
-                                   added: newLines.count, deleted: oldLines.count, truncated: true)
-        }
+        // Do not use N*M as a size limit: it measures the quadratic LCS
+        // workspace, not the amount of change. A 2,324-line file would be
+        // incorrectly reported as a complete replacement here.
+        let records = myersRecords(oldLines: oldLines, newLines: newLines)
 
-        var table = Array(repeating: Array(repeating: 0, count: newLines.count + 1), count: oldLines.count + 1)
-        if !oldLines.isEmpty && !newLines.isEmpty {
-            for i in stride(from: oldLines.count - 1, through: 0, by: -1) {
-                for j in stride(from: newLines.count - 1, through: 0, by: -1) {
-                    table[i][j] = oldLines[i] == newLines[j] ? table[i + 1][j + 1] + 1 : max(table[i + 1][j], table[i][j + 1])
-                }
-            }
-        }
-
-        enum Record { case context(String), added(String), deleted(String) }
-        var records: [Record] = []
-        var i = 0, j = 0
-        while i < oldLines.count || j < newLines.count {
-            if i < oldLines.count && j < newLines.count && oldLines[i] == newLines[j] {
-                records.append(.context(oldLines[i])); i += 1; j += 1
-            } else if j < newLines.count && (i == oldLines.count || table[i][j + 1] >= table[i + 1][j]) {
-                records.append(.added(newLines[j])); j += 1
-            } else if i < oldLines.count {
-                records.append(.deleted(oldLines[i])); i += 1
-            }
-        }
+        // `records` is produced by Myers' shortest-edit-script algorithm.
 
         let added = records.reduce(0) { partial, record in
             if case .added = record { return partial + 1 }; return partial
@@ -198,6 +176,76 @@ nonisolated enum MothxDiffBuilder {
             switch record { case .context(let line): return "  \(line)"; case .added(let line): return "+ \(line)"; case .deleted(let line): return "- \(line)" }
         }.joined(separator: "\n")
         return MothxFileChange(path: path, oldText: oldText, newText: newText, unifiedDiff: diff, added: added, deleted: deleted)
+    }
+
+    private enum Record {
+        case context(String), added(String), deleted(String)
+    }
+
+    private static func myersRecords(oldLines: [String], newLines: [String]) -> [Record] {
+        let n = oldLines.count
+        let m = newLines.count
+        let maxDistance = n + m
+        guard maxDistance > 0 else { return [] }
+        let offset = maxDistance
+        var frontier = Array(repeating: 0, count: maxDistance * 2 + 1)
+        var trace: [[Int]] = []
+        var finishDistance = 0
+
+        search: for distance in 0...maxDistance {
+            for diagonal in stride(from: -distance, through: distance, by: 2) {
+                let index = offset + diagonal
+                let startX: Int
+                if diagonal == -distance || (diagonal != distance && frontier[index - 1] < frontier[index + 1]) {
+                    startX = frontier[index + 1]
+                } else {
+                    startX = frontier[index - 1] + 1
+                }
+                var x = startX
+                var y = x - diagonal
+                while x < n && y < m && oldLines[x] == newLines[y] {
+                    x += 1; y += 1
+                }
+                frontier[index] = x
+                if x >= n && y >= m {
+                    trace.append(frontier)
+                    finishDistance = distance
+                    break search
+                }
+            }
+            trace.append(frontier)
+        }
+
+        var result: [Record] = []
+        var x = n
+        var y = m
+        for distance in stride(from: finishDistance, through: 1, by: -1) {
+            let previous = trace[distance - 1]
+            let diagonal = x - y
+            let index = offset + diagonal
+            let previousDiagonal: Int
+            if diagonal == -distance || (diagonal != distance && previous[index - 1] < previous[index + 1]) {
+                previousDiagonal = diagonal + 1
+            } else {
+                previousDiagonal = diagonal - 1
+            }
+            let previousX = previous[offset + previousDiagonal]
+            let previousY = previousX - previousDiagonal
+            while x > previousX && y > previousY {
+                result.append(.context(oldLines[x - 1])); x -= 1; y -= 1
+            }
+            if x == previousX {
+                result.append(.added(newLines[y - 1])); y -= 1
+            } else {
+                result.append(.deleted(oldLines[x - 1])); x -= 1
+            }
+        }
+        while x > 0 && y > 0 {
+            result.append(.context(oldLines[x - 1])); x -= 1; y -= 1
+        }
+        while x > 0 { result.append(.deleted(oldLines[x - 1])); x -= 1 }
+        while y > 0 { result.append(.added(newLines[y - 1])); y -= 1 }
+        return result.reversed()
     }
 
     private static func lines(_ value: String) -> [String] {

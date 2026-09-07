@@ -901,6 +901,17 @@ struct WorkspaceView: View {
             preparedTurnIDs.removeAll()
             preparingTurnID = nil
         }
+        // The collapse animation shrinks the document over the 0.2s above.
+        // Re-anchor the scrollbar only after the collapsed layout has
+        // committed; a scroll issued against the pre-collapse document height
+        // would leave the viewport off the true conversation bottom once the
+        // topics have contracted. The observer's retry logic then re-lands the
+        // bottom as the incoming user message grows the document again.
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            requestScrollToBottom()
+        }
         let submittedAttachments = attachments
         let imageAttachments = submittedAttachments.compactMap(\.dataURL)
         if question.isEmpty, !attachments.isEmpty {
