@@ -183,8 +183,23 @@ struct Copy {
     var agentModel: String { text("模型", "Model") }
     var agentWorkDir: String { text("工作目录", "Working directory") }
     var agentMode: String { text("执行模式", "Execution mode") }
-    var agentTools: String { text("工具（逗号分隔）", "Tools (comma separated)") }
-    var agentSkills: String { text("Skills（逗号分隔）", "Skills (comma separated)") }
+    var agentTools: String { text("工具", "Tools") }
+    var agentSkills: String { text("Skills", "Skills") }
+    var agentToolsHint: String { text("选择该 Agent 可调用的工具（来自 mothx 能力目录，可多选）", "Select tools available to this agent (from the mothx capability catalog, multi-select)") }
+    var agentSkillsHint: String { text("选择该 Agent 工作目录下的项目技能（可多选；其他技能可在下方添加到该目录）", "Select project-local skills in this Agent's working directory (multi-select; add others from below)") }
+    var noAvailableTools: String { text("暂无可选工具（服务未连接或未提供能力目录）", "No tools available (service offline or no capability catalog)") }
+    var noAvailableSkills: String { text("暂无可用技能", "No skills available") }
+    /// Localized display name for a mothx tool catalog id.
+    func agentToolLabel(_ id: String) -> String {
+        switch id {
+        case "browser": return text("浏览器", "Browser")
+        case "a2aMaster": return text("A2A 主智能体", "A2A master agent")
+        case "delegate": return text("委派子智能体", "Delegate sub-agent")
+        case "multiAgent": return text("多智能体协作", "Multi-agent collaboration")
+        case "workflows": return text("工作流", "Workflows")
+        default: return id
+        }
+    }
     var agentMaxIterations: String { text("最大迭代次数", "Max iterations") }
     var agentEnabledTitle: String { text("启用该 Agent", "Enable this agent") }
     var agentEnabledHint: String { text("未启用的 Agent 不会被调度器使用", "Disabled agents are not scheduled") }

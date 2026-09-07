@@ -30,6 +30,10 @@ enum TeamError: LocalizedError {
 /// is the mothxOS orchestration layer. All published mutations happen on the
 /// main actor.
 final class TeamRunManager: ObservableObject {
+    /// Weak back-reference to the service manager so agent runs can prune
+    /// legacy tool/skill names against the live catalog. Never retained:
+    /// MothxServiceManager owns this instance.
+    weak var mothx: MothxServiceManager?
     @Published private(set) var agentProfiles: [MothxAgentProfile] = []
     @Published private(set) var teamProjects: [MothxTeamProject] = []
     @Published private(set) var teamRuns: [MothxTeamRun] = []
@@ -291,8 +295,23 @@ final class TeamRunManager: ObservableObject {
         var payload: [String: Any] = ["message": message, "mode": profile.mode.isEmpty ? "agent" : profile.mode, "transcript": true]
         if !profile.providerID.isEmpty { payload["provider"] = profile.providerID }
         if !profile.modelID.isEmpty { payload["model"] = profile.modelID }
-        if !profile.tools.isEmpty { payload["tools"] = profile.tools }
-        if !profile.skills.isEmpty { payload["skills"] = profile.skills }
+        // Defense in depth: legacy profiles may still carry tool names the run
+        // API rejects (e.g. the old "read, grep, find" defaults). Prune them
+        // against the live catalog whenever it is available.
+        let knownTools = mothx?.toolCatalog.filter(\.available).map(\.id) ?? []
+        let safeTools = profile.tools.filter { knownTools.isEmpty || knownTools.contains($0) }
+        if !safeTools.isEmpty { payload["tools"] = safeTools }
+        // Skills use the same split as the workspace: only server-known names go
+        // into the `skills` payload (otherwise the run API rejects them with 400
+        // — "the requested skill configuration is invalid"); the rest become
+        // /skill:<name> directives appended to the message.
+        let (payloadSkills, directiveSkills) = mothx?.splitSkillsForPayload(profile.skills) ?? (profile.skills, [])
+        if !payloadSkills.isEmpty { payload["skills"] = payloadSkills }
+        var submittedMessage = message
+        if !directiveSkills.isEmpty {
+            submittedMessage = message + "\n\n" + directiveSkills.map { "/skill:\($0)" }.joined(separator: "  ")
+            payload["message"] = submittedMessage
+        }
         if !profile.workDir.isEmpty { payload["workDir"] = profile.workDir }
         let body = try jsonData(payload)
 

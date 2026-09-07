@@ -42,7 +42,7 @@ struct MothxAgentProfile: Identifiable, Codable, Hashable {
             modelID: "",
             workDir: "",
             mode: "agent",
-            tools: ["read", "grep", "find"],
+            tools: [],
             skills: [],
             maxIterations: 50,
             enabled: true,

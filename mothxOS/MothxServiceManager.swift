@@ -176,6 +176,10 @@ final class MothxServiceManager: ObservableObject {
     /// Full set of skills offered by the "添加技能" picker: everything the
     /// server knows (installed) plus skills discovered by local directory scan.
     @Published private(set) var discoverableSkills: [MothxSkill] = []
+    /// Tool catalog loaded from `GET /api/capabilities`. These are the only
+    /// tool names mothx accepts in a run submission `tools` array; the Agent
+    /// editor and the workspace composer render this list as a multi-select.
+    @Published private(set) var toolCatalog: [MothxAgentTool] = []
     @Published private(set) var activeSkillsBySession: [String: Set<String>] = [:]
     @Published private(set) var tuilang = "auto"
     @Published private(set) var skillsDir = ""
@@ -270,6 +274,7 @@ final class MothxServiceManager: ObservableObject {
     private static let imageGenerationDefaultsKey = "mothxOS.imageGeneration"
 
     init() {
+        teamManager.mothx = self
         imageGeneration = Self.loadImageGenerationConfig()
         imageRecognition = Self.loadImageRecognitionConfig()
         let stored = changeStore.load()
@@ -642,6 +647,7 @@ final class MothxServiceManager: ObservableObject {
         }
 
         await loadInstalledSkills()
+        await loadToolCatalog()
         // Agent team layer: resume any active runs after sessions/projects are
         // available. The mapping itself was loaded before project publication.
         await teamManager.recoverActiveRuns()
@@ -927,9 +933,33 @@ final class MothxServiceManager: ObservableObject {
             let data = try await request(path: "api/sessions/\(sessionID)/messages?limit=200", method: "GET")
             let messages = decodeMessages(data, sessionID: sessionID)
             recordRuntimeLog("messages", "load complete session=\(sessionID) count=\(messages.count) bytes=\(data.count) elapsedMs=\(Int(Date().timeIntervalSince(started) * 1000))")
-            messagesBySession[sessionID] = messages
-            await loadHistoricalRuns(sessionID: sessionID, messages: messages)
-            await rebuildHistoricalChanges(sessionID: sessionID, messages: messages)
+            // While this session's run is streaming, the HTTP message list is
+            // only a checkpoint: it can lag the WS/ACP stream (missing the
+            // in-progress assistant reply or even the current user anchor).
+            // Replacing the live projection wholesale under those conditions
+            // blanks the conversation and, as streaming resumes, re-creates
+            // the reply bubble so the typewriter restarts from zero. The blank
+            // state also survives a session switch because the next load
+            // returns the same checkpoint. Merge the checkpoint into the live
+            // projection instead; replace outright only when the run is
+            // terminal or the session is otherwise idle.
+            let previousMessages = messagesBySession[sessionID] ?? []
+            let runIsActiveForSession = runSessionID == sessionID && isRunning
+            let resolvedMessages = runIsActiveForSession
+                ? mergedLiveMessages(existing: previousMessages, snapshot: messages)
+                : messages
+            if messagesBySession[sessionID] != resolvedMessages {
+                messagesBySession[sessionID] = resolvedMessages
+            }
+            // Historical run mapping and change rebuild are expensive (and can
+            // issue one tool-detail request per historical file edit). They are
+            // only needed for already-loaded history; skip them while the run
+            // is live (pollRun calls this every ~500ms) unless this is a fresh
+            // load of a session that already has an active run.
+            if !runIsActiveForSession || previousMessages.isEmpty {
+                await loadHistoricalRuns(sessionID: sessionID, messages: resolvedMessages)
+                await rebuildHistoricalChanges(sessionID: sessionID, messages: resolvedMessages)
+            }
             startRunEventStream(sessionID: sessionID)
             if sessionID == runSessionID {
                 runReplyMessageID = messages.first { message in
@@ -951,6 +981,70 @@ final class MothxServiceManager: ObservableObject {
             settingsError = copy.loadMessagesFailedPrefix(describe(error))
             return []
         }
+    }
+
+    /// Merges a server message checkpoint into the live streaming projection
+    /// while a run is active.
+    ///
+    /// `GET /messages` is only a checkpoint during an active run: for streaming
+    /// sessions it can lag the WebSocket/ACP stream, omit the in-progress
+    /// assistant reply, or even lack the current user anchor. A wholesale
+    /// replacement under those conditions blanks the conversation (see
+    /// `loadMessages`) and, once streaming resumes, re-creates the reply bubble
+    /// so the typewriter restarts from zero. This upsert preserves the live
+    /// projection:
+    ///
+    /// - server entries are refreshed by id, never shrinking the current
+    ///   typewriter target;
+    /// - client-local entries (`local-*`, `acp-*`) survive until their server
+    ///   counterpart arrives;
+    /// - server entries the checkpoint no longer reports are pruned, unless
+    ///   they are the message currently being streamed.
+    private func mergedLiveMessages(existing: [MothxMessage], snapshot: [MothxMessage]) -> [MothxMessage] {
+        let snapshotIDs = Set(snapshot.map(\.id))
+        let streamingID = currentRunningMessageID ?? runReplyMessageID
+        var merged = existing.filter { message in
+            if message.id.hasPrefix("local-") || message.id.hasPrefix("acp-") { return true }
+            if let streamingID, message.id == streamingID { return true }
+            return snapshotIDs.contains(message.id)
+        }
+        // Once the checkpoint knows a tool call/result, drop the streaming
+        // client-side copy so the process block never lists it twice.
+        let serverCallIDs = Set(snapshot.compactMap(\.toolCallId))
+        if !serverCallIDs.isEmpty {
+            merged.removeAll { message in
+                (message.id.hasPrefix("acp-call-") || message.id.hasPrefix("acp-result-"))
+                    && (message.toolCallId.map { serverCallIDs.contains($0) } ?? false)
+            }
+        }
+        // Replace the optimistic local user placeholder once its real
+        // counterpart shows up in the checkpoint, so the turn is not duplicated.
+        let snapshotUsers = snapshot.filter { $0.isUser && !$0.id.hasPrefix("local-") }
+        if !snapshotUsers.isEmpty {
+            merged.removeAll { message in
+                message.id.hasPrefix("local-") && message.isUser
+                    && snapshotUsers.contains { $0.content == message.content }
+            }
+        }
+        var order: [String] = []
+        var byID: [String: MothxMessage] = [:]
+        for message in merged {
+            if byID[message.id] == nil { order.append(message.id) }
+            byID[message.id] = message
+        }
+        var known = Set(order)
+        for message in snapshot {
+            if let old = byID[message.id] {
+                // Prefer the longer rendering of the same message so the
+                // typewriter target never rewinds mid-stream.
+                if message.content.count >= old.content.count { byID[message.id] = message }
+            } else if !known.contains(message.id) {
+                byID[message.id] = message
+                order.append(message.id)
+                known.insert(message.id)
+            }
+        }
+        return order.compactMap { byID[$0] }
     }
 
     /// Loads one tool result only when the user opens its process page. The
@@ -1532,10 +1626,8 @@ final class MothxServiceManager: ObservableObject {
             // invalid". Only server-known skills go into the payload; the rest
             // are attached as /skill:<name> directives in the message — the
             // same path that works when typed directly in the prompt.
-            let serverKnownSkillNames = Set(remoteInstalledSkills.map(\.name))
-            let payloadSkills = skills.filter { serverKnownSkillNames.contains($0) }
+            let (payloadSkills, directiveSkills) = splitSkillsForPayload(skills)
             if !payloadSkills.isEmpty { payload["skills"] = payloadSkills }
-            let directiveSkills = skills.filter { !serverKnownSkillNames.contains($0) }
             var submittedMessage = message
             if !directiveSkills.isEmpty {
                 submittedMessage = message + "\n\n" + directiveSkills.map { "/skill:\($0)" }.joined(separator: "  ")
@@ -3043,7 +3135,47 @@ final class MothxServiceManager: ObservableObject {
         return model ?? nil
     }
 
-    private func loadInstalledSkills() async {
+    /// Splits the requested skills into server-known names (safe for the
+    /// `skills` payload, which otherwise fails validation with 400) and
+    /// directive names to attach as `/skill:<name>` in the message. Mirrors
+    /// the workspace submit path; team agent runs use the same rules.
+    func splitSkillsForPayload(_ skills: [String]) -> (payload: [String], directives: [String]) {
+        let serverKnown = Set(remoteInstalledSkills.map(\.name))
+        return (
+            skills.filter { serverKnown.contains($0) },
+            skills.filter { !serverKnown.contains($0) }
+        )
+    }
+
+    /// Loads the serve tool catalog (`GET /api/capabilities`, `features` map).
+    /// Only the local-tool toggles accepted by the run submission API are
+    /// surfaced; hosted tools (webSearch) are excluded because the server
+    /// ignores them in the `tools` payload.
+    func loadToolCatalog() async {
+        do {
+            let data = try await request(path: "api/capabilities", method: "GET")
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let features = object["features"] as? [String: Any] else {
+                toolCatalog = []
+                return
+            }
+            // Order matches the workspace composer; keep parity with
+            // sessionToolOptionsFromNames in the mothx run submit handler.
+            let ids = ["browser", "a2aMaster", "delegate", "multiAgent", "workflows"]
+            toolCatalog = ids.compactMap { id in
+                guard let raw = features[id] as? [String: Any] else { return nil }
+                return MothxAgentTool(
+                    id: id,
+                    available: raw["available"] as? Bool ?? false,
+                    isDefault: raw["default"] as? Bool ?? false
+                )
+            }
+        } catch {
+            toolCatalog = []
+        }
+    }
+
+    func loadInstalledSkills() async {
         // Global (bootstrap) skill sync. This must NOT clobber the per-session
         // skill list owned by loadSkills(for:): the workspace re-syncs after
         // every run (updateSessionTitle → loadWorkspace) while a session is
@@ -3187,6 +3319,14 @@ final class MothxServiceManager: ObservableObject {
     func refreshInstalledSkills(workDirs: [String]) {
         installedSkills = mergeInstalledSkills(disk: installedSkillsFromDisk(workDirs: workDirs), remote: remoteInstalledSkills)
         discoverableSkills = mergeInstalledSkills(disk: installedSkillsFromDisk(workDirs: workDirs), remote: remoteInstalledSkills)
+    }
+
+    /// Skill list scoped to the given work dirs (disk scan + last server
+    /// payload) without touching the shared session-scoped `installedSkills`.
+    /// Used by the team Agent editor, whose skills belong to the Agent's own
+    /// working directory rather than the currently open workspace session.
+    func skillsForAgent(workDirs: [String]) -> [MothxSkill] {
+        mergeInstalledSkills(disk: installedSkillsFromDisk(workDirs: workDirs), remote: remoteInstalledSkills)
     }
 
     /// First existing project skill root under the workDir, falling back to

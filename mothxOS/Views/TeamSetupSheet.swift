@@ -251,11 +251,18 @@ private struct AgentSummaryRow: View {
 struct AgentEditorSheet: View {
     @EnvironmentObject private var mothx: MothxServiceManager
     @EnvironmentObject private var languageStore: LanguageStore
+    @Environment(\.colorScheme) private var colorScheme
     @State var profile: MothxAgentProfile
     let projectID: String
     @Binding var isPresented: Bool
-    @State private var toolsText = ""
-    @State private var skillsText = ""
+    @State private var selectedTools: Set<String> = []
+    @State private var selectedSkills: Set<String> = []
+    /// Skills scoped to the Agent's own working directory (like the workspace's
+    /// project-local skill list) plus disk/global and server-known skills.
+    @State private var agentSkillOptions: [MothxSkill] = []
+    /// Skills that are not project-local and can be added into the Agent's workDir.
+    @State private var addableSkillOptions: [MothxSkill] = []
+    @State private var skillActionMessage: String?
     @State private var testResult: String?
     @State private var testError: String?
     @State private var isTesting = false
@@ -289,11 +296,11 @@ struct AgentEditorSheet: View {
                                 .scrollContentBackground(.hidden)
                                 .frame(minHeight: 54, maxHeight: 90)
                                 .padding(8)
-                                .background(Color.white)
+                                .background(colorScheme == .light ? .white : Color(nsColor: .underPageBackgroundColor))
                                 .clipShape(RoundedRectangle(cornerRadius: 6))
                                 .overlay(
                                     RoundedRectangle(cornerRadius: 6)
-                                        .stroke(Color.primary.opacity(0.14), lineWidth: 1)
+                                        .stroke(Color.primary.opacity(colorScheme == .light ? 0.14 : 0.1), lineWidth: 1)
                                 )
                                 .overlay(alignment: .topLeading) {
                                     if profile.summary.isEmpty {
@@ -313,11 +320,11 @@ struct AgentEditorSheet: View {
                             .disabled(profile.role == .manager)
                         }
                         .padding(10)
-                        .background(Color.white)
+                        .background(colorScheme == .light ? .white : Color(nsColor: .underPageBackgroundColor))
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                         .overlay(
                             RoundedRectangle(cornerRadius: 6)
-                                .stroke(Color.primary.opacity(0.14), lineWidth: 1)
+                                .stroke(Color.primary.opacity(colorScheme == .light ? 0.14 : 0.1), lineWidth: 1)
                         )
                     }
 
@@ -371,25 +378,45 @@ struct AgentEditorSheet: View {
                             .frame(width: 240)
                         }
                         .padding(10)
-                        .background(Color.white)
+                        .background(colorScheme == .light ? .white : Color(nsColor: .underPageBackgroundColor))
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                         .overlay(
                             RoundedRectangle(cornerRadius: 6)
-                                .stroke(Color.primary.opacity(0.14), lineWidth: 1)
+                                .stroke(Color.primary.opacity(colorScheme == .light ? 0.14 : 0.1), lineWidth: 1)
                         )
                     }
                     .padding(16)
-                    .background(Color.white)
+                    .background(colorScheme == .light ? .white : Color(nsColor: .underPageBackgroundColor))
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                     .overlay(
                         RoundedRectangle(cornerRadius: 10)
-                            .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+                            .stroke(Color.primary.opacity(colorScheme == .light ? 0.12 : 0.1), lineWidth: 1)
                     )
 
                     // MARK: - 工具与配置
                     VStack(alignment: .leading, spacing: 10) {
-                        SettingsField(title: c.agentTools, text: $toolsText)
-                        SettingsField(title: c.agentSkills, text: $skillsText)
+                        AgentMultiSelectField(
+                            title: c.agentTools,
+                            hint: c.agentToolsHint,
+                            items: mothx.toolCatalog.filter(\.available).map { ($0.id, c.agentToolLabel($0.id)) },
+                            selection: $selectedTools,
+                            emptyText: c.noAvailableTools
+                        )
+                        AgentMultiSelectField(
+                            title: c.agentSkills,
+                            hint: c.agentSkillsHint,
+                            items: agentSkillOptions.filter { $0.scope == .local }.map { ($0.name, $0.name) },
+                            selection: $selectedSkills,
+                            emptyText: c.noAvailableSkills
+                        )
+                        AgentSkillAddSection(
+                            addable: addableSkillOptions,
+                            workDir: profile.workDir,
+                            action: { addSkill($0) }
+                        )
+                        if let skillActionMessage {
+                            Text(skillActionMessage).font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                        }
 
                         HStack {
                             Text(c.agentMaxIterations).frame(width: 150, alignment: .leading)
@@ -398,22 +425,22 @@ struct AgentEditorSheet: View {
                                 .frame(width: 120)
                         }
                         .padding(10)
-                        .background(Color.white)
+                        .background(colorScheme == .light ? .white : Color(nsColor: .underPageBackgroundColor))
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                         .overlay(
                             RoundedRectangle(cornerRadius: 6)
-                                .stroke(Color.primary.opacity(0.14), lineWidth: 1)
+                                .stroke(Color.primary.opacity(colorScheme == .light ? 0.14 : 0.1), lineWidth: 1)
                         )
 
                         Toggle(c.agentEnabledTitle, isOn: $profile.enabled)
                         Text(c.agentEnabledHint).font(.caption).foregroundStyle(.secondary)
                     }
                     .padding(16)
-                    .background(Color.white)
+                    .background(colorScheme == .light ? .white : Color(nsColor: .underPageBackgroundColor))
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                     .overlay(
                         RoundedRectangle(cornerRadius: 10)
-                            .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+                            .stroke(Color.primary.opacity(colorScheme == .light ? 0.12 : 0.1), lineWidth: 1)
                     )
 
                     // MARK: - 测试运行
@@ -447,11 +474,11 @@ struct AgentEditorSheet: View {
                         }
                     }
                     .padding(16)
-                    .background(Color.white)
+                    .background(colorScheme == .light ? .white : Color(nsColor: .underPageBackgroundColor))
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                     .overlay(
                         RoundedRectangle(cornerRadius: 10)
-                            .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+                            .stroke(Color.primary.opacity(colorScheme == .light ? 0.12 : 0.1), lineWidth: 1)
                     )
                 }
             }
@@ -459,15 +486,31 @@ struct AgentEditorSheet: View {
         .padding(24)
         .frame(width: 620, height: 680)
         .onAppear {
-            toolsText = profile.tools.joined(separator: ", ")
-            skillsText = profile.skills.joined(separator: ", ")
+            selectedTools = Set(profile.tools)
+            selectedSkills = Set(profile.skills)
+            // Keep the multi-select backed by the live mothx catalog / skills.
+            if mothx.toolCatalog.isEmpty {
+                Task { await mothx.loadToolCatalog() }
+            }
+            Task {
+                await mothx.loadInstalledSkills()
+                reloadAgentSkills()
+            }
+        }
+        .onChange(of: profile.workDir) { _, _ in
+            reloadAgentSkills()
         }
     }
 
     private func save() {
         var profile = profile
-        profile.tools = toolsText.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
-        profile.skills = skillsText.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        // Persist only tool names the runtime knows; unknown tools are
+        // rejected by the run submit API and would fail the run. Skills keep
+        // every selected name: the run path splits server-known skills into the
+        // payload and the rest into /skill directives, mirroring the workspace.
+        let knownTools = mothx.toolCatalog.filter(\.available).map(\.id)
+        profile.tools = Array(selectedTools).sorted().filter { knownTools.isEmpty || knownTools.contains($0) }
+        profile.skills = Array(selectedSkills).sorted()
         profile.updatedAt = Date()
         profile.providerID = profile.providerID.trimmingCharacters(in: .whitespacesAndNewlines)
         profile.modelID = profile.modelID.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -486,8 +529,9 @@ struct AgentEditorSheet: View {
         testError = nil
         testResult = nil
         var profile = profile
-        profile.tools = toolsText.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
-        profile.skills = skillsText.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        let knownTools = mothx.toolCatalog.filter(\.available).map(\.id)
+        profile.tools = Array(selectedTools).sorted().filter { knownTools.isEmpty || knownTools.contains($0) }
+        profile.skills = Array(selectedSkills).sorted()
         let testPrompt = languageStore.copy.testRunPrompt
         let result = await mothx.teamManager.testRunAgent(profile: profile, prompt: testPrompt)
         isTesting = false
@@ -503,5 +547,130 @@ struct AgentEditorSheet: View {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         if panel.runModal() == .OK, let url = panel.url { profile.workDir = url.path }
+    }
+
+    /// Refreshes the Agent-scoped skill options after the server list or the
+    /// working directory changes, mirroring the workspace skill UI.
+    private func reloadAgentSkills() {
+        agentSkillOptions = mothx.skillsForAgent(workDirs: [profile.workDir])
+        let localNames = Set(agentSkillOptions.filter { $0.scope == .local }.map(\.name))
+        addableSkillOptions = agentSkillOptions.filter { $0.scope != .local && !localNames.contains($0.name) }
+    }
+
+    private func addSkill(_ skill: MothxSkill) {
+        if let error = mothx.installSkillToProject(skill, workDir: profile.workDir) {
+            skillActionMessage = error
+        } else {
+            skillActionMessage = languageStore.copy.addSkillSuccess(skill.name)
+            reloadAgentSkills()
+            selectedSkills.insert(skill.name)
+        }
+    }
+}
+
+/// 多选项（工具 / Skills）选择器：选项来自 mothx 接口目录，勾选式多选。
+private struct AgentMultiSelectField: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let title: String
+    let hint: String
+    let items: [(id: String, label: String)]
+    @Binding var selection: Set<String>
+    let emptyText: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            Text(hint).font(.caption2).foregroundStyle(.tertiary)
+            if items.isEmpty {
+                Text(emptyText).font(.callout).foregroundStyle(.secondary).padding(.vertical, 8)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(items, id: \.id) { item in
+                            Toggle(isOn: Binding(
+                                get: { selection.contains(item.id) },
+                                set: { on in
+                                    if on { selection.insert(item.id) } else { selection.remove(item.id) }
+                                }
+                            )) {
+                                Text(item.label).font(.system(size: 13))
+                            }
+                            .toggleStyle(.checkbox)
+                            .padding(.vertical, 3)
+                        }
+                    }
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 110)
+                .background(colorScheme == .light ? .white : Color(nsColor: .underPageBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color.primary.opacity(colorScheme == .light ? 0.14 : 0.1), lineWidth: 1)
+                )
+            }
+        }
+    }
+}
+/// 「添加技能」区域：与项目会话的添加技能一致，把全局/可发现的技能复制到
+/// Agent 自己的工作目录（workDir/.skills 等），之后即可在勾选列表中使用。
+private struct AgentSkillAddSection: View {
+    @EnvironmentObject private var languageStore: LanguageStore
+    @Environment(\.colorScheme) private var colorScheme
+    let addable: [MothxSkill]
+    let workDir: String
+    let action: (MothxSkill) -> Void
+
+    private var c: Copy { languageStore.copy }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(c.addSkill).font(.caption).foregroundStyle(.secondary)
+            if addable.isEmpty {
+                Text(c.noAddableSkills).font(.callout).foregroundStyle(.secondary).padding(.vertical, 4)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(addable) { skill in
+                            let canAdd = !workDir.isEmpty && !skill.directory.isEmpty
+                            HStack(spacing: 4) {
+                                Image(systemName: skill.scope == .global ? "globe" : "server.rack")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(skill.scope == .global ? .blue : .secondary)
+                                Text(skill.name).lineLimit(1)
+                                Spacer()
+                                if skill.directory.isEmpty {
+                                    Text(c.addSkillServerOnly).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                                } else {
+                                    Button { action(skill) } label: {
+                                        Text(c.addSkill).font(.caption)
+                                            .padding(.horizontal, 8).padding(.vertical, 4)
+                                    }
+                                    .buttonStyle(.bordered).controlSize(.small)
+                                    .disabled(!canAdd)
+                                    .help(canAdd ? c.addSkill : c.addSkillNoWorkDir)
+                                }
+                            }
+                            .padding(.horizontal, 10).padding(.vertical, 8)
+                            .frame(maxWidth: .infinity, minHeight: 38, alignment: .leading)
+                            .contentShape(Rectangle())
+                        }
+                    }
+                    .padding(6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 120)
+                .background(colorScheme == .light ? .white : Color(nsColor: .underPageBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color.primary.opacity(colorScheme == .light ? 0.14 : 0.1), lineWidth: 1)
+                )
+                if workDir.isEmpty {
+                    Text(c.addSkillNoWorkDir).font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+        }
     }
 }

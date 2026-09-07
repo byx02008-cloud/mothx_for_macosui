@@ -57,6 +57,18 @@ struct WorkspaceView: View {
     /// Guards async turn recomputes: only the newest request may commit,
     /// otherwise a slower older pass could overwrite fresher turn data.
     @State private var turnsRecomputeGeneration = 0
+    /// True while `.task(id: sessionID)` is applying saved per-session
+    /// provider/model preferences. Persisting onChange handlers skip these
+    /// programmatic writes so restoring a conversation never fabricates a
+    /// memory for it; only explicit user selections are remembered.
+    @State private var isRestoringSession = false
+    /// True while `.task(id: sessionID)` is restoring a saved conversation
+    /// (messages → turns → collapse → prepared content). Premature
+    /// bottom-scroll requests from the message/turn change handlers are
+    /// suppressed during the restore so opening a historical session never
+    /// positions the scrollbar against partial content: the scrollbar
+    /// position is determined only after the content is loaded and collapsed.
+    @State private var isRestoringConversation = false
 
     private let conversationBottomID = "conversation-bottom"
 
@@ -183,6 +195,13 @@ struct WorkspaceView: View {
                         }
                         .coordinateSpace(name: "conversation-scroll")
                         .onChange(of: mothx.messagesBySession[sessionID] ?? []) { _, _ in
+                            // While a saved conversation is being restored, the
+                            // message dictionary is populated before the turns
+                            // are computed and collapsed. A scroll here would
+                            // anchor the viewport against partial content, so
+                            // defer to the single scroll issued at the end of
+                            // the restore.
+                            guard !isRestoringConversation else { return }
                             requestScrollToBottom()
                         }
                         .onChange(of: currentTurns.count) { _, _ in
@@ -193,6 +212,7 @@ struct WorkspaceView: View {
                             // forces the LazyVStack layout first, so a restored
                             // session never opens on a blank viewport until the
                             // user nudges the scrollbar.
+                            guard !isRestoringConversation else { return }
                             requestScrollToBottom()
                         }
                         .onChange(of: mothx.thinkingBySession[sessionID] ?? "") { _, _ in
@@ -227,6 +247,25 @@ struct WorkspaceView: View {
                         .onAppear {
                             requestScrollToBottom()
                         }
+                        .overlay {
+                            // While a saved conversation is being restored the
+                            // turn list is intentionally empty (stale turns from
+                            // the previous session are dropped first so the
+                            // final scroll lands against this session's own
+                            // layout). Show an explicit loading state instead of
+                            // a blank conversation area.
+                            if isRestoringConversation && currentTurns.isEmpty {
+                                VStack(spacing: 10) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text("加载会话… / Loading session…")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .padding(20)
+                                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                            }
+                        }
                         .overlay(alignment: .topTrailing) {
                             if currentTurns.count > 3 {
                                 Button {
@@ -234,7 +273,7 @@ struct WorkspaceView: View {
                                         showAllHistory.toggle()
                                         if let lastID = currentTurns.last?.id {
                                             expandedTurnIDs = [lastID]
-                                            prepareTurn(lastID)
+                                            Task { await prepareTurn(lastID) }
                                         }
                                     }
                                 } label: {
@@ -297,7 +336,7 @@ struct WorkspaceView: View {
                             selectedSkills: $selectedSkills,
                             selectedTools: $selectedTools,
                             models: currentModels,
-                            isRunning: mothx.isSubmittingRun || mothx.isStreaming,
+                            isRunning: mothx.runSessionID == sessionID && (mothx.isSubmittingRun || mothx.isStreaming),
                             promptPlaceholder: imageGenerationSelection == nil
                                 ? c.askAnything
                                 : c.text("请输入生图提示词", "Enter an image generation prompt"),
@@ -333,12 +372,32 @@ struct WorkspaceView: View {
             Text(skillActionMessage ?? "")
         }
         .task(id: sessionID) {
+            // Restore gate: while a saved conversation is being reloaded, the
+            // message/turn change handlers must not position the scrollbar
+            // against partial content. The position is determined exactly once
+            // at the end of the restore, after the content is loaded and
+            // collapsed.
+            isRestoringConversation = true
+            defer { isRestoringConversation = false }
             if let sessionID {
+                // Drop the previous conversation immediately so the restored
+                // session never renders stale turns while its messages are
+                // loading, and the final scroll lands against this session's
+                // own collapsed layout.
+                currentTurns = []
+                expandedTurnIDs = []
+                preparedTurnIDs = []
+                preparingTurnID = nil
+                showAllHistory = false
                 imageGenerationMenuOpen = false
                 imageGenerationSelection = nil
                 selectedMode = ["plan", "agent", "yolo"].contains(mothx.defaultMode) ? mothx.defaultMode : "agent"
                 // Restore per-session provider/model preferences. If the saved
                 // provider no longer exists, fall back to the global defaults.
+                // These writes are flagged so the binding onChange handlers do
+                // not treat the restore as a user selection and persist
+                // fallback defaults as if they were remembered.
+                isRestoringSession = true
                 if let savedProvider = mothx.providerForSession(sessionID),
                    mothx.providers.contains(where: { $0.id == savedProvider }) {
                     // Saved provider exists: keep it, and fall back to its first
@@ -358,6 +417,7 @@ struct WorkspaceView: View {
                     selectedProviderID = mothx.providers.first?.id ?? ""
                     selectedModelID = mothx.providers.first?.models.first?.id ?? ""
                 }
+                isRestoringSession = false
                 selectedSkills = mothx.activeSkillsBySession[sessionID] ?? []
                 selectedTools = []
                 await mothx.loadSkills(for: sessionID)
@@ -372,9 +432,24 @@ struct WorkspaceView: View {
                 expandedTurnIDs = currentTurns.last.map { [$0.id] } ?? []
                 preparedTurnIDs = []
                 preparingTurnID = nil
-                if let lastID = currentTurns.last?.id { prepareTurn(lastID) }
-                // Guarantee the restored conversation opens at the bottom even
-                // when the turn count did not change this session switch.
+                if let lastID = currentTurns.last?.id {
+                    // Restore ordering: the expanded turn's real content must
+                    // replace the loading placeholder before the viewport is
+                    // positioned, otherwise the scroll lands against a
+                    // placeholder-height document and the restored session
+                    // opens off the true conversation bottom.
+                    await prepareTurn(lastID)
+                }
+                guard !Task.isCancelled else { return }
+                // The collapse (only the last turn stays expanded) and the
+                // prepared content need one committed layout pass before the
+                // scrollbar position is determined.
+                await Task.yield()
+                await Task.yield()
+                // Load order complete: content loaded → collapsed → prepared.
+                // Only now determine the scrollbar position; the premature
+                // requests from the change handlers were suppressed above.
+                isRestoringConversation = false
                 requestScrollToBottom()
                 prefetchPreviewCache()
             }
@@ -384,23 +459,22 @@ struct WorkspaceView: View {
                 Task { await mothx.setActiveSkills(sessionID: sessionID, names: newValue) }
             }
         }
-        .onChange(of: mothx.messagesBySession) { _, _ in
-            if let sessionID {
-                let started = Date()
-                let messages = mothx.messagesBySession[sessionID] ?? []
-                turnsRecomputeGeneration += 1
-                let generation = turnsRecomputeGeneration
-                Task { @MainActor in
-                    let turns = await computeTurnsAsync(messages)
-                    guard generation == turnsRecomputeGeneration, !Task.isCancelled else { return }
-                    currentTurns = turns
-                    mothx.recordRuntimeLog("workspace", "turns recomputed session=\(sessionID) messages=\(messages.count) turns=\(turns.count) elapsedMs=\(Int(Date().timeIntervalSince(started) * 1000))")
-                    if turns.count <= 3 { showAllHistory = false }
-                    // Keep last turn expanded, preserve other expanded
-                    if let lastID = turns.last?.id {
-                        expandedTurnIDs.insert(lastID)
-                        prepareTurn(lastID)
-                    }
+        .onChange(of: mothx.messagesBySession) { oldBySession, newBySession in
+            guard let sessionID, oldBySession[sessionID] != newBySession[sessionID] else { return }
+            let started = Date()
+            let messages = mothx.messagesBySession[sessionID] ?? []
+            turnsRecomputeGeneration += 1
+            let generation = turnsRecomputeGeneration
+            Task { @MainActor in
+                let turns = await computeTurnsAsync(messages)
+                guard generation == turnsRecomputeGeneration, !Task.isCancelled else { return }
+                currentTurns = turns
+                mothx.recordRuntimeLog("workspace", "turns recomputed session=\(sessionID) messages=\(messages.count) turns=\(turns.count) elapsedMs=\(Int(Date().timeIntervalSince(started) * 1000))")
+                if turns.count <= 3 { showAllHistory = false }
+                // Keep last turn expanded, preserve other expanded
+                if let lastID = turns.last?.id {
+                    expandedTurnIDs.insert(lastID)
+                    Task { await prepareTurn(lastID) }
                 }
             }
         }
@@ -421,6 +495,20 @@ struct WorkspaceView: View {
             let provider = providers.first(where: { $0.id == mothx.defaultProvider }) ?? providers.first
             selectedProviderID = provider?.id ?? ""
             selectedModelID = provider?.models.first?.id ?? ""
+        }
+        // Remember the provider/model the user actually selects in the
+        // composer for this session immediately, so switching conversations
+        // or relaunching the app restores it. Restore writes are excluded via
+        // isRestoringSession, and the image-generation temporary route is
+        // excluded via imageGenerationSelection (the original pair is saved
+        // explicitly when the generation Run finishes).
+        .onChange(of: selectedProviderID) { _, newProvider in
+            guard let sessionID, !isRestoringSession, imageGenerationSelection == nil else { return }
+            mothx.setSessionProvider(newProvider, for: sessionID)
+        }
+        .onChange(of: selectedModelID) { _, newModel in
+            guard let sessionID, !isRestoringSession, imageGenerationSelection == nil else { return }
+            mothx.setSessionModel(newModel, for: sessionID)
         }
         .onChange(of: terminalStore.isOpen) { _, isOpen in
             guard !isOpen, let sessionID else { return }
@@ -698,27 +786,30 @@ struct WorkspaceView: View {
             }
             newIDs.insert(turn.id)
             expandedTurnIDs = newIDs
-            prepareTurn(turn.id)
+            Task { await prepareTurn(turn.id) }
         }
     }
 
     /// Give SwiftUI one layout pass to display the loading placeholder before
     /// exposing a potentially very large turn to the lazy conversation stack.
     /// Once ready, the entire expanded turn is present before scrollbar input
-    /// can request another portion of it.
-    private func prepareTurn(_ turnID: String) {
-        guard !preparedTurnIDs.contains(turnID), preparingTurnID != turnID else { return }
-        preparingTurnID = turnID
-        Task { @MainActor in
-            await Task.yield()
-            await Task.yield()
-            guard expandedTurnIDs.contains(turnID) else {
-                if preparingTurnID == turnID { preparingTurnID = nil }
-                return
-            }
-            preparedTurnIDs.insert(turnID)
-            if preparingTurnID == turnID { preparingTurnID = nil }
+    /// can request another portion of it. Awaitable so session restore can
+    /// hold the scrollbar position until the content is actually present.
+    @discardableResult
+    private func prepareTurn(_ turnID: String) async -> Bool {
+        guard !preparedTurnIDs.contains(turnID), preparingTurnID != turnID else {
+            return preparedTurnIDs.contains(turnID)
         }
+        preparingTurnID = turnID
+        await Task.yield()
+        await Task.yield()
+        guard expandedTurnIDs.contains(turnID) else {
+            if preparingTurnID == turnID { preparingTurnID = nil }
+            return false
+        }
+        preparedTurnIDs.insert(turnID)
+        if preparingTurnID == turnID { preparingTurnID = nil }
+        return true
     }
 
     // MARK: - Session fork
@@ -1374,7 +1465,11 @@ struct PromptComposer: View {
     @State private var modelSearchText = ""
     @State private var isDropTargeted = false
 
-    private let toolOptions = [("browser", "browser"), ("delegate", "delegate"), ("multi-agent", "muti-agent"), ("workflow", "workflow")]
+    /// Tools offered to the composer come from the mothx capability catalog
+    /// (`toolCatalog`) so the names always match what the run API accepts.
+    private var toolOptions: [(id: String, label: String)] {
+        mothx.toolCatalog.filter(\.available).map { ($0.id, languageStore.copy.agentToolLabel($0.id)) }
+    }
 
     private var selectedModelLabel: String {
         if let model = models.first(where: { $0.id == modelID }) { return model.displayName }
@@ -1745,7 +1840,7 @@ struct PromptComposer: View {
                                 .contentShape(Rectangle())
                             }
                         case .tools:
-                            ForEach(toolOptions, id: \.0) { tool, label in
+                            ForEach(toolOptions, id: \.id) { tool, label in
                                 let active = selectedTools.contains(tool)
                                 Button {
                                     if active { selectedTools.remove(tool) } else { selectedTools.insert(tool) }
@@ -1823,6 +1918,11 @@ private struct ConversationScrollObserver: NSViewRepresentable {
         var boundsObserver: NSObjectProtocol?
         var documentFrameObserver: NSObjectProtocol?
         var documentBoundsObserver: NSObjectProtocol?
+        /// Tracks the last time we attempted to scroll to the bottom, so we can
+        /// retry when LazyVStack finishes laying out and the document grows.
+        var lastScrollToBottomTime: Date?
+        /// The document height recorded during the last scroll-to-bottom attempt.
+        var lastScrollToBottomDocumentHeight: CGFloat = 0
 
         init(onBottomChanged: @escaping (Bool) -> Void) {
             self.onBottomChanged = onBottomChanged
@@ -1832,11 +1932,22 @@ private struct ConversationScrollObserver: NSViewRepresentable {
             DispatchQueue.main.async { [weak self, weak view] in
                 guard let self, let view,
                       let scrollView = Self.findScrollView(from: view) else { return }
+
+                let documentViewChanged: Bool
+                if let currentScrollView = self.observedScrollView {
+                    documentViewChanged = currentScrollView.documentView !== scrollView.documentView
+                } else {
+                    documentViewChanged = true
+                }
+
                 guard self.observedScrollView !== scrollView else {
                     self.refreshLayoutIfNeeded()
                     self.refreshScrollIfNeeded()
                     self.scheduleScrollOffsetClamp()
                     self.updateBottomState()
+                    if documentViewChanged {
+                        self.reattachDocumentObservers(scrollView: scrollView)
+                    }
                     return
                 }
                 if let boundsObserver = self.boundsObserver {
@@ -1858,29 +1969,58 @@ private struct ConversationScrollObserver: NSViewRepresentable {
                     self?.clampScrollOffsetIfNeeded()
                     self?.updateBottomState()
                 }
-                if let documentView = scrollView.documentView {
-                    documentView.postsFrameChangedNotifications = true
-                    documentView.postsBoundsChangedNotifications = true
-                    self.documentFrameObserver = NotificationCenter.default.addObserver(
-                        forName: NSView.frameDidChangeNotification,
-                        object: documentView,
-                        queue: .main
-                    ) { [weak self] _ in
-                        self?.scheduleScrollOffsetClamp()
-                    }
-                    self.documentBoundsObserver = NotificationCenter.default.addObserver(
-                        forName: NSView.boundsDidChangeNotification,
-                        object: documentView,
-                        queue: .main
-                    ) { [weak self] _ in
-                        self?.scheduleScrollOffsetClamp()
-                    }
-                }
+                self.reattachDocumentObservers(scrollView: scrollView)
                 self.refreshLayoutIfNeeded()
                 self.refreshScrollIfNeeded()
                 self.scheduleScrollOffsetClamp()
                 self.updateBottomState()
             }
+        }
+
+        func reattachDocumentObservers(scrollView: NSScrollView) {
+            if let documentFrameObserver = self.documentFrameObserver {
+                NotificationCenter.default.removeObserver(documentFrameObserver)
+            }
+            if let documentBoundsObserver = self.documentBoundsObserver {
+                NotificationCenter.default.removeObserver(documentBoundsObserver)
+            }
+
+            if let documentView = scrollView.documentView {
+                documentView.postsFrameChangedNotifications = true
+                documentView.postsBoundsChangedNotifications = true
+                self.documentFrameObserver = NotificationCenter.default.addObserver(
+                    forName: NSView.frameDidChangeNotification,
+                    object: documentView,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.scheduleScrollOffsetClamp()
+                    self?.retryScrollToBottomIfNeeded()
+                }
+                self.documentBoundsObserver = NotificationCenter.default.addObserver(
+                    forName: NSView.boundsDidChangeNotification,
+                    object: documentView,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.scheduleScrollOffsetClamp()
+                    self?.retryScrollToBottomIfNeeded()
+                }
+            }
+        }
+
+        /// When LazyVStack finishes laying out turns, the document height grows.
+        /// If we recently tried to scroll to the bottom while the height was
+        /// still small, retry now so the viewport lands at the true bottom.
+        /// The window is generous because restored content realizes in several
+        /// passes (markdown, images, per-file historical changes fetched over
+        /// the network), each of which can grow the document later.
+        func retryScrollToBottomIfNeeded() {
+            guard let lastTime = lastScrollToBottomTime,
+                  Date().timeIntervalSince(lastTime) < 4.0,
+                  let scrollView = observedScrollView,
+                  let documentView = scrollView.documentView else { return }
+            let documentHeight = documentView.bounds.height
+            guard documentHeight > lastScrollToBottomDocumentHeight + 10 else { return }
+            scrollToBottomNow()
         }
 
         func refreshLayoutIfNeeded() {
@@ -1956,6 +2096,10 @@ private struct ConversationScrollObserver: NSViewRepresentable {
             guard abs(currentY - maxY) > 0.5 else { return }
             clipView.scroll(to: NSPoint(x: 0, y: maxY))
             scrollView.reflectScrolledClipView(clipView)
+            // Record when and at what height we scrolled so we can retry if
+            // LazyVStack grows the document after this point.
+            lastScrollToBottomTime = Date()
+            lastScrollToBottomDocumentHeight = documentHeight
         }
 
         func updateBottomState() {
@@ -2085,8 +2229,22 @@ private struct RetSubmitTextEditor: NSViewRepresentable {
         (textView as? PasteAwareTextView)?.onPasteImage = { [weak coordinator = context.coordinator] image in
             coordinator?.parent.onPasteImage(image)
         }
+        // A running conversation re-renders this composer continuously (stream
+        // ticks, thinking previews, the per-second elapsed timer — and even a
+        // newly opened session's composer, because the shared messagesBySession
+        // dictionary invalidates every workspace). Assigning `textView.string`
+        // here cancels an active input-method composition (marked text), which
+        // made Chinese input impossible while any conversation was in progress.
+        // While the field is being edited, the field itself is the source of
+        // truth and textDidChange keeps the binding in sync — so binding→view
+        // writes must be skipped, including whenever marked text is present.
+        let coordinator = context.coordinator
+        let hasMarkedText = textView.hasMarkedText()
+        guard !coordinator.isEditing, !hasMarkedText else { return }
         if textView.string != text {
+            coordinator.isInternalUpdate = true
             textView.string = text
+            coordinator.isInternalUpdate = false
         }
     }
 
@@ -2097,9 +2255,21 @@ private struct RetSubmitTextEditor: NSViewRepresentable {
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: RetSubmitTextEditor
         var isInternalUpdate = false
+        /// True while the field itself is the first responder with an active
+        /// editing session. Used to keep binding→view writes away from a
+        /// focused field that may hold an input-method composition.
+        var isEditing = false
 
         init(_ parent: RetSubmitTextEditor) {
             self.parent = parent
+        }
+
+        func textDidBeginEditing(_ notification: Notification) {
+            isEditing = true
+        }
+
+        func textDidEndEditing(_ notification: Notification) {
+            isEditing = false
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
@@ -2114,6 +2284,18 @@ private struct RetSubmitTextEditor: NSViewRepresentable {
                 guard !parent.isRunning else { return true }
                 parent.text = textView.string
                 parent.onSubmit()
+                // The submit flow clears the prompt binding synchronously when
+                // the message is accepted. Because the field stays focused and
+                // updateNSView intentionally skips binding→view writes while
+                // editing, mirror the cleared value here so the sent prompt
+                // does not linger in the composer. If submit bailed early
+                // (missing provider/model, empty prompt…), the binding keeps
+                // the text and the field is left untouched.
+                if parent.text.isEmpty, !textView.string.isEmpty {
+                    isInternalUpdate = true
+                    textView.string = ""
+                    isInternalUpdate = false
+                }
                 return true
             }
             return false

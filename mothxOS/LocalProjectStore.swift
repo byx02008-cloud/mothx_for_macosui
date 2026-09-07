@@ -116,11 +116,20 @@ final class LocalProjectStore {
 
     func setModel(_ modelID: String, for sessionID: String) throws {
         // UPSERT so model and provider updates do not overwrite each other.
-        try execute("INSERT INTO session_preferences (session_id, model_id) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET model_id = excluded.model_id", bindings: [sessionID, modelID])
+        // The sentinel provider_id keeps the write legal on a fresh row even
+        // when setModel runs before setProvider; the following setProvider
+        // upsert replaces it with the real provider.
+        try execute("INSERT INTO session_preferences (session_id, model_id, provider_id) VALUES (?, ?, '') ON CONFLICT(session_id) DO UPDATE SET model_id = excluded.model_id", bindings: [sessionID, modelID])
     }
 
     func setProvider(_ providerID: String, for sessionID: String) throws {
-        try execute("INSERT INTO session_preferences (session_id, provider_id) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET provider_id = excluded.provider_id", bindings: [sessionID, providerID])
+        // The INSERT row is validated (including model_id NOT NULL) before the
+        // ON CONFLICT DO UPDATE branch runs, so a provider-only write with a
+        // NULL model_id always failed and the provider was never persisted
+        // (the error was swallowed by `try?` at the call site). Inserting an
+        // empty-string sentinel model_id keeps the row valid; setModel replaces
+        // it with the real model.
+        try execute("INSERT INTO session_preferences (session_id, model_id, provider_id) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET provider_id = excluded.provider_id", bindings: [sessionID, "", providerID])
     }
 
     func model(for sessionID: String) throws -> String? {
