@@ -344,13 +344,15 @@ struct VideoPreviewSidebar: View {
             VStack(alignment: .leading, spacing: 12) {
                 Group {
                     if let player {
-                        VideoPlayer(player: player)
+                        // Use the AppKit AVPlayerView bridge instead of SwiftUI's
+                        // VideoPlayer. The latter goes through _AVKit_SwiftUI's
+                        // NSViewRepresentable metadata path and can abort in an
+                        // optimized/archive build on macOS 26, even though Debug
+                        // runs from Xcode work correctly.
+                        MacVideoPlayerView(player: player)
                             .onDisappear { player.pause() }
-                    } else if let localURL = localVideoFileURL(for: video.source) {
-                        ContentUnavailableView("视频加载失败", systemImage: "video.slash")
-                            .onAppear { self.player = AVPlayer(url: localURL) }
-                    } else if let remoteURL = remoteVideoURL(for: video.source) {
-                        VideoPlayer(player: AVPlayer(url: remoteURL))
+                    } else if localVideoFileURL(for: video.source) != nil || remoteVideoURL(for: video.source) != nil {
+                        ProgressView("正在加载视频…")
                     } else {
                         ContentUnavailableView("视频内容不可用", systemImage: "video.slash")
                     }
@@ -384,7 +386,8 @@ struct VideoPreviewSidebar: View {
         .background(.background)
         .task(id: video.source) {
             player?.pause()
-            player = localVideoFileURL(for: video.source).map(AVPlayer.init(url:))
+            let url = localVideoFileURL(for: video.source) ?? remoteVideoURL(for: video.source)
+            player = url.map(AVPlayer.init(url:))
         }
     }
 }
@@ -428,6 +431,38 @@ private struct ImagePreviewContent: View {
         let encoded = String(image.source[image.source.index(after: comma)...])
         guard let data = Data(base64Encoded: encoded) else { return nil }
         return NSImage(data: data)
+    }
+}
+
+// MARK: - Video player
+
+/// AppKit-backed video rendering for the macOS app.
+///
+/// SwiftUI's `VideoPlayer` is convenient, but its private `_AVKit_SwiftUI`
+/// bridge has a release/archive-only metadata crash on the macOS 26 runtime
+/// used by this app. `AVPlayerView` is the supported AppKit counterpart and
+/// avoids that fragile SwiftUI bridge while retaining native playback controls.
+private struct MacVideoPlayerView: NSViewRepresentable {
+    let player: AVPlayer
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = AVPlayerView()
+        view.player = player
+        view.controlsStyle = .floating
+        view.videoGravity = .resizeAspect
+        view.showsFullScreenToggleButton = true
+        return view
+    }
+
+    func updateNSView(_ view: AVPlayerView, context: Context) {
+        if view.player !== player {
+            view.player = player
+        }
+    }
+
+    static func dismantleNSView(_ view: AVPlayerView, coordinator: ()) {
+        view.player?.pause()
+        view.player = nil
     }
 }
 
