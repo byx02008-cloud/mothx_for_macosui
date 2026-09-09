@@ -45,8 +45,9 @@ nonisolated struct ToolInvocationSummary: Identifiable, Hashable {
     let hasDetail: Bool
     let isError: Bool
     let imagePreviews: [MothxImagePreview]
+    let videoPreviews: [MothxVideoPreview]
 
-    init(id: String, toolName: String, argumentsPreview: String, arguments: String, resultSummary: String, hasDetail: Bool, isError: Bool, imagePreviews: [MothxImagePreview] = []) {
+    init(id: String, toolName: String, argumentsPreview: String, arguments: String, resultSummary: String, hasDetail: Bool, isError: Bool, imagePreviews: [MothxImagePreview] = [], videoPreviews: [MothxVideoPreview] = []) {
         self.id = id
         self.toolName = toolName
         self.argumentsPreview = argumentsPreview
@@ -55,6 +56,7 @@ nonisolated struct ToolInvocationSummary: Identifiable, Hashable {
         self.hasDetail = hasDetail
         self.isError = isError
         self.imagePreviews = imagePreviews
+        self.videoPreviews = videoPreviews
     }
 }
 
@@ -71,12 +73,12 @@ nonisolated func computeTurns(_ messages: [MothxMessage]) -> [Turn] {
         var fileCalls: [MothxMessage] = []
         for msg in messages {
             if msg.isAssistant,
-               !msg.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !msg.imagePreviews.isEmpty {
-                results.append(MothxMessage(id: msg.id, seq: msg.seq, role: msg.role, content: msg.content.trimmingCharacters(in: .whitespacesAndNewlines), toolCallId: msg.toolCallId, toolName: msg.toolName, arguments: msg.arguments, plan: msg.plan, summary: msg.summary, hasDetail: msg.hasDetail, createdAt: msg.createdAt, imagePreviews: msg.imagePreviews))
+               (!msg.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !msg.imagePreviews.isEmpty || !msg.videoPreviews.isEmpty) {
+                results.append(MothxMessage(id: msg.id, seq: msg.seq, role: msg.role, content: msg.content.trimmingCharacters(in: .whitespacesAndNewlines), toolCallId: msg.toolCallId, toolName: msg.toolName, arguments: msg.arguments, plan: msg.plan, summary: msg.summary, hasDetail: msg.hasDetail, createdAt: msg.createdAt, imagePreviews: msg.imagePreviews, videoPreviews: msg.videoPreviews))
             } else if msg.isToolCall {
                 let id = msg.toolCallId ?? msg.id
                 let name = msg.toolName ?? "tool"
-                calls[id] = ToolInvocationSummary(id: id, toolName: name, argumentsPreview: toolArgSummary(toolName: name, arguments: msg.arguments) ?? "", arguments: msg.arguments, resultSummary: "", hasDetail: false, isError: false, imagePreviews: msg.imagePreviews)
+                calls[id] = ToolInvocationSummary(id: id, toolName: name, argumentsPreview: toolArgSummary(toolName: name, arguments: msg.arguments) ?? "", arguments: msg.arguments, resultSummary: "", hasDetail: false, isError: false, imagePreviews: msg.imagePreviews, videoPreviews: msg.videoPreviews)
                 order.append(id)
                 if ["edit", "write", "insert", "edit_file", "write_file", "insert_file", "insert_text"].contains((msg.toolName ?? "").lowercased().replacingOccurrences(of: "-", with: "_")) {
                     fileCalls.append(msg)
@@ -84,12 +86,16 @@ nonisolated func computeTurns(_ messages: [MothxMessage]) -> [Turn] {
             } else if msg.isToolResult {
                 resultCount += 1
                 let id = msg.toolCallId ?? msg.id
-                let old = calls[id] ?? ToolInvocationSummary(id: id, toolName: msg.toolName ?? "tool", argumentsPreview: "", arguments: "", resultSummary: "", hasDetail: false, isError: false, imagePreviews: [])
+                let old = calls[id] ?? ToolInvocationSummary(id: id, toolName: msg.toolName ?? "tool", argumentsPreview: "", arguments: "", resultSummary: "", hasDetail: false, isError: false, imagePreviews: [], videoPreviews: [])
                 var previews = old.imagePreviews
                 for preview in msg.imagePreviews where !previews.contains(where: { $0.source == preview.source }) {
                     previews.append(preview)
                 }
-                calls[id] = ToolInvocationSummary(id: id, toolName: old.toolName, argumentsPreview: old.argumentsPreview, arguments: old.arguments, resultSummary: compactToolSummary(msg.summary ?? ""), hasDetail: msg.hasDetail, isError: false, imagePreviews: previews)
+                var videoPreviews = old.videoPreviews
+                for preview in msg.videoPreviews where !videoPreviews.contains(where: { $0.source == preview.source }) {
+                    videoPreviews.append(preview)
+                }
+                calls[id] = ToolInvocationSummary(id: id, toolName: old.toolName, argumentsPreview: old.argumentsPreview, arguments: old.arguments, resultSummary: compactToolSummary(msg.summary ?? ""), hasDetail: msg.hasDetail, isError: false, imagePreviews: previews, videoPreviews: videoPreviews)
                 if !order.contains(id) { order.append(id) }
             }
         }
@@ -136,6 +142,7 @@ struct TurnBlock: View {
     var onPreviewSkill: ((MothxSkill) -> Void)? = nil
     var onPreviewTool: ((ToolInvocationSummary) -> Void)? = nil
     var onPreviewImage: ((MothxImagePreview) -> Void)? = nil
+    var onPreviewVideo: ((MothxVideoPreview) -> Void)? = nil
 
     /// Explicit message forks are accepted only at the final assistant text
     /// entry of a completed turn. This mirrors mothx's `fork_unavailable`
@@ -212,6 +219,28 @@ struct TurnBlock: View {
     /// reply text (`publish_artifact <path>`), resolved against the session
     /// working directory. Shown as a card after the final answer so the user
     /// can click through to the right-sidebar preview.
+    /// Locally generated or downloaded video files found in this turn. They
+    /// are shown after the final answer as a file card and open in the same
+    /// sliding right-sidebar preview used by generated images.
+    private var turnPublishArtifactVideos: [MothxVideoPreview] {
+        guard turnRunID != nil else { return [] }
+        let workDir = mothx.workDir(for: sessionID)
+        let directPreviews = turn.resultMessages.flatMap(\.videoPreviews)
+            + turn.toolSummaries.flatMap(\.videoPreviews)
+        let texts = turn.resultMessages.map(\.content)
+            + turn.toolSummaries.map(\.arguments)
+            + turn.toolSummaries.map(\.resultSummary)
+        var seen = Set<String>()
+        var result: [MothxVideoPreview] = []
+        for preview in directPreviews where seen.insert(preview.source).inserted {
+            result.append(preview)
+        }
+        for preview in texts.flatMap({ MothxVideoPreview.previews(from: $0, workDirectory: workDir) }) {
+            if seen.insert(preview.source).inserted { result.append(preview) }
+        }
+        return result
+    }
+
     private var turnPublishArtifactImages: [MothxImagePreview] {
         guard turnRunID != nil else { return [] }
         let workDir = mothx.workDir(for: sessionID)
@@ -336,6 +365,13 @@ struct TurnBlock: View {
             if let runID = turnRunID, !artifactImages.isEmpty {
                 PublishArtifactCard(images: artifactImages, runID: runID) { image in
                     onPreviewImage?(image)
+                }
+                .padding(.top, 2)
+            }
+            let artifactVideos = turnPublishArtifactVideos
+            if let runID = turnRunID, !artifactVideos.isEmpty {
+                PublishArtifactVideoCard(videos: artifactVideos, runID: runID) { video in
+                    onPreviewVideo?(video)
                 }
                 .padding(.top, 2)
             }

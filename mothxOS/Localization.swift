@@ -370,10 +370,19 @@ struct Copy {
     var appNameLabel: String { text("应用名称", "App Name") }
     var appVersionLabel: String { text("App 版本", "App Version") }
     var mothxVersionLabel: String { text("mothx 版本", "mothx Version") }
+    var recommendedVersionLabel: String { text("推荐 mothx 版本", "Recommended mothx Version") }
     var latestVersionLabel: String { text("最新版本（npm）", "Latest Version (npm)") }
     var versionUnknown: String { text("未知", "Unknown") }
     var refreshVersion: String { text("刷新", "Refresh") }
     var updateAvailableHint: String { text("发现新版本，可点击下方按钮在线更新", "A new version is available") }
+    var runtimeNeedsUpgradeHint: (String) -> String { { version in self.text("当前 mothx 版本低于推荐版本，建议升级到 v\(version)", "The installed mothx version is older than recommended. Upgrade to v\(version)") } }
+    var runtimeUpdateAvailableHint: (String) -> String { { version in self.text("当前 mothx 版本属于 1.3.x 兼容范围，可升级到推荐版本 v\(version)", "The installed mothx version is within the compatible 1.3.x range. You can update to the recommended v\(version)") } }
+    var runtimeNewerCanDowngradeHint: (String) -> String { { version in self.text("当前 mothx 版本高于推荐版本，可降级到 v\(version) 以获得兼容性", "The installed mothx version is newer than recommended. You can downgrade to v\(version) for compatibility") } }
+    var runtimeCompatibleHint: String { text("当前 mothx 版本符合推荐兼容版本", "The installed mothx version matches the recommended compatibility version") }
+    var runtimeMissingHint: String { text("未检测到 mothx 版本，请先安装 mothx runtime", "No mothx version detected. Install the mothx runtime first") }
+    var runtimeVersionInvalidHint: String { text("无法识别当前 mothx 版本", "The installed mothx version could not be recognized") }
+    var upgradeToRecommended: String { text("升级到推荐版本", "Upgrade to Recommended") }
+    var downgradeToRecommended: String { text("降级到推荐版本", "Downgrade to Recommended") }
     var upToDateHint: String { text("已是最新版本", "You're up to date") }
     var npmUnavailableHint: String { text("未能获取最新版本，请确认已安装 npm", "Couldn't check the latest version. Make sure npm is installed.") }
     var updateButton: String { text("在线更新", "Update") }
@@ -383,13 +392,15 @@ struct Copy {
     var updateProgressTitle: String { text("在线更新", "Online Update") }
     var updateWaitingForOutput: String { text("等待输出…", "Waiting for output…") }
     var updateStageStoppingService: String { text("正在停止 mothx 服务…", "Stopping mothx service…") }
-    var updateStageInstalling: String { text("正在执行 npm install -g mothx-installer…", "Running npm install -g mothx-installer…") }
+    var updateStageInstalling: String { text("正在安装 mothx 推荐版本…", "Installing the recommended mothx version…") }
+    var updateStageInstallingVersion: (String) -> String { { version in self.text("正在安装 mothx v\(version)…", "Installing mothx v\(version)…") } }
     var updateStageRestartingService: String { text("正在重启 mothx 服务…", "Restarting mothx service…") }
     var updateStageSucceeded: String { text("更新完成", "Update complete") }
     var updateStageFailed: String { text("更新失败", "Update failed") }
     var updateLogStoppingService: String { text("[步骤] 停止 mothx 服务", "[Step] Stopping mothx service") }
     var updateLogExternalServiceSkipped: String { text("[步骤] 检测到外部启动的 mothx 服务，跳过停止（避免终止非本应用进程）", "[Step] Detected an externally-started mothx service, skipping stop (won't terminate a process this app doesn't own)") }
-    var updateLogRunningNpmInstall: String { text("[步骤] 执行 npm install -g mothx-installer", "[Step] Running npm install -g mothx-installer") }
+    var updateLogRunningNpmInstall: String { text("[步骤] 安装 mothx 推荐版本", "[Step] Installing the recommended mothx version") }
+    var updateLogRunningNpmInstallVersion: (String) -> String { { version in self.text("[步骤] 执行 npm install -g mothx-installer@\(version)", "[Step] Running npm install -g mothx-installer@\(version)") } }
     var updateLogRestartingService: String { text("[步骤] 重启 mothx 服务", "[Step] Restarting mothx service") }
     var updateLogSucceeded: String { text("[完成] 更新成功，服务已重启", "[Done] Update succeeded, service restarted") }
     var updateLogFailedPrefix: (Int32) -> String { { code in self.text("[失败] npm install 退出码 \(code)", "[Failed] npm install exited with code \(code)") } }
@@ -399,6 +410,21 @@ struct Copy {
     var updateStageInstallingAdmin: String { text("正在以管理员权限执行 npm install…", "Running npm install as administrator…") }
     var updateStageNeedsAdmin: String { text("更新需要管理员权限", "Update requires admin rights") }
     var updatePromptTitle: (String) -> String { { version in self.text("发现新版本 v\(version)，是否现在更新？", "New version v\(version) available. Update now?") } }
+    var runtimePromptTitle: (String, Bool) -> String { { version, isDowngrade in
+        self.text(
+            isDowngrade ? "当前 mothx 版本高于推荐版本 v\(version)" : "当前 mothx 版本低于推荐版本 v\(version)",
+            isDowngrade ? "The installed mothx version is newer than recommended v\(version)" : "The installed mothx version is older than recommended v\(version)"
+        )
+    } }
+    var runtimePromptMessage: (String, Bool) -> String { { version, isDowngrade in
+        self.text(
+            isDowngrade ? "为保证兼容性，建议降级到 mothx v\(version)。" : "为保证兼容性，建议升级到 mothx v\(version)。",
+            isDowngrade ? "For compatibility, downgrade to mothx v\(version)." : "For compatibility, upgrade to mothx v\(version)."
+        )
+    } }
+    var runtimePromptAction: (Bool) -> String { { isDowngrade in
+        self.text(isDowngrade ? "降级到推荐版本" : "升级到推荐版本", isDowngrade ? "Downgrade to Recommended" : "Upgrade to Recommended")
+    } }
     var updatePromptMessage: String { text("mothx 有可用更新。您可以稍后处理，也可以忽略此版本。", "mothx has an available update. You can handle it later, or ignore this version.") }
     var updatePromptNow: String { text("现在更新", "Update Now") }
     var updatePromptLater: String { text("稍后再说", "Later") }

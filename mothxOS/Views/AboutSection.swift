@@ -20,12 +20,30 @@ struct AboutSection: View {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
     }
 
-    private var updateAvailable: Bool {
+    private var recommendedRuntimeVersion: String {
+        MothxRuntimeCompatibility.recommendedVersion
+    }
+
+    private var runtimeStatus: MothxRuntimeVersionStatus {
         #if DEBUG
-        if ProcessInfo.processInfo.environment["MOTHXOS_SIMULATE_UPDATE_AVAILABLE"] == "1" { return true }
+        if ProcessInfo.processInfo.environment["MOTHXOS_SIMULATE_UPDATE_AVAILABLE"] == "1" {
+            return .needsUpgrade
+        }
         #endif
-        guard let mothxVersion, let latestVersion, !latestVersion.isEmpty else { return false }
-        return RuntimeInstall.versionNeedsUpdate(current: mothxVersion, latest: latestVersion)
+        return RuntimeInstall.runtimeVersionStatus(current: mothxVersion)
+    }
+
+    private var runtimeActionAvailable: Bool {
+        runtimeStatus == .needsUpgrade
+            || runtimeStatus == .updateAvailable
+            || runtimeStatus == .newerCanDowngrade
+    }
+
+    private var actionButtonTitle: String {
+        switch runtimeStatus {
+        case .newerCanDowngrade: return languageStore.copy.downgradeToRecommended
+        default: return languageStore.copy.upgradeToRecommended
+        }
     }
 
     var body: some View {
@@ -35,6 +53,7 @@ struct AboutSection: View {
                 infoRow(c.appNameLabel, appDisplayName)
                 infoRow(c.appVersionLabel, appVersion)
                 infoRow(c.mothxVersionLabel, mothxVersion ?? c.versionUnknown)
+                infoRow(c.recommendedVersionLabel, recommendedRuntimeVersion)
                 HStack {
                     Text(c.latestVersionLabel)
                     Spacer()
@@ -46,11 +65,24 @@ struct AboutSection: View {
                 }
 
                 if !isChecking {
-                    if updateAvailable {
-                        Text(c.updateAvailableHint).font(.caption).foregroundStyle(.orange)
-                    } else if mothxVersion != nil && latestVersion != nil {
-                        Text(c.upToDateHint).font(.caption).foregroundStyle(.secondary)
-                    } else if latestVersion == nil {
+                    switch runtimeStatus {
+                    case .needsUpgrade:
+                        Text(c.runtimeNeedsUpgradeHint(recommendedRuntimeVersion))
+                            .font(.caption).foregroundStyle(.orange)
+                    case .updateAvailable:
+                        Text(c.runtimeUpdateAvailableHint(recommendedRuntimeVersion))
+                            .font(.caption).foregroundStyle(.orange)
+                    case .newerCanDowngrade:
+                        Text(c.runtimeNewerCanDowngradeHint(recommendedRuntimeVersion))
+                            .font(.caption).foregroundStyle(.orange)
+                    case .compatible:
+                        Text(c.runtimeCompatibleHint).font(.caption).foregroundStyle(.secondary)
+                    case .missing:
+                        Text(c.runtimeMissingHint).font(.caption).foregroundStyle(.secondary)
+                    case .invalid:
+                        Text(c.runtimeVersionInvalidHint).font(.caption).foregroundStyle(.red)
+                    }
+                    if latestVersion == nil {
                         Text(c.npmUnavailableHint).font(.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -63,8 +95,8 @@ struct AboutSection: View {
                     Button(c.refreshVersion) { Task { await checkVersions() } }
                         .buttonStyle(.bordered)
                         .disabled(isChecking || isUpdating)
-                    if updateAvailable {
-                        Button(isUpdating ? c.updating : c.updateButton) { Task { await runUpdate(asAdmin: false) } }
+                    if runtimeActionAvailable {
+                        Button(isUpdating ? c.updating : actionButtonTitle) { Task { await runUpdate(asAdmin: false) } }
                             .buttonStyle(.borderedProminent).tint(.orange)
                             .disabled(isUpdating)
                     }
@@ -76,6 +108,7 @@ struct AboutSection: View {
             UpdateProgressSheet(
                 stage: updateStage,
                 log: updateLog,
+                targetVersion: MothxRuntimeCompatibility.recommendedVersion,
                 onClose: { showUpdateProgress = false },
                 onInstallAsAdmin: { Task { await runUpdate(asAdmin: true) } }
             )
@@ -118,9 +151,9 @@ struct AboutSection: View {
         updateStage = .stoppingService
         showUpdateProgress = true
 
-        let result = await mothx.performMothxUpdate(asAdmin: asAdmin, onStage: { stage in
+        let result = await mothx.performMothxUpdate(targetVersion: recommendedRuntimeVersion, asAdmin: asAdmin, onStage: { stage in
             updateStage = stage
-            let line = UpdateFlowSupport.stageLogLine(stage, c: c)
+            let line = UpdateFlowSupport.stageLogLine(stage, c: c, targetVersion: MothxRuntimeCompatibility.recommendedVersion)
             if !line.isEmpty { appendUpdateLog(line) }
             if stage == .stoppingService && !mothx.ownsRunningProcess {
                 appendUpdateLog(c.updateLogExternalServiceSkipped)

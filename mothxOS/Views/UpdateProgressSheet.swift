@@ -6,10 +6,10 @@ import SwiftUI
 enum UpdateFlowSupport {
     /// The progress-sheet log line for a stage transition, or "" when the
     /// stage doesn't carry a step log line.
-    static func stageLogLine(_ stage: MothxUpdateStage, c: Copy) -> String {
+    static func stageLogLine(_ stage: MothxUpdateStage, c: Copy, targetVersion: String = MothxRuntimeCompatibility.recommendedVersion) -> String {
         switch stage {
         case .stoppingService: return c.updateLogStoppingService
-        case .installing: return c.updateLogRunningNpmInstall
+        case .installing: return c.updateLogRunningNpmInstallVersion(targetVersion)
         case .restartingService: return c.updateLogRestartingService
         default: return ""
         }
@@ -29,6 +29,7 @@ struct UpdateProgressSheet: View {
     @EnvironmentObject private var languageStore: LanguageStore
     let stage: MothxUpdateStage
     let log: String
+    let targetVersion: String
     let onClose: () -> Void
     let onInstallAsAdmin: () -> Void
 
@@ -63,7 +64,7 @@ struct UpdateProgressSheet: View {
                         .buttonStyle(.borderedProminent)
                     HStack(spacing: 8) {
                         Button(c.installCopySudoCommand) {
-                            copyToPasteboard("sudo npm install -g mothx-installer")
+                            copyToPasteboard("sudo npm install -g mothx-installer@\(targetVersion)")
                         }
                         .buttonStyle(.bordered)
                         Button(c.installOpenTerminal) { openTerminal() }
@@ -98,7 +99,7 @@ struct UpdateProgressSheet: View {
     private func stageLabel(_ c: Copy) -> String {
         switch stage {
         case .stoppingService: return c.updateStageStoppingService
-        case .installing: return c.updateStageInstalling
+        case .installing: return c.updateStageInstallingVersion(targetVersion)
         case .restartingService: return c.updateStageRestartingService
         case .succeeded: return c.updateStageSucceeded
         case .failed: return c.updateStageFailed

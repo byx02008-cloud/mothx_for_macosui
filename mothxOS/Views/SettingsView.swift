@@ -19,7 +19,6 @@ struct SettingsView: View {
     @State private var defaultMode = "agent"
     @State private var skillsDir = ""
     @State private var sessionDir = ""
-    @State private var imageGeneration = MothxImageGenerationConfig()
     @State private var imageRecognition = MothxImageRecognitionConfig()
     @State private var language = "auto"
     @State private var section = "providers"
@@ -50,19 +49,15 @@ struct SettingsView: View {
                         ModelSection(provider: $draft, selectedID: $modelID, discovering: $discovering) { id, name in pendingDeletion = .model(id: id, name: name) }
                     }
                 } else if section == "general" {
-                    GeneralSection(language: $language)
-                } else if section == "imageGeneration" {
-                    ImageGenerationSection(config: $imageGeneration)
-                } else if section == "imageRecognition" {
-                    ImageRecognitionSection(config: $imageRecognition)
+                    GeneralSection(language: $language, imageRecognition: $imageRecognition)
                 } else if section == "skills" {
-                    SkillsSection(skillsDir: $skillsDir)
+                    SkillsSection(skillsDir: $skillsDir, sessionID: selectedSessionID)
                 } else if section == "sessions" {
                     SessionsSection(sessionDir: $sessionDir, showSettings: $showSettings, selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID, pendingDeletion: $pendingDeletion)
                 } else if section == "advanced" {
                     AdvancedSettingsSection()
                 } else {
-                    AboutSection()
+                    GeneralSection(language: $language, imageRecognition: $imageRecognition)
                 }
                 if let error = mothx.settingsError { Text(error).font(.callout).foregroundStyle(.red) }
             }.padding(38).frame(maxWidth: 900, alignment: .leading) }.frame(maxWidth: .infinity)
@@ -91,7 +86,7 @@ struct SettingsView: View {
         } message: {
             Text(pendingDeletion?.message(using: languageStore.copy) ?? languageStore.copy.text("此操作无法撤销。", "This action cannot be undone."))
         }
-        .task { await mothx.loadSettings(); defaultProviderID = mothx.defaultProvider; defaultModelID = mothx.defaultModel; defaultThinkingLevel = mothx.defaultThinkingLevel; defaultMode = mothx.defaultMode; language = languageStore.setting; skillsDir = mothx.skillsDir; sessionDir = mothx.sessionDir; imageGeneration = mothx.imageGeneration; imageRecognition = mothx.imageRecognition; providerID = "" }
+        .task { await mothx.loadSettings(); defaultProviderID = mothx.defaultProvider; defaultModelID = mothx.defaultModel; defaultThinkingLevel = mothx.defaultThinkingLevel; defaultMode = mothx.defaultMode; language = languageStore.setting; skillsDir = mothx.skillsDir; sessionDir = mothx.sessionDir; imageRecognition = mothx.imageRecognition; providerID = ""; mothx.loadGlobalSkills() }
     }
     func select(_ provider: MothxProviderConfig) { providerID = provider.id; draft = provider; modelID = provider.models.first?.id ?? ""; saved = false }
     func save() async { await mothx.saveProvider(draft, asDefault: false); saved = true }
@@ -181,7 +176,7 @@ struct SettingsNavigation: View {
     @Environment(\.colorScheme) private var colorScheme
     @EnvironmentObject private var languageStore: LanguageStore
     @Binding var section: String
-    var body: some View { let c = languageStore.copy; return VStack(alignment: .leading, spacing: 8) { Text(c.settings.uppercased()).sectionLabel().padding(.bottom, 10); SettingsNavItem(title: c.general, icon: "gearshape", id: "general", section: $section); SettingsNavItem(title: c.providers, icon: "server.rack", id: "providers", section: $section); SettingsNavItem(title: c.text("图片识别", "Image Recognition"), icon: "eye", id: "imageRecognition", section: $section); SettingsNavItem(title: c.imageGeneration, icon: "photo", id: "imageGeneration", section: $section); SettingsNavItem(title: c.skills, icon: "sparkles", id: "skills", section: $section); SettingsNavItem(title: c.sessions, icon: "clock", id: "sessions", section: $section); SettingsNavItem(title: c.advancedSettings, icon: "wrench.and.screwdriver", id: "advanced", section: $section); SettingsNavItem(title: c.about, icon: "info.circle", id: "about", section: $section); Spacer() }.padding(22).frame(width: 230).background(colorScheme == .light ? .white : .codexSidebar) }
+    var body: some View { let c = languageStore.copy; return VStack(alignment: .leading, spacing: 8) { Text(c.settings.uppercased()).sectionLabel().padding(.bottom, 10); SettingsNavItem(title: c.general, icon: "gearshape", id: "general", section: $section); SettingsNavItem(title: c.providers, icon: "server.rack", id: "providers", section: $section); SettingsNavItem(title: c.skills, icon: "sparkles", id: "skills", section: $section); SettingsNavItem(title: c.sessions, icon: "clock", id: "sessions", section: $section); SettingsNavItem(title: c.advancedSettings, icon: "wrench.and.screwdriver", id: "advanced", section: $section); Spacer() }.padding(22).frame(width: 230).background(colorScheme == .light ? .white : .codexSidebar) }
 }
 
 struct SettingsNavItem: View { let title: String; let icon: String; let id: String; @Binding var section: String
@@ -247,97 +242,34 @@ struct GeneralSection: View {
     @EnvironmentObject private var mothx: MothxServiceManager
     @EnvironmentObject private var languageStore: LanguageStore
     @Binding var language: String
-    var body: some View {
-        let c = languageStore.copy
-        return SettingsCard(title: c.general, subtitle: c.text("常规设置，对应 settings.json 的 tuilang", "General settings, stored in settings.json as tuilang")) {
-            HStack {
-                Text(c.language)
-                Spacer()
-                Picker(c.language, selection: $language) {
-                    Text("中文").tag("zh")
-                    Text("English").tag("en")
-                    Text("Auto").tag("auto")
-                    Text("Global").tag("global")
-                }.frame(width: 180)
-                Button(c.save) {
-                    Task {
-                        if await mothx.saveLanguage(language) {
-                            languageStore.update(setting: language)
-                        }
-                    }
-                }.buttonStyle(.borderedProminent).tint(.orange)
-            }
-            Text(c.text("语言值会同时保存到本地配置和 mothx settings.json 的 tuilang 字段。", "The language value is saved to the local app settings and mothx settings.json as tuilang.")).font(.caption).foregroundStyle(.secondary)
-        }
-    }
-}
-
-struct ImageGenerationSection: View {
-    @EnvironmentObject private var mothx: MothxServiceManager
-    @EnvironmentObject private var languageStore: LanguageStore
-    @Binding var config: MothxImageGenerationConfig
-
-    private var selectedProvider: MothxProviderConfig? {
-        mothx.providers.first { $0.id == config.providerID }
-    }
-
-    private var models: [MothxModelConfig] {
-        selectedProvider?.models ?? []
-    }
+    @Binding var imageRecognition: MothxImageRecognitionConfig
 
     var body: some View {
         let c = languageStore.copy
-        return SettingsCard(
-            title: c.imageGeneration,
-            subtitle: c.text(
-                "选择一个已有运营商和模型作为生图模型。客户端不判断模型能力，也不保存 API Key。",
-                "Choose an existing provider and model for image generation. The app does not inspect capabilities or store API keys."
-            )
-        ) {
-            Toggle(c.imageGenerationEnabled, isOn: $config.enabled)
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 7) {
-                    Text(c.text("生图 Provider", "Generation Provider")).font(.caption).foregroundStyle(.secondary)
-                    Picker(c.text("生图 Provider", "Generation Provider"), selection: $config.providerID) {
-                        Text(c.selectProvider).tag("")
-                        ForEach(mothx.providers) { provider in
-                            Text(provider.id).tag(provider.id)
+        return VStack(alignment: .leading, spacing: 18) {
+            SettingsCard(title: c.general, subtitle: c.text("常规设置，对应 settings.json 的 tuilang", "General settings, stored in settings.json as tuilang")) {
+                HStack {
+                    Text(c.language)
+                    Spacer()
+                    Picker(c.language, selection: $language) {
+                        Text("中文").tag("zh")
+                        Text("English").tag("en")
+                        Text("Auto").tag("auto")
+                        Text("Global").tag("global")
+                    }.frame(width: 180)
+                    Button(c.save) {
+                        Task {
+                            if await mothx.saveLanguage(language) {
+                                languageStore.update(setting: language)
+                            }
                         }
-                    }
-                    .labelsHidden()
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    }.buttonStyle(.borderedProminent).tint(.orange)
                 }
-                VStack(alignment: .leading, spacing: 7) {
-                    Text(c.text("生图模型", "Generation Model")).font(.caption).foregroundStyle(.secondary)
-                    Picker(c.text("生图模型", "Generation Model"), selection: $config.modelID) {
-                        Text(c.selectModel).tag("")
-                        ForEach(models) { model in
-                            Text(model.displayName).tag(model.id)
-                        }
-                    }
-                    .labelsHidden()
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .disabled(models.isEmpty)
-                }
+                Text(c.text("语言值会同时保存到本地配置和 mothx settings.json 的 tuilang 字段。", "The language value is saved to the local app settings and mothx settings.json as tuilang.")).font(.caption).foregroundStyle(.secondary)
             }
-            .onChange(of: config.providerID) { _, newProviderID in
-                let providerModels = mothx.providers.first(where: { $0.id == newProviderID })?.models ?? []
-                if !providerModels.contains(where: { $0.id == config.modelID }) {
-                    config.modelID = providerModels.first?.id ?? ""
-                }
-            }
-            Text(c.text(
-                "只保存 Provider/Model 的选择。输入 /生图 后，提交时会使用这里选择的运营商与模型；模型是否支持生图由用户自行保证。",
-                "Only the Provider/Model selection is stored. After /生图, the run is submitted with this provider and model; the user is responsible for choosing a model that can generate images."
-            ))
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            Button(c.imageGenerationSave) {
-                mothx.saveImageGeneration(config)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.orange)
-            .disabled(config.enabled && (config.providerID.isEmpty || config.modelID.isEmpty))
+
+            ImageRecognitionSection(config: $imageRecognition)
+            AboutSection()
         }
     }
 }
@@ -412,8 +344,260 @@ struct ImageRecognitionSection: View {
     }
 }
 
-struct SkillsSection: View { @EnvironmentObject private var mothx: MothxServiceManager; @EnvironmentObject private var languageStore: LanguageStore; @Binding var skillsDir: String
-    var body: some View { let c = languageStore.copy; return SettingsCard(title: c.skills, subtitle: c.text("对应 settings.json 的 skillsDir 和 skillHub", "settings.json skillsDir and skillHub")) { SettingsField(title: c.skillsDirectory, text: $skillsDir, placeholder: c.defaultSkillsDir); Text(c.skillHubHint).font(.caption).foregroundStyle(.secondary); Button(c.saveSkills) { Task { await mothx.saveSkillsAndSession(skillsDir: skillsDir, sessionDir: mothx.sessionDir) } }.buttonStyle(.borderedProminent).tint(.orange) } }
+private enum GlobalSkillTab: Hashable {
+    case system
+    case custom
+}
+
+struct SkillsSection: View {
+    @EnvironmentObject private var mothx: MothxServiceManager
+    @EnvironmentObject private var languageStore: LanguageStore
+    @Binding var skillsDir: String
+    let sessionID: String?
+    @State private var selectedSkillKey: String?
+    @State private var selectedTab: GlobalSkillTab = .system
+    @State private var content = ""
+    @State private var isLoadingContent = false
+    @State private var isSaving = false
+    @State private var saved = false
+    @State private var errorMessage: String?
+    @State private var showSkillMarket = false
+
+    private var visibleSkills: [MothxSkill] {
+        selectedTab == .system ? mothx.systemSkills : mothx.customSkills
+    }
+
+    var body: some View {
+        let c = languageStore.copy
+        return VStack(alignment: .leading, spacing: 18) {
+            SettingsCard(title: c.skills, subtitle: c.text("管理全局 SKILL.md；项目技能仍在对应项目目录中维护。", "Manage global SKILL.md files; project skills remain in their project directories.")) {
+                SettingsField(title: c.skillsDirectory, text: $skillsDir, placeholder: c.defaultSkillsDir)
+                Text(c.skillHubHint).font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Button(c.saveSkills) {
+                        Task {
+                            await mothx.saveSkillsAndSession(skillsDir: skillsDir, sessionDir: mothx.sessionDir)
+                            mothx.loadGlobalSkills()
+                        }
+                    }.buttonStyle(.borderedProminent).tint(.orange)
+                    Button {
+                        mothx.loadGlobalSkills()
+                    } label: { Label(c.text("刷新全局技能", "Refresh global skills"), systemImage: "arrow.clockwise") }.buttonStyle(.bordered)
+                    Spacer()
+                    Button {
+                        showSkillMarket = true
+                    } label: {
+                        Label(c.text("安装技能", "Install skill"), systemImage: "plus.circle")
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.orange)
+                }
+            }
+
+            SettingsCard(title: c.text("技能列表", "Skill list"), subtitle: c.text("系统技能来自 ~/.agents/skills，自定义技能来自 ~/.mothx/skills。点击技能可查看和编辑 SKILL.md。", "System skills are loaded from ~/.agents/skills; custom skills are loaded from ~/.mothx/skills. Select a skill to inspect and edit its SKILL.md.")) {
+                Picker("", selection: $selectedTab) {
+                    Text(c.text("系统技能", "System skills")).tag(GlobalSkillTab.system)
+                    Text(c.text("自定义技能", "Custom skills")).tag(GlobalSkillTab.custom)
+                }
+                .pickerStyle(.segmented)
+
+                Divider()
+
+                if visibleSkills.isEmpty {
+                    Text(selectedTab == .system
+                         ? c.text("暂无系统技能", "No system skills found")
+                         : c.text("暂无自定义技能", "No custom skills found"))
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(visibleSkills) { skill in
+                        VStack(alignment: .leading, spacing: 8) {
+                            GlobalSkillRow(skill: skill, selected: selectedSkillKey == skill.directory) {
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    selectedSkillKey = selectedSkillKey == skill.directory ? nil : skill.directory
+                                }
+                            }
+                            if selectedSkillKey == skill.directory {
+                                GlobalSkillDetail(
+                                    skill: skill,
+                                    content: $content,
+                                    isLoadingContent: $isLoadingContent,
+                                    isSaving: $isSaving,
+                                    saved: $saved,
+                                    errorMessage: $errorMessage,
+                                    loadContent: loadContent,
+                                    canUninstall: selectedTab == .custom,
+                                    uninstall: uninstallCustomSkill
+                                )
+                                .transition(.opacity.combined(with: .move(edge: .top)))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .task {
+            mothx.loadGlobalSkills()
+        }
+        .onChange(of: selectedTab) { _, _ in
+            selectedSkillKey = nil
+            content = ""
+            errorMessage = nil
+            saved = false
+        }
+        .sheet(isPresented: $showSkillMarket) {
+            SkillMarketSheet(sessionID: sessionID)
+                .environmentObject(mothx)
+                .environmentObject(languageStore)
+        }
+    }
+
+    private func loadContent(_ skill: MothxSkill) {
+        isLoadingContent = true
+        saved = false
+        errorMessage = nil
+        content = mothx.skillContent(skill) ?? ""
+        if content.isEmpty {
+            errorMessage = languageStore.copy.text("无法读取 SKILL.md。", "Unable to read SKILL.md.")
+        }
+        isLoadingContent = false
+    }
+
+    private func uninstallCustomSkill(_ skill: MothxSkill) {
+        let error = mothx.uninstallCustomSkill(skill)
+        if let error {
+            errorMessage = error
+            return
+        }
+        selectedSkillKey = nil
+        content = ""
+        errorMessage = nil
+        saved = false
+    }
+}
+
+private struct GlobalSkillDetail: View {
+    @EnvironmentObject private var mothx: MothxServiceManager
+    @EnvironmentObject private var languageStore: LanguageStore
+    let skill: MothxSkill
+    @Binding var content: String
+    @Binding var isLoadingContent: Bool
+    @Binding var isSaving: Bool
+    @Binding var saved: Bool
+    @Binding var errorMessage: String?
+    let loadContent: (MothxSkill) -> Void
+    let canUninstall: Bool
+    let uninstall: (MothxSkill) -> Void
+    @State private var showUninstallConfirmation = false
+
+    var body: some View {
+        let c = languageStore.copy
+        VStack(alignment: .leading, spacing: 10) {
+            if isLoadingContent {
+                ProgressView(c.text("正在读取技能…", "Loading skill…"))
+            } else {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text(c.text("描述", "Description"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(mothx.skillDescription(from: content) ?? c.text("未定义描述", "No description defined"))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                        .background(Color.primary.opacity(0.07))
+                        .clipShape(RoundedRectangle(cornerRadius: 7))
+                }
+                Text(c.text("SKILL.md 内容", "SKILL.md content"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextEditor(text: $content)
+                    .font(.system(.body, design: .monospaced))
+                    .frame(minHeight: 120, maxHeight: 200)
+                    .padding(6)
+                    .background(Color.primary.opacity(0.07))
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.primary.opacity(0.12)))
+                HStack {
+                    if saved { Text(c.saved).font(.caption).foregroundStyle(.green) }
+                    if let errorMessage { Text(errorMessage).font(.caption).foregroundStyle(.red) }
+                    Spacer()
+                    if canUninstall {
+                        Button(role: .destructive) {
+                            showUninstallConfirmation = true
+                        } label: {
+                            Label(c.text("卸载", "Uninstall"), systemImage: "trash")
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(isSaving)
+                    }
+                    Button(c.save) {
+                        isSaving = true
+                        saved = false
+                        errorMessage = nil
+                        Task {
+                            let error = mothx.saveGlobalSkillContent(skill, content: content)
+                            await MainActor.run {
+                                isSaving = false
+                                errorMessage = error
+                                saved = error == nil
+                            }
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
+                    .disabled(isSaving || content.isEmpty)
+                }
+            }
+        }
+        .padding(14)
+        .background(Color.primary.opacity(0.045))
+        .clipShape(RoundedRectangle(cornerRadius: 9))
+        .overlay(RoundedRectangle(cornerRadius: 9).stroke(Color.primary.opacity(0.1)))
+        .task(id: skill.id) {
+            loadContent(skill)
+        }
+        .confirmationDialog(
+            c.text("卸载技能？", "Uninstall skill?"),
+            isPresented: $showUninstallConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button(c.text("卸载", "Uninstall"), role: .destructive) {
+                uninstall(skill)
+            }
+            Button(c.cancel, role: .cancel) { }
+        } message: {
+            Text(c.text(
+                "将删除该技能目录及其中的文件，此操作无法撤销。",
+                "The skill directory and its files will be deleted. This action cannot be undone."
+            ))
+        }
+    }
+}
+
+private struct GlobalSkillRow: View {
+    let skill: MothxSkill
+    let selected: Bool
+    let select: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: selected ? "sparkles.rectangle.stack.fill" : "sparkles.rectangle.stack")
+                .foregroundStyle(selected ? .orange : .secondary)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(skill.name).font(.system(size: 14, weight: .medium))
+                Text(skill.directory).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer()
+            Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(selected ? Color.orange.opacity(0.12) : (isHovered ? Color.primary.opacity(0.08) : Color.primary.opacity(0.04)))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .contentShape(Rectangle())
+        .onHover { isHovered = $0 }
+        .onTapGesture(perform: select)
+    }
 }
 
 struct SessionsSection: View {
@@ -629,4 +813,534 @@ struct SettingsField: View {
     var secure = false
 
     var body: some View { HStack { Text(title).frame(width: 150, alignment: .leading); if secure { SecureField(placeholder, text: $text).textFieldStyle(.plain) } else { TextField(placeholder, text: $text).textFieldStyle(.plain) } }.padding(10).background(colorScheme == .light ? .white : Color.primary.opacity(0.18)).clipShape(RoundedRectangle(cornerRadius: 6)) }
+}
+
+// MARK: - SkillHub marketplace sheet
+
+private struct SkillMarketViewError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
+
+private enum SkillMarketTab: Hashable {
+    case official
+    case community
+}
+
+private struct SkillMarketSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var mothx: MothxServiceManager
+    @EnvironmentObject private var languageStore: LanguageStore
+    let sessionID: String?
+
+    @State private var query = ""
+    @State private var selectedTab: SkillMarketTab = .official
+    @State private var items: [MothxSkillHubSummary] = []
+    @State private var selectedItem: MothxSkillHubSummary?
+    @State private var detail: MothxSkillHubDetail?
+    @State private var page = 1
+    @State private var total = 0
+    @State private var pageSize = 20
+    @State private var isLoading = false
+    @State private var isLoadingDetail = false
+    @State private var actionKey: String?
+    @State private var errorMessage: String?
+    @State private var listRequestID = 0
+
+    private var totalPages: Int { max(1, Int(ceil(Double(total) / Double(max(pageSize, 1))))) }
+    private var currentSummary: MothxSkillHubSummary? {
+        guard let selectedItem else { return nil }
+        return items.first(where: { $0.key == selectedItem.key }) ?? selectedItem
+    }
+    private var installedState: MothxSkillHubInstalledState? {
+        detail?.summary.installed ?? currentSummary?.installed
+    }
+
+    var body: some View {
+        let c = languageStore.copy
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(c.text("技能市场", "Skill marketplace"))
+                        .font(.system(size: 20, weight: .semibold))
+                    Text("skillhub.cn")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Picker("", selection: $selectedTab) {
+                    Text(c.text("官方技能", "Official")).tag(SkillMarketTab.official)
+                    Text(c.text("社区技能", "Community")).tag(SkillMarketTab.community)
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 190)
+                Spacer()
+                TextField(c.text("搜索技能", "Search skills"), text: $query)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 260)
+                    .onSubmit { startSearch() }
+                Button(c.text("搜索", "Search")) { startSearch() }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
+                Button(c.cancel) { dismiss() }
+                    .buttonStyle(.bordered)
+            }
+            .padding(20)
+            Divider()
+
+            HStack(spacing: 0) {
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack {
+                        Text(c.text("技能列表", "Skills"))
+                            .font(.headline)
+                        Spacer()
+                        if isLoading { ProgressView().controlSize(.small) }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+
+                    Divider()
+                    if items.isEmpty && !isLoading {
+                        VStack(spacing: 8) {
+                            Image(systemName: "shippingbox")
+                                .font(.system(size: 28))
+                                .foregroundStyle(.secondary)
+                            Text(c.text("暂无技能", "No skills found"))
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        ScrollView {
+                            LazyVStack(spacing: 0) {
+                                ForEach(items, id: \.key) { item in
+                                    SkillMarketRow(
+                                        item: item,
+                                        selected: selectedItem?.key == item.key,
+                                        select: { select(item) }
+                                    )
+                                    Divider().padding(.leading, 16)
+                                }
+                            }
+                        }
+                    }
+
+                    Divider()
+                    HStack(spacing: 10) {
+                        Button {
+                            changePage(page - 1)
+                        } label: { Image(systemName: "chevron.left") }
+                        .buttonStyle(.bordered)
+                        .disabled(isLoading || page <= 1)
+                        Text(c.text("第 \(page) / \(totalPages) 页", "Page \(page) of \(totalPages)"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Button {
+                            changePage(page + 1)
+                        } label: { Image(systemName: "chevron.right") }
+                        .buttonStyle(.bordered)
+                        .disabled(isLoading || page >= totalPages)
+                        Spacer()
+                        Text(c.text("共 \(total) 个", "\(total) total"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(12)
+                }
+                .frame(width: 360)
+                .background(Color.primary.opacity(0.025))
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 0) {
+                    if isLoadingDetail {
+                        Spacer()
+                        ProgressView(c.text("正在读取技能详情…", "Loading skill details…"))
+                        Spacer()
+                    } else if let detail {
+                        SkillMarketDetail(
+                            detail: detail,
+                            installedState: installedState,
+                            isActing: actionKey == detail.summary.key,
+                            canInstall: !(sessionID?.isEmpty ?? true),
+                            install: { install(detail.summary) },
+                            uninstall: { uninstall(detail.summary) }
+                        )
+                    } else {
+                        Spacer()
+                        VStack(spacing: 8) {
+                            Image(systemName: "sidebar.right")
+                                .font(.system(size: 30))
+                                .foregroundStyle(.secondary)
+                            Text(c.text("选择一个技能查看详情", "Select a skill to view details"))
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        Spacer()
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+
+            if let errorMessage {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                    Text(errorMessage).lineLimit(2)
+                    Spacer()
+                    Button { self.errorMessage = nil } label: { Image(systemName: "xmark") }
+                        .buttonStyle(.plain)
+                }
+                .font(.caption)
+                .foregroundStyle(.red)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(Color.red.opacity(0.08))
+            }
+        }
+        .frame(minWidth: 1060, minHeight: 680)
+        .task { beginListLoad() }
+        .onChange(of: selectedTab) { _, _ in
+            page = 1
+            selectedItem = nil
+            detail = nil
+            beginListLoad()
+        }
+    }
+
+    private func startSearch() {
+        page = 1
+        beginListLoad()
+    }
+
+    private func changePage(_ newPage: Int) {
+        guard newPage >= 1, newPage <= totalPages else { return }
+        page = newPage
+        beginListLoad()
+    }
+
+    private func beginListLoad() {
+        listRequestID += 1
+        let requestID = listRequestID
+        Task { await loadList(requestID: requestID) }
+    }
+
+    private func select(_ item: MothxSkillHubSummary) {
+        selectedItem = item
+        detail = nil
+        Task { await loadDetail(item) }
+    }
+
+    private func loadList(requestID: Int) async {
+        isLoading = true
+        errorMessage = nil
+        do {
+            let response: MothxSkillHubListResponse
+            switch selectedTab {
+            case .official:
+                response = try await mothx.loadSkillHubOfficial(query: query, page: page, limit: 20, sessionID: sessionID)
+            case .community:
+                response = try await mothx.loadSkillHubCommunity(query: query, page: page, limit: 20, sessionID: sessionID)
+            }
+            guard requestID == listRequestID else { return }
+            items = response.items
+            page = response.page
+            pageSize = max(response.pageSize, 1)
+            total = response.total
+            if let selectedItem,
+               let refreshed = response.items.first(where: { $0.key == selectedItem.key }) {
+                self.selectedItem = refreshed
+                await loadDetail(refreshed)
+            } else if let first = response.items.first {
+                selectedItem = first
+                await loadDetail(first)
+            } else {
+                selectedItem = nil
+                detail = nil
+            }
+        } catch {
+            guard requestID == listRequestID else { return }
+            errorMessage = error.localizedDescription
+        }
+        if requestID == listRequestID {
+            isLoading = false
+        }
+    }
+
+    private func loadDetail(_ item: MothxSkillHubSummary) async {
+        guard selectedItem?.key == item.key else { return }
+        isLoadingDetail = true
+        do {
+            let loadedDetail = try await mothx.loadSkillHubDetail(market: item.market, skillID: item.id)
+            if selectedItem?.key == item.key {
+                detail = loadedDetail
+            }
+        } catch {
+            if selectedItem?.key == item.key {
+                errorMessage = error.localizedDescription
+            }
+        }
+        isLoadingDetail = false
+    }
+
+    private func install(_ item: MothxSkillHubSummary) {
+        guard let sessionID, !sessionID.isEmpty else {
+            errorMessage = MothxSkillHubClientError.sessionRequired.localizedDescription
+            return
+        }
+        guard actionKey == nil else { return }
+        actionKey = item.key
+        errorMessage = nil
+        Task {
+            do {
+                let targets = try await mothx.loadSkillHubTargets(sessionID: sessionID)
+                guard let target = targets.targets.first(where: { $0.scope == "global" }) else {
+                    throw SkillMarketViewError(message: languageStore.copy.text("服务端没有可用的全局技能目录。", "The server did not provide a global skills directory."))
+                }
+                try await mothx.installSkillHubSkill(
+                    market: item.market,
+                    skillID: item.id,
+                    version: item.version,
+                    scope: target.scope,
+                    targetDir: target.path,
+                    sessionID: sessionID,
+                    activate: false
+                )
+                mothx.loadGlobalSkills()
+                beginListLoad()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+            actionKey = nil
+        }
+    }
+
+    private func uninstall(_ item: MothxSkillHubSummary) {
+        guard let installedState, !installedState.scope.isEmpty else { return }
+        guard actionKey == nil else { return }
+        actionKey = item.key
+        errorMessage = nil
+        Task {
+            do {
+                try await mothx.uninstallSkillHubSkill(
+                    market: item.market,
+                    skillID: item.id,
+                    scope: installedState.scope,
+                    sessionID: sessionID
+                )
+                mothx.loadGlobalSkills()
+                beginListLoad()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+            actionKey = nil
+        }
+    }
+}
+
+private struct SkillMarketRow: View {
+    let item: MothxSkillHubSummary
+    let selected: Bool
+    let select: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: item.installed?.installed == true ? "checkmark.circle.fill" : "sparkles")
+                .foregroundStyle(item.installed?.installed == true ? .green : (selected ? .orange : .secondary))
+            VStack(alignment: .leading, spacing: 4) {
+                Text(item.title)
+                    .font(.system(size: 13, weight: .medium))
+                    .lineLimit(2)
+                HStack(spacing: 6) {
+                    Text(item.id).lineLimit(1)
+                    if !item.version.isEmpty { Text("v\(item.version)") }
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 4)
+            if item.installed?.installed == true {
+                Text("已安装")
+                    .font(.caption2)
+                    .foregroundStyle(.green)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(selected ? Color.orange.opacity(0.12) : Color.clear)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: select)
+    }
+}
+
+private struct SkillMarketDetail: View {
+    @EnvironmentObject private var languageStore: LanguageStore
+    let detail: MothxSkillHubDetail
+    let installedState: MothxSkillHubInstalledState?
+    let isActing: Bool
+    let canInstall: Bool
+    let install: () -> Void
+    let uninstall: () -> Void
+
+    private var c: Copy { languageStore.copy }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: "sparkles.rectangle.stack.fill")
+                        .font(.system(size: 30))
+                        .foregroundStyle(.orange)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(detail.summary.title)
+                            .font(.system(size: 21, weight: .semibold))
+                            .textSelection(.enabled)
+                        Text(detail.summary.id)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                        HStack(spacing: 10) {
+                            if !detail.summary.version.isEmpty { Text("v\(detail.summary.version)") }
+                            if !detail.summary.category.isEmpty { Text(detail.summary.category) }
+                            if !detail.summary.author.isEmpty { Text(detail.summary.author) }
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if installedState?.installed == true {
+                        VStack(alignment: .trailing, spacing: 6) {
+                            Label(c.text("已安装", "Installed"), systemImage: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                            if let scope = installedState?.scope, !scope.isEmpty {
+                                Text(scope)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Button(role: .destructive, action: uninstall) {
+                                if isActing {
+                                    ProgressView().controlSize(.small)
+                                } else {
+                                    Label(c.text("卸载", "Uninstall"), systemImage: "trash")
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(isActing)
+                        }
+                    } else {
+                        VStack(alignment: .trailing, spacing: 6) {
+                            Button(action: install) {
+                                if isActing {
+                                    ProgressView().controlSize(.small)
+                                } else {
+                                    Label(c.text("安装", "Install"), systemImage: "arrow.down.circle")
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.orange)
+                            .disabled(isActing || !canInstall)
+                            if !canInstall {
+                                Text(c.text("请先打开一个会话", "Open a session before installing"))
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+
+                if !detail.summary.description.isEmpty {
+                    SkillMarketTextSection(title: c.text("描述", "Description"), text: detail.summary.description)
+                }
+                if !detail.readme.isEmpty {
+                    SkillMarketTextSection(title: c.text("使用说明", "Usage"), text: detail.readme)
+                }
+                if let evaluation = detail.evaluation {
+                    SkillMarketMarkdownSection(
+                        title: c.text("评估 / 使用说明", "Evaluation / usage notes"),
+                        markdown: evaluation.markdownDocument()
+                    )
+                }
+                if let reports = detail.securityReports {
+                    SkillMarketMarkdownSection(
+                        title: c.text("安全说明", "Security reports"),
+                        markdown: reports.markdownDocument()
+                    )
+                }
+                if !detail.downloadSources.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(c.text("下载源", "Download sources"))
+                            .font(.headline)
+                        ForEach(Array(detail.downloadSources.enumerated()), id: \.offset) { _, source in
+                            HStack(spacing: 8) {
+                                Image(systemName: source.fallback ? "arrow.triangle.2.circlepath" : "arrow.down.circle")
+                                    .foregroundStyle(.secondary)
+                                if let url = URL(string: source.url) {
+                                    Link(source.kind.isEmpty ? source.url : source.kind, destination: url)
+                                        .lineLimit(1)
+                                } else {
+                                    Text(source.url).lineLimit(1)
+                                }
+                                if source.fallback { Text(c.text("备用", "fallback")).font(.caption2).foregroundStyle(.secondary) }
+                            }
+                            .font(.caption)
+                        }
+                    }
+                }
+                if !detail.files.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(c.text("文件列表", "Files"))
+                            .font(.headline)
+                        ForEach(detail.files, id: \.path) { file in
+                            HStack(spacing: 8) {
+                                Image(systemName: "doc.text")
+                                    .foregroundStyle(.secondary)
+                                Text(file.path)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .lineLimit(1)
+                                Spacer()
+                                if file.size > 0 {
+                                    Text(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(24)
+        }
+    }
+}
+
+private struct SkillMarketMarkdownSection: View {
+    let title: String
+    let markdown: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.headline)
+            MarkdownMessageText(markdown: markdown)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12)
+                .background(Color.primary.opacity(0.045))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+    }
+}
+
+private struct SkillMarketTextSection: View {
+    let title: String
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.headline)
+            Text(text)
+                .font(.system(.body, design: .default))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12)
+                .background(Color.primary.opacity(0.045))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+    }
 }

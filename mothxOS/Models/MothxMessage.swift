@@ -88,6 +88,113 @@ struct MothxImagePreview: Identifiable, Hashable {
     }
 }
 
+
+/// A locally generated or downloaded video file that can be previewed in the
+/// conversation's right sidebar.
+struct MothxVideoPreview: Identifiable, Hashable {
+    let id: String
+    let source: String
+    let mediaType: String
+    let name: String?
+
+    static let supportedExtensions: Set<String> = ["mp4", "mov", "m4v", "webm", "mkv", "avi", "wmv"]
+
+    static func mediaType(for url: URL) -> String {
+        switch url.pathExtension.lowercased() {
+        case "mov": return "video/quicktime"
+        case "webm": return "video/webm"
+        case "mkv": return "video/x-matroska"
+        default: return "video/mp4"
+        }
+    }
+
+    static func localPreview(
+        source: String,
+        workDirectory: String,
+        id: String,
+        name: String? = nil
+    ) -> MothxVideoPreview? {
+        let cleaned = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty,
+              let url = MothxImagePreview.resolvedFileURL(for: cleaned, workDirectory: workDirectory),
+              supportedExtensions.contains(url.pathExtension.lowercased()) else {
+            return nil
+        }
+        return MothxVideoPreview(
+            id: id,
+            source: url.path,
+            mediaType: mediaType(for: url),
+            name: name?.isEmpty == false ? name : url.lastPathComponent
+        )
+    }
+
+    /// Extracts a locally published video from a structured
+    /// `publish_artifact` tool call. The tool stores its path in JSON
+    /// arguments, while the downloaded file itself lives in the session work
+    /// directory (or is returned as an absolute path).
+    static func publishArtifactPreviews(
+        toolName: String?,
+        arguments: String,
+        workDirectory: String
+    ) -> [MothxVideoPreview] {
+        guard toolName?.lowercased() == "publish_artifact",
+              let data = arguments.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return []
+        }
+        let candidateKeys = ["path", "file", "filePath", "file_path", "downloadedPath", "downloaded_path", "url"]
+        for key in candidateKeys {
+            guard let path = object[key] as? String, !path.isEmpty else { continue }
+            if let preview = localPreview(
+                source: path,
+                workDirectory: workDirectory,
+                id: "video-artifact-argument-\(UUID().uuidString)",
+                name: object["filename"] as? String
+            ) {
+                return [preview]
+            }
+        }
+        return []
+    }
+
+    /// Extracts `publish_artifact <path>` references and ordinary local video
+    /// paths printed by a download command (for example `/tmp/result.mp4`).
+    static func previews(from text: String, workDirectory: String) -> [MothxVideoPreview] {
+        let publishPattern = #"publish_artifact[\s:]+([^\s]+)"#
+        // Keep the match limited to path characters. A broad "non-space"
+        // pattern also consumes Markdown punctuation before a backticked path
+        // (for example `**文件**：`uploadimg/video/result.mp4`), which then
+        // prevents the path from resolving against the session directory.
+        let filePattern = #"(?i)(?<![A-Za-z0-9._-])((?:file://)?(?:/|\.{1,2}/)?[A-Za-z0-9][A-Za-z0-9_./+%~-]*\.(?:mp4|mov|m4v|webm|mkv|avi|wmv)(?:\?[A-Za-z0-9_./+%~?&=-]*)?)(?![A-Za-z0-9_-])"#
+        var sources: [(String, String?)] = []
+        for pattern in [publishPattern, filePattern] {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(text.startIndex..., in: text)
+            for match in regex.matches(in: text, range: range) {
+                guard match.numberOfRanges > 1,
+                      let rawRange = Range(match.range(at: 1), in: text) else { continue }
+                var raw = String(text[rawRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                while let last = raw.last, ["\"", "'", ",", ")", "]", "}", "`", "."].contains(String(last)) {
+                    raw.removeLast()
+                }
+                if !raw.isEmpty { sources.append((raw, nil)) }
+            }
+        }
+        var result: [MothxVideoPreview] = []
+        var seen = Set<String>()
+        for (index, source) in sources.enumerated() {
+            guard let preview = localPreview(
+                source: source.0,
+                workDirectory: workDirectory,
+                id: "video-artifact-\(index)-\(UUID().uuidString)",
+                name: source.1
+            ), seen.insert(preview.source).inserted else { continue }
+            result.append(preview)
+        }
+        return result
+    }
+}
+
 // MARK: - Message
 
 nonisolated struct MothxMessage: Identifiable, Hashable {
@@ -103,8 +210,9 @@ nonisolated struct MothxMessage: Identifiable, Hashable {
     let hasDetail: Bool        // toolResult: whether full content is available via API
     let createdAt: String?
     let imagePreviews: [MothxImagePreview]
+    let videoPreviews: [MothxVideoPreview]
 
-    init(id: String, seq: Int?, role: String, content: String, toolCallId: String?, toolName: String?, arguments: String, plan: MothxPlan?, summary: String?, hasDetail: Bool, createdAt: String?, imagePreviews: [MothxImagePreview] = []) {
+    init(id: String, seq: Int?, role: String, content: String, toolCallId: String?, toolName: String?, arguments: String, plan: MothxPlan?, summary: String?, hasDetail: Bool, createdAt: String?, imagePreviews: [MothxImagePreview] = [], videoPreviews: [MothxVideoPreview] = []) {
         self.id = id
         self.seq = seq
         self.role = role
@@ -117,6 +225,7 @@ nonisolated struct MothxMessage: Identifiable, Hashable {
         self.hasDetail = hasDetail
         self.createdAt = createdAt
         self.imagePreviews = imagePreviews
+        self.videoPreviews = videoPreviews
     }
 
     var isUser: Bool { role == "user" }

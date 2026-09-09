@@ -168,7 +168,7 @@ struct EnvironmentCheckSheet: View {
                 .buttonStyle(.borderedProminent)
             HStack(spacing: 8) {
                 Button(c.installCopySudoCommand) {
-                    copyToPasteboard("sudo npm install -g mothx-installer")
+                    copyToPasteboard("sudo npm install -g mothx-installer@\(MothxRuntimeCompatibility.recommendedVersion)")
                 }
                 .buttonStyle(.bordered)
                 Button(c.installOpenTerminal) { openTerminal() }
@@ -297,7 +297,7 @@ struct EnvironmentCheckSheet: View {
             return
         }
         #endif
-        let exitCode = await EnvironmentCheckSheet.runShellStreaming("npm install -g mothx-installer") { chunk in
+        let exitCode = await EnvironmentCheckSheet.runShellStreaming("npm install -g mothx-installer@\(MothxRuntimeCompatibility.recommendedVersion)") { chunk in
             log += chunk
         }
         let output = log.lowercased()
@@ -319,7 +319,7 @@ struct EnvironmentCheckSheet: View {
     private func installMothxAsAdmin() async {
         phase = .installingMothx
         log = ""
-        let exitCode = await RuntimeInstall.installGloballyAsAdmin { chunk in
+        let exitCode = await RuntimeInstall.installGloballyAsAdmin(version: MothxRuntimeCompatibility.recommendedVersion) { chunk in
             log += chunk
         }
         guard exitCode == 0 else {

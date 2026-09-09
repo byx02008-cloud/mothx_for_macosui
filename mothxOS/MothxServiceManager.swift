@@ -153,6 +153,16 @@ struct MothxImageRecognitionProgress: Equatable, Sendable {
     var isError = false
 }
 
+enum MothxSkillHubClientError: LocalizedError {
+    case sessionRequired
+
+    var errorDescription: String? {
+        switch self {
+        case .sessionRequired: return "请先打开一个会话，再安装技能。"
+        }
+    }
+}
+
 final class MothxServiceManager: ObservableObject {
     enum State: Equatable {
         case checking
@@ -169,6 +179,13 @@ final class MothxServiceManager: ObservableObject {
     @Published private(set) var defaultThinkingLevel = ""
     @Published private(set) var defaultMode = "agent"
     @Published private(set) var installedSkills: [MothxSkill] = []
+    /// Skills discovered from global skill roots. These are the skills that
+    /// can be inspected and edited from Settings > Skills.
+    @Published private(set) var globalSkills: [MothxSkill] = []
+    /// Skills shown in Settings > Skills > System skills.
+    @Published private(set) var systemSkills: [MothxSkill] = []
+    /// Skills shown in Settings > Skills > Custom skills.
+    @Published private(set) var customSkills: [MothxSkill] = []
     /// Last installed-skill payload returned by the mothx server. Kept so the
     /// filesystem-driven skill list can still surface marketplace-managed skills
     /// that are not present on disk.
@@ -556,6 +573,13 @@ final class MothxServiceManager: ObservableObject {
             tuilang = root["tuilang"] as? String ?? "auto"
             skillsDir = root["skillsDir"] as? String ?? ""
             sessionDir = root["sessionDir"] as? String ?? ""
+            // A failed/debug runtime launch can leave sessionDir pointing at
+            // a temporary test directory. The server then starts normally,
+            // but it reads a fresh database and makes all existing sessions
+            // appear to have disappeared. Restore the durable default before
+            // the workspace is loaded, while keeping the full settings JSON
+            // intact.
+            await repairTransientSessionDirectoryIfNeeded()
             // Image generation routing is app-owned, just like image
             // recognition routing. The server's legacy imageGeneration
             // object may still be present in rawSettings and is deliberately
@@ -575,6 +599,62 @@ final class MothxServiceManager: ObservableObject {
         } catch {
             settingsError = copy.loadSettingsFailedPrefix(describe(error))
         }
+    }
+
+    /// Returns the durable per-user session directory used by mothx when no
+    /// custom session directory is configured.
+    private var defaultMothxSessionDirectory: String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".mothx", isDirectory: true)
+            .appendingPathComponent("sessions", isDirectory: true)
+            .path
+    }
+
+    /// Temporary session roots are only appropriate for isolated tests. If
+    /// one leaks into the user's global settings, mothx serves an empty
+    /// database and the app looks as though settings/history were lost. Only
+    /// repair paths that are unambiguously temporary and only when the normal
+    /// durable database already exists; arbitrary user-selected custom paths
+    /// remain untouched.
+    private func repairTransientSessionDirectoryIfNeeded() async {
+        let configured = sessionDir.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !configured.isEmpty else { return }
+
+        let configuredPath = URL(fileURLWithPath: configured).standardizedFileURL.path
+        let defaultPath = URL(fileURLWithPath: defaultMothxSessionDirectory).standardizedFileURL.path
+        guard configuredPath != defaultPath, isTransientSessionDirectory(configuredPath) else { return }
+
+        let fileManager = FileManager.default
+        let durableDatabase = URL(fileURLWithPath: defaultPath, isDirectory: true)
+            .appendingPathComponent("sessions.db")
+        guard fileManager.fileExists(atPath: durableDatabase.path) else {
+            recordRuntimeLog("settings", "sessionDir is temporary but durable database is unavailable; leaving configured path unchanged: \(configuredPath)")
+            return
+        }
+
+        var repairedSettings = rawSettings
+        repairedSettings["sessionDir"] = defaultPath
+        do {
+            let data = try JSONSerialization.data(withJSONObject: repairedSettings)
+            _ = try await request(path: "api/settings", method: "PUT", body: data)
+            rawSettings = repairedSettings
+            sessionDir = defaultPath
+            recordRuntimeLog("settings", "restored transient sessionDir to durable default: \(defaultPath)")
+        } catch {
+            // Do not discard the settings response just because the automatic
+            // repair failed; expose the original state and leave a diagnostic
+            // record for the user/support logs.
+            recordRuntimeLog("settings", "failed to restore transient sessionDir: \(describe(error))")
+        }
+    }
+
+    private func isTransientSessionDirectory(_ path: String) -> Bool {
+        let normalized = URL(fileURLWithPath: path).standardizedFileURL.path
+        return normalized.hasPrefix("/private/var/folders/")
+            || normalized.hasPrefix("/var/folders/")
+            || normalized.hasPrefix("/private/tmp/")
+            || normalized.hasPrefix("/tmp/")
+            || normalized.contains("/mothx-runtime-config-")
     }
 
     func loadWorkspace() async {
@@ -629,6 +709,14 @@ final class MothxServiceManager: ObservableObject {
                     _ = try? await setSessionProject(sessionID: sessionID, projectID: projectID)
                 }
             }
+
+            // A previous launch against a temporary session database could
+            // create a second remote project for every local project. Merge
+            // exact-name duplicates after sessions are available so the
+            // project that owns history remains canonical.
+            let reconciled = await reconcileDuplicateProjects(projects: projects, sessions: loadedSessions)
+            projects = reconciled.projects
+            loadedSessions = reconciled.sessions
             sessions = loadedSessions
             await teamManager.repairSessionProjectLinks()
             if !hadLocalProjectLoadError { settingsError = nil }
@@ -687,6 +775,88 @@ final class MothxServiceManager: ObservableObject {
             let local = persisted.first(where: { $0.id == remote.id })
             return MothxProject(id: remote.id, name: remote.name, workDir: local?.workDir ?? "")
         }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    /// Consolidates duplicate remote projects that have the same visible
+    /// name. This can happen when the app was pointed at a temporary session
+    /// database: the local project rows are then recreated remotely, and the
+    /// next launch sees both the recreated and durable projects.
+    ///
+    /// The project with the most sessions wins. If counts tie, prefer the one
+    /// with a configured work directory and finally use the stable ID order.
+    /// Sessions are moved before the duplicate is deleted, so history is not
+    /// discarded.
+    private func reconcileDuplicateProjects(projects: [MothxProject], sessions: [MothxSession]) async -> (projects: [MothxProject], sessions: [MothxSession]) {
+        var retainedProjects = projects
+        var reconciledSessions = sessions
+        let grouped = Dictionary(grouping: projects, by: { normalizedProjectName($0.name) })
+
+        for group in grouped.values where group.count > 1 {
+            let sessionCounts = Dictionary(grouping: reconciledSessions.compactMap { session in
+                session.projectID.map { ($0, session) }
+            }, by: { $0.0 }).mapValues(\.count)
+            let ordered = group.sorted { lhs, rhs in
+                let lhsCount = sessionCounts[lhs.id, default: 0]
+                let rhsCount = sessionCounts[rhs.id, default: 0]
+                if lhsCount != rhsCount { return lhsCount > rhsCount }
+                let lhsHasWorkDir = !lhs.workDir.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                let rhsHasWorkDir = !rhs.workDir.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                if lhsHasWorkDir != rhsHasWorkDir { return lhsHasWorkDir }
+                return lhs.id < rhs.id
+            }
+            guard let canonical = ordered.first else { continue }
+
+            for duplicate in ordered.dropFirst() {
+                let affectedIndexes = reconciledSessions.indices.filter { reconciledSessions[$0].projectID == duplicate.id }
+                var moved = true
+                for index in affectedIndexes {
+                    do {
+                        _ = try await setSessionProject(sessionID: reconciledSessions[index].id, projectID: canonical.id)
+                        reconciledSessions[index].projectID = canonical.id
+                    } catch {
+                        moved = false
+                        recordRuntimeLog("projects", "failed to move session \(reconciledSessions[index].id) from duplicate project \(duplicate.id) to \(canonical.id): \(describe(error))")
+                        break
+                    }
+                }
+                guard moved else { continue }
+
+                do {
+                    _ = try await request(path: "api/projects/\(duplicate.id)", method: "DELETE")
+                } catch {
+                    recordRuntimeLog("projects", "failed to delete duplicate project \(duplicate.id): \(describe(error))")
+                    continue
+                }
+
+                if let localProjectStore {
+                    do { try localProjectStore.deleteProject(id: duplicate.id) }
+                    catch { recordRuntimeLog("projects", "failed to delete duplicate local project \(duplicate.id): \(describe(error))") }
+                }
+                retainedProjects.removeAll { $0.id == duplicate.id }
+            }
+
+            // Preserve a useful work directory if it only existed on a
+            // duplicate row. This keeps the canonical project usable after
+            // the merge without overwriting an already configured directory.
+            if let canonicalIndex = retainedProjects.firstIndex(where: { $0.id == canonical.id }),
+               retainedProjects[canonicalIndex].workDir.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               let workDir = group.dropFirst().map(\.workDir).first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
+                retainedProjects[canonicalIndex].workDir = workDir
+                if let localProjectStore {
+                    do {
+                        try localProjectStore.updateProject(id: canonical.id, name: retainedProjects[canonicalIndex].name, workDir: workDir)
+                    } catch {
+                        recordRuntimeLog("projects", "failed to preserve work directory for project \(canonical.id): \(describe(error))")
+                    }
+                }
+            }
+        }
+
+        return (retainedProjects.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }, reconciledSessions)
+    }
+
+    private func normalizedProjectName(_ name: String) -> String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     @discardableResult
@@ -2194,7 +2364,14 @@ final class MothxServiceManager: ObservableObject {
     }
 
     private func resetRunMetrics(sessionID: String) {
-        metricsBySession[sessionID] = MothxSessionMetrics()
+        // Context occupancy describes the latest completed input footprint, not
+        // a cumulative per-run counter. Keep the previous context value visible
+        // while the next run is being admitted; the incoming usage/context
+        // event will replace it with the new turn's exact value. Clear only the
+        // cache ratio, whose value is specific to the previous run.
+        var metrics = metricsBySession[sessionID] ?? MothxSessionMetrics()
+        metrics.cacheHitRate = nil
+        metricsBySession[sessionID] = metrics
     }
 
     /// Fetches the latest persisted usage for the active run from
@@ -2907,6 +3084,7 @@ final class MothxServiceManager: ObservableObject {
             let summary: String?
             let hasDetail: Bool
             let imagePreviews = decodeImagePreviews(item, sessionID: sessionID)
+            let videoPreviews = decodeVideoPreviews(item, sessionID: sessionID)
 
             switch role {
             case "toolCall":
@@ -2946,6 +3124,7 @@ final class MothxServiceManager: ObservableObject {
             }
 
             var combinedPreviews = imagePreviews
+            var combinedVideoPreviews = videoPreviews
             // `publish_artifact` stores its tool name separately from the
             // JSON arguments. Resolve the relative `path` against this
             // session's work directory while the session context is known.
@@ -2956,6 +3135,13 @@ final class MothxServiceManager: ObservableObject {
                     workDirectory: workDir(for: sessionID)
                 ) where !combinedPreviews.contains(where: { $0.source == candidate.source }) {
                     combinedPreviews.append(candidate)
+                }
+                for candidate in MothxVideoPreview.publishArtifactPreviews(
+                    toolName: toolName,
+                    arguments: arguments,
+                    workDirectory: workDir(for: sessionID)
+                ) where !combinedVideoPreviews.contains(where: { $0.source == candidate.source }) {
+                    combinedVideoPreviews.append(candidate)
                 }
             }
             // Assistant/user replies frequently reference locally generated
@@ -2971,6 +3157,10 @@ final class MothxServiceManager: ObservableObject {
                         combinedPreviews.append(candidate)
                     }
                 }
+                for candidate in MothxVideoPreview.previews(from: content, workDirectory: workDir(for: sessionID))
+                    where !combinedVideoPreviews.contains(where: { $0.source == candidate.source }) {
+                    combinedVideoPreviews.append(candidate)
+                }
             }
             // Tool results publish generated files with the same notation, e.g.
             // `publish_artifact uploadimg/midautumn/20260830_200215_1.png`; keep
@@ -2979,6 +3169,10 @@ final class MothxServiceManager: ObservableObject {
                 for candidate in publishArtifactImagePreviews(from: summary, sessionID: sessionID)
                     where !combinedPreviews.contains(where: { $0.source == candidate.source }) {
                     combinedPreviews.append(candidate)
+                }
+                for candidate in MothxVideoPreview.previews(from: summary, workDirectory: workDir(for: sessionID))
+                    where !combinedVideoPreviews.contains(where: { $0.source == candidate.source }) {
+                    combinedVideoPreviews.append(candidate)
                 }
             }
 
@@ -2992,11 +3186,12 @@ final class MothxServiceManager: ObservableObject {
                     ?? (item["created_at"] as? String)
                     ?? (item["timestamp"] as? String)
                     ?? (item["createdAt"] as? NSNumber).map { ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: $0.doubleValue)) },
-                imagePreviews: combinedPreviews
+                imagePreviews: combinedPreviews,
+                videoPreviews: combinedVideoPreviews
             )
         }.filter { msg in
             if msg.isToolCall || msg.isToolResult { return true }
-            return !msg.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !msg.imagePreviews.isEmpty
+            return !msg.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !msg.imagePreviews.isEmpty || !msg.videoPreviews.isEmpty
         }
     }
 
@@ -3034,6 +3229,59 @@ final class MothxServiceManager: ObservableObject {
     /// directory. Only existing image files are included.
     private func publishArtifactImagePreviews(from text: String, sessionID: String) -> [MothxImagePreview] {
         MothxImagePreview.publishArtifactPreviews(from: text, workDirectory: workDir(for: sessionID))
+    }
+
+    private func decodeVideoPreviews(_ item: [String: Any], sessionID: String = "") -> [MothxVideoPreview] {
+        var previews: [MothxVideoPreview] = []
+        var index = 0
+        let workDirectory = workDir(for: sessionID)
+
+        func append(source: String, mediaType: String?, name: String?) {
+            guard !source.isEmpty else { return }
+            let normalized = normalizedImageSource(source, sessionID: sessionID)
+            let preview: MothxVideoPreview?
+            if let url = URL(string: normalized), ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
+                preview = MothxVideoPreview(
+                    id: "video-\(index)-\(item["id"] as? String ?? UUID().uuidString)",
+                    source: normalized,
+                    mediaType: mediaType ?? "video/mp4",
+                    name: name
+                )
+            } else {
+                preview = MothxVideoPreview.localPreview(
+                    source: normalized,
+                    workDirectory: workDirectory,
+                    id: "video-\(index)-\(item["id"] as? String ?? UUID().uuidString)",
+                    name: name
+                )
+            }
+            guard let preview, !previews.contains(where: { $0.source == preview.source }) else { return }
+            previews.append(preview)
+            index += 1
+        }
+
+        if let contents = item["contents"] as? [[String: Any]] {
+            for block in contents where (block["type"] as? String)?.lowercased() == "video" {
+                let video = (block["video"] as? [String: Any]) ?? block
+                let mediaType = (video["mimeType"] as? String) ?? (video["mediaType"] as? String)
+                let name = (video["filename"] as? String) ?? (video["name"] as? String)
+                if let source = (video["url"] as? String) ?? (video["source"] as? String) {
+                    append(source: source, mediaType: mediaType, name: name)
+                }
+            }
+        }
+
+        if let attachments = item["attachments"] as? [[String: Any]] {
+            for attachment in attachments where (attachment["kind"] as? String)?.lowercased() == "video" {
+                guard let source = attachment["url"] as? String else { continue }
+                append(
+                    source: source,
+                    mediaType: attachment["mediaType"] as? String,
+                    name: attachment["name"] as? String
+                )
+            }
+        }
+        return previews
     }
 
     private func decodeImagePreviews(_ item: [String: Any], sessionID: String = "") -> [MothxImagePreview] {
@@ -3175,6 +3423,192 @@ final class MothxServiceManager: ObservableObject {
         }
     }
 
+    /// Scans global skill roots independently from the current session.
+    /// `installedSkills` is session-scoped and may be replaced with project
+    /// skills when the workspace changes, so Settings uses this stable list.
+    func loadGlobalSkills() {
+        systemSkills = Self.scanSkillDirectories(roots: [Self.systemSkillRoot], scope: .global)
+        customSkills = Self.scanSkillDirectories(roots: [Self.customSkillRoot], scope: .global)
+
+        var roots = Self.globalSkillRoots
+        let configured = skillsDir.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !configured.isEmpty {
+            let customRoot = URL(fileURLWithPath: configured).standardizedFileURL.path
+            if !roots.contains(customRoot) { roots.insert(customRoot, at: 0) }
+        }
+        globalSkills = Self.scanSkillDirectories(roots: roots, scope: .global)
+    }
+
+    /// Reads the canonical SKILL.md for a global skill.
+    func skillContent(_ skill: MothxSkill) -> String? {
+        guard skill.scope == .global, !skill.directory.isEmpty else { return nil }
+        let fileURL = URL(fileURLWithPath: skill.directory).appendingPathComponent("SKILL.md")
+        return try? String(contentsOf: fileURL, encoding: .utf8)
+    }
+
+    /// Saves a global skill's SKILL.md and refreshes the skill indexes.
+    /// Returns nil on success or a user-facing error message on failure.
+    @discardableResult
+    func saveGlobalSkillContent(_ skill: MothxSkill, content: String) -> String? {
+        guard skill.scope == .global, !skill.directory.isEmpty else {
+            return copy.text("该技能不是可编辑的全局技能。", "This skill is not an editable global skill.")
+        }
+        let fileURL = URL(fileURLWithPath: skill.directory).appendingPathComponent("SKILL.md")
+        do {
+            try content.write(to: fileURL, atomically: true, encoding: .utf8)
+            loadGlobalSkills()
+            return nil
+        } catch {
+            return copy.text("保存技能失败：\(describe(error))", "Failed to save skill: \(describe(error))")
+        }
+    }
+
+    /// Removes a custom global skill from `~/.mothx/skills`.
+    ///
+    /// Only direct children of the custom skill root can be removed. This
+    /// prevents an accidentally malformed skill record from deleting an
+    /// arbitrary path outside the user-managed custom skill directory.
+    @discardableResult
+    func uninstallCustomSkill(_ skill: MothxSkill) -> String? {
+        guard skill.scope == .global, !skill.directory.isEmpty else {
+            return copy.text("该技能不是可卸载的自定义技能。", "This skill is not an uninstallable custom skill.")
+        }
+
+        let fileManager = FileManager.default
+        let rootURL = URL(fileURLWithPath: Self.customSkillRoot).standardizedFileURL
+        let skillURL = URL(fileURLWithPath: skill.directory).standardizedFileURL
+        guard skillURL.deletingLastPathComponent().path == rootURL.path,
+              fileManager.fileExists(atPath: skillURL.appendingPathComponent("SKILL.md").path) else {
+            return copy.text("只能卸载 ~/.mothx/skills 下的自定义技能。", "Only custom skills under ~/.mothx/skills can be uninstalled.")
+        }
+
+        do {
+            try fileManager.removeItem(at: skillURL)
+            removeSkillFromPersistedSessions(skill.name)
+            loadGlobalSkills()
+            return nil
+        } catch {
+            return copy.text("卸载技能失败：\(describe(error))", "Failed to uninstall skill: \(describe(error))")
+        }
+    }
+
+    /// Extracts the optional YAML-front-matter description, with a readable
+    /// first-paragraph fallback for plain Markdown skills.
+    func skillDescription(from content: String) -> String? {
+        let lines = content.components(separatedBy: .newlines)
+        if lines.first?.trimmingCharacters(in: .whitespacesAndNewlines) == "---" {
+            for line in lines.dropFirst() {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed == "---" { break }
+                if trimmed.lowercased().hasPrefix("description:") {
+                    let value = String(trimmed.dropFirst("description:".count))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    return value.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                }
+            }
+        }
+        var paragraph: [String] = []
+        var skippedHeading = false
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                if !paragraph.isEmpty { break }
+                continue
+            }
+            if !skippedHeading && trimmed.hasPrefix("#") {
+                skippedHeading = true
+                continue
+            }
+            paragraph.append(trimmed)
+        }
+        return paragraph.isEmpty ? nil : paragraph.joined(separator: " ")
+    }
+
+    // MARK: - SkillHub marketplace
+
+    func loadSkillHubOfficial(query: String, page: Int, limit: Int = 20, sessionID: String? = nil) async throws -> MothxSkillHubListResponse {
+        var queryItems = [
+            URLQueryItem(name: "market", value: "skillhub.cn"),
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "page", value: String(page))
+        ]
+        if !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            queryItems.append(URLQueryItem(name: "q", value: query))
+        }
+        if let sessionID, !sessionID.isEmpty {
+            queryItems.append(URLQueryItem(name: "sessionId", value: sessionID))
+        }
+        let data = try await request(path: skillHubPath("official", queryItems: queryItems), method: "GET")
+        return try JSONDecoder().decode(MothxSkillHubListResponse.self, from: data)
+    }
+
+    func loadSkillHubCommunity(query: String, page: Int, limit: Int = 20, sessionID: String? = nil) async throws -> MothxSkillHubListResponse {
+        var queryItems = [
+            URLQueryItem(name: "market", value: "skillhub.cn"),
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "page", value: String(page)),
+            URLQueryItem(name: "sort", value: "downloads"),
+            URLQueryItem(name: "order", value: "desc")
+        ]
+        if !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            queryItems.append(URLQueryItem(name: "q", value: query))
+        }
+        if let sessionID, !sessionID.isEmpty {
+            queryItems.append(URLQueryItem(name: "sessionId", value: sessionID))
+        }
+        let data = try await request(path: skillHubPath("search", queryItems: queryItems), method: "GET")
+        return try JSONDecoder().decode(MothxSkillHubListResponse.self, from: data)
+    }
+
+    func loadSkillHubDetail(market: String, skillID: String) async throws -> MothxSkillHubDetail {
+        let encodedMarket = market.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? market
+        let encodedID = skillID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? skillID
+        let data = try await request(path: "api/skillhub/skills/\(encodedMarket)/\(encodedID)", method: "GET")
+        return try JSONDecoder().decode(MothxSkillHubDetail.self, from: data)
+    }
+
+    func loadSkillHubTargets(sessionID: String) async throws -> MothxSkillHubTargetsResponse {
+        guard !sessionID.isEmpty else { throw MothxSkillHubClientError.sessionRequired }
+        let data = try await request(path: skillHubPath("targets", queryItems: [URLQueryItem(name: "sessionId", value: sessionID)]), method: "GET")
+        return try JSONDecoder().decode(MothxSkillHubTargetsResponse.self, from: data)
+    }
+
+    func installSkillHubSkill(market: String, skillID: String, version: String? = nil, scope: String, targetDir: String, sessionID: String, activate: Bool = false) async throws {
+        guard !sessionID.isEmpty else { throw MothxSkillHubClientError.sessionRequired }
+        var payload: [String: Any] = [
+            "market": market,
+            "id": skillID,
+            "scope": scope,
+            "targetDir": targetDir,
+            "sessionId": sessionID,
+            "activate": activate
+        ]
+        if let version, !version.isEmpty { payload["version"] = version }
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        _ = try await request(path: "api/skillhub/install", method: "POST", body: body)
+    }
+
+    func uninstallSkillHubSkill(market: String, skillID: String, scope: String, sessionID: String? = nil) async throws {
+        var payload: [String: Any] = [
+            "market": market,
+            "id": skillID,
+            "scope": scope
+        ]
+        if let sessionID, !sessionID.isEmpty { payload["sessionId"] = sessionID }
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        _ = try await request(path: "api/skillhub/uninstall", method: "POST", body: body)
+        // A marketplace id is normally the installed skill name. Clear it
+        // from every saved conversation after a successful uninstall so it
+        // cannot reappear when that conversation is reopened.
+        removeSkillFromPersistedSessions(skillID)
+    }
+
+    private func skillHubPath(_ endpoint: String, queryItems: [URLQueryItem]) -> String {
+        var components = URLComponents(url: baseURL.appendingPathComponent("api/skillhub/\(endpoint)"), resolvingAgainstBaseURL: false)!
+        components.queryItems = queryItems
+        return components.string ?? "api/skillhub/\(endpoint)"
+    }
+
     func loadInstalledSkills() async {
         // Global (bootstrap) skill sync. This must NOT clobber the per-session
         // skill list owned by loadSkills(for:): the workspace re-syncs after
@@ -3218,15 +3652,63 @@ final class MothxServiceManager: ObservableObject {
             if let values = object["installed"] as? [[String: Any]] {
                 let skills = decodeInstalledSkills(values, workDir: effectiveWorkDir)
                 remoteInstalledSkills = skills
-                installedSkills = skills
+                // Keep locally copied project skills visible even when the
+                // server response races the filesystem copy and does not yet
+                // include the new directory.
+                let diskWorkDirs = [sessionWorkDir, effectiveWorkDir]
+                    .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                    .reduce(into: [String]()) { result, workDir in
+                        if !result.contains(workDir) { result.append(workDir) }
+                    }
+                let diskSkills = installedSkillsFromDisk(workDirs: diskWorkDirs)
+                installedSkills = mergeInstalledSkills(disk: diskSkills, remote: skills)
             }
-            let active = ((object["session"] as? [String: Any])?["activeSkills"] as? [String]) ?? []
-            activeSkillsBySession[sessionID] = Set(active)
+            let serverActive = Set(((object["session"] as? [String: Any])?["activeSkills"] as? [String]) ?? [])
+            let availableNames = Set(installedSkills.map(\.name))
+            let persistedActive: Set<String>?
+            if let localProjectStore {
+                persistedActive = try? localProjectStore.activeSkills(for: sessionID)
+            } else {
+                persistedActive = nil
+            }
+            let resolvedActive: Set<String>
+            if let persistedActive {
+                // The local selection is authoritative after the user has
+                // explicitly changed it. Drop names that are no longer
+                // installed, but never resurrect a server-only stale value.
+                resolvedActive = availableNames.isEmpty
+                    ? persistedActive
+                    : persistedActive.intersection(availableNames)
+            } else {
+                // Backfill the desktop store for sessions created before
+                // client-side persistence existed.
+                resolvedActive = availableNames.isEmpty
+                    ? serverActive
+                    : serverActive.intersection(availableNames)
+            }
+            activeSkillsBySession[sessionID] = resolvedActive
+            try? localProjectStore?.setActiveSkills(resolvedActive, for: sessionID)
+            // Rehydrate the mothx in-memory session too. This makes an app
+            // restart and a mothx service restart behave the same way.
+            if resolvedActive != serverActive {
+                await persistActiveSkillsToServer(sessionID: sessionID, names: resolvedActive)
+            }
         } catch {
-            activeSkillsBySession[sessionID] = []
             installedSkills = installedSkillsFromDisk(workDirs: [sessionWorkDir])
+            let persistedActive: Set<String>?
+            if let localProjectStore {
+                persistedActive = try? localProjectStore.activeSkills(for: sessionID)
+            } else {
+                persistedActive = nil
+            }
+            activeSkillsBySession[sessionID] = persistedActive ?? []
         }
-        discoverableSkills = mergeInstalledSkills(disk: installedSkillsFromDisk(workDirs: [sessionWorkDir]), remote: remoteInstalledSkills)
+        let discoverableWorkDirs = [sessionWorkDir, workDir(for: sessionID)]
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .reduce(into: [String]()) { result, workDir in
+                if !result.contains(workDir) { result.append(workDir) }
+            }
+        discoverableSkills = mergeInstalledSkills(disk: installedSkillsFromDisk(workDirs: discoverableWorkDirs), remote: remoteInstalledSkills)
     }
 
     private func decodeInstalledSkills(_ values: [[String: Any]], workDir: String) -> [MothxSkill] {
@@ -3268,11 +3750,20 @@ final class MothxServiceManager: ObservableObject {
     /// Global skill roots that are scanned (in priority order). Skills live in
     /// `<root>/<skill-name>/SKILL.md`. The mothx server's own default skills
     /// directory comes first so promoted/global skills are visible server-side.
+    static var systemSkillRoot: String {
+        (NSHomeDirectory() as NSString).appendingPathComponent(".agents/skills")
+    }
+
+    static var customSkillRoot: String {
+        (NSHomeDirectory() as NSString).appendingPathComponent(".mothx/skills")
+    }
+
     static var globalSkillRoots: [String] {
         [
             (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/mothx/.skills"),
             "~/.skill",
             "~/.skills",
+            "~/.mothx/skills",
             "~/.agents/skills",
         ].map { ($0 as NSString).expandingTildeInPath }
     }
@@ -3373,15 +3864,47 @@ final class MothxServiceManager: ObservableObject {
         return nil
     }
 
-    /// Persists the session's active skill set on the server (same contract as
-    /// the official web client's `POST /api/skillhub/set-active`).
+    /// Persists the session's active skill set locally and on the server. The
+    /// local record is authoritative after an explicit user change so a
+    /// service restart cannot silently reactivate a suspended skill.
     func setActiveSkills(sessionID: String, names: Set<String>) async {
         guard !sessionID.isEmpty else { return }
+        let normalized = Set(names.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
+        activeSkillsBySession[sessionID] = normalized
+        try? localProjectStore?.setActiveSkills(normalized, for: sessionID)
+        await persistActiveSkillsToServer(sessionID: sessionID, names: normalized)
+    }
+
+    private func persistActiveSkillsToServer(sessionID: String, names: Set<String>) async {
+        guard !sessionID.isEmpty else { return }
         do {
-            let body = try jsonData(["sessionId": sessionID, "names": Array(names).sorted()])
-            _ = try await request(path: "api/skillhub/set-active", method: "POST", body: body)
+            var payload: [String: Any] = [
+                "sessionId": sessionID,
+                "names": Array(names).sorted()
+            ]
+            let sessionWorkDir = workDir(for: sessionID)
+            if !sessionWorkDir.isEmpty { payload["workDir"] = sessionWorkDir }
+            let body = try jsonData(payload)
+            let data = try await request(path: "api/skillhub/set-active", method: "POST", body: body)
+            // Keep the server response useful for diagnostics, but do not
+            // replace the local state with it: an explicit empty local set is
+            // meaningful even when an older server returns stale activeSkills.
+            _ = data
         } catch {
-            // Best-effort persist; the run payload still carries the selection.
+            // The local record and the run payload remain available when the
+            // server is temporarily unavailable.
+        }
+    }
+
+    private func removeSkillFromPersistedSessions(_ name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        for (sessionID, names) in activeSkillsBySession {
+            guard names.contains(trimmed) else { continue }
+            let updated = names.subtracting([trimmed])
+            activeSkillsBySession[sessionID] = updated
+            try? localProjectStore?.setActiveSkills(updated, for: sessionID)
+            Task { await persistActiveSkillsToServer(sessionID: sessionID, names: updated) }
         }
     }
 
@@ -3696,16 +4219,18 @@ final class MothxServiceManager: ObservableObject {
         await connect()
     }
 
-    /// Runs the full update dance: stop the owned mothx service, run
-    /// `npm install -g mothx-installer` (admin-elevated when `asAdmin`),
+    /// Runs the full update dance: stop the owned mothx service, install the
+    /// requested mothx-installer version (admin-elevated when `asAdmin`),
     /// restart the service, and report the outcome. Progress is delivered via
     /// `onStage` (phase transitions) and `onLog` (raw install output, already
     /// on the main actor).
     func performMothxUpdate(
+        targetVersion: String? = nil,
         asAdmin: Bool = false,
         onStage: @escaping (MothxUpdateStage) -> Void,
         onLog: @escaping (String) -> Void
     ) async -> MothxUpdateResult {
+        let requestedVersion = targetVersion ?? MothxRuntimeCompatibility.recommendedVersion
         var logText = ""
         let append: (String) -> Void = { chunk in
             logText += chunk
@@ -3725,19 +4250,19 @@ final class MothxServiceManager: ObservableObject {
         #endif
         let exitCode: Int32
         if asAdmin {
-            exitCode = await RuntimeInstall.installGloballyAsAdmin { append($0) }
+            exitCode = await RuntimeInstall.installGloballyAsAdmin(version: requestedVersion) { append($0) }
         } else if simulatedEACCES {
             append("\nnpm error code EACCES")
             exitCode = 1
         } else {
-            exitCode = await RuntimeInstall.runShellStreaming("npm install -g mothx-installer") { append($0) }
+            exitCode = await RuntimeInstall.runShellStreaming("npm install -g mothx-installer@\(requestedVersion)") { append($0) }
         }
 
         onStage(.restartingService)
         await connect()
 
         if exitCode == 0 {
-            return .succeeded(version: await RuntimeInstall.latestNpmVersion())
+            return .succeeded(version: await RuntimeInstall.mothxVersionString() ?? requestedVersion)
         }
         let lower = logText.lowercased()
         if lower.contains("cancel") || lower.contains("取消") {

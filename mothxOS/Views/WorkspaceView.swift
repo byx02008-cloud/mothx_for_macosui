@@ -42,6 +42,7 @@ struct WorkspaceView: View {
     @State private var previewedSkill: MothxSkill?
     @State private var previewedTool: ToolInvocationSummary?
     @State private var previewedImage: MothxImagePreview?
+    @State private var previewedVideo: MothxVideoPreview?
     @State private var reviewSidebarWidth: CGFloat = 420
     /// Remembers the sidebar width when a resize drag starts so the new width
     /// is derived from the pre-drag value rather than the previous frame.
@@ -157,7 +158,8 @@ struct WorkspaceView: View {
                                         onReviewChanges: presentReview,
                                         onPreviewSkill: presentSkillPreview,
                                         onPreviewTool: presentToolPreview,
-                                        onPreviewImage: presentImagePreview
+                                        onPreviewImage: presentImagePreview,
+                                        onPreviewVideo: presentVideoPreview
                                     )
                                 }
 
@@ -417,11 +419,15 @@ struct WorkspaceView: View {
                     selectedProviderID = mothx.providers.first?.id ?? ""
                     selectedModelID = mothx.providers.first?.models.first?.id ?? ""
                 }
-                isRestoringSession = false
                 selectedSkills = mothx.activeSkillsBySession[sessionID] ?? []
                 selectedTools = []
                 await mothx.loadSkills(for: sessionID)
                 selectedSkills = mothx.activeSkillsBySession[sessionID] ?? []
+                // Do not persist the intermediate skill selection while the
+                // session is being restored. The saved local selection is
+                // authoritative and is applied only after loadSkills() has
+                // reconciled it with the installed skills.
+                isRestoringSession = false
                 await mothx.loadMessages(sessionID: sessionID)
                 await mothx.attachToActiveRun(sessionID: sessionID)
                 turnsRecomputeGeneration += 1
@@ -455,6 +461,7 @@ struct WorkspaceView: View {
             }
         }
         .onChange(of: selectedSkills) { _, newValue in
+            guard !isRestoringSession else { return }
             if let sessionID {
                 Task { await mothx.setActiveSkills(sessionID: sessionID, names: newValue) }
             }
@@ -590,12 +597,13 @@ struct WorkspaceView: View {
 
     private func toggleRightSidebar() {
         withAnimation(.easeInOut(duration: 0.22)) {
-            if reviewedChanges != nil || previewedSkill != nil || previewedTool != nil || previewedImage != nil {
+            if reviewedChanges != nil || previewedSkill != nil || previewedTool != nil || previewedImage != nil || previewedVideo != nil {
                 reviewedChanges = nil
                 showEmptyPreviewSidebar = false
                 previewedSkill = nil
                 previewedTool = nil
                 previewedImage = nil
+                previewedVideo = nil
                 return
             }
             guard let sessionID,
@@ -616,6 +624,7 @@ struct WorkspaceView: View {
             previewedSkill = nil
             previewedTool = nil
             previewedImage = nil
+            previewedVideo = nil
             reviewedChanges = changes
         }
         // Warm the cache for this turn immediately even before the sidebar
@@ -644,6 +653,11 @@ struct WorkspaceView: View {
             } else {
                 if let sessionID {
                     await mothx.loadSkills(for: sessionID)
+                    // The server may answer before its project-skill scan sees
+                    // the copied directory. Re-scan the exact work directory
+                    // after the request so the new skill is immediately shown
+                    // in the selectable project-skill list.
+                    mothx.refreshInstalledSkills(workDirs: [workDir])
                 } else {
                     mothx.refreshInstalledSkills(workDirs: [workDir])
                 }
@@ -659,6 +673,7 @@ struct WorkspaceView: View {
             previewedSkill = skill
             previewedTool = nil
             previewedImage = nil
+            previewedVideo = nil
             reviewedChanges = nil
         }
     }
@@ -670,6 +685,7 @@ struct WorkspaceView: View {
             previewedTool = item
             previewedSkill = nil
             previewedImage = nil
+            previewedVideo = nil
             reviewedChanges = nil
         }
     }
@@ -679,6 +695,19 @@ struct WorkspaceView: View {
             conversationWasAtBottomBeforeReview = isConversationAtBottom
             showEmptyPreviewSidebar = false
             previewedImage = image
+            previewedVideo = nil
+            previewedTool = nil
+            previewedSkill = nil
+            reviewedChanges = nil
+        }
+    }
+
+    private func presentVideoPreview(_ video: MothxVideoPreview) {
+        withAnimation(.easeInOut(duration: 0.22)) {
+            conversationWasAtBottomBeforeReview = isConversationAtBottom
+            showEmptyPreviewSidebar = false
+            previewedVideo = video
+            previewedImage = nil
             previewedTool = nil
             previewedSkill = nil
             reviewedChanges = nil
@@ -692,6 +721,7 @@ struct WorkspaceView: View {
             previewedSkill = nil
             previewedTool = nil
             previewedImage = nil
+            previewedVideo = nil
         }
     }
 
@@ -712,7 +742,7 @@ struct WorkspaceView: View {
     }
 
     private var isRightSidebarOpen: Bool {
-        showEmptyPreviewSidebar || reviewedChanges != nil || previewedSkill != nil || previewedTool != nil || previewedImage != nil
+        showEmptyPreviewSidebar || reviewedChanges != nil || previewedSkill != nil || previewedTool != nil || previewedImage != nil || previewedVideo != nil
     }
 
     /// The review/preview panel currently shown. Mutators keep these states
@@ -733,6 +763,10 @@ struct WorkspaceView: View {
             }
         } else if let previewedImage {
             ImagePreviewSidebar(image: previewedImage) {
+                closeRightSidebar()
+            }
+        } else if let previewedVideo {
+            VideoPreviewSidebar(video: previewedVideo) {
                 closeRightSidebar()
             }
         } else if showEmptyPreviewSidebar {
@@ -1789,7 +1823,15 @@ struct PromptComposer: View {
         let copy = languageStore.copy
         let localSkills = skills.filter { $0.scope == .local }
         let localSkillNames = Set(localSkills.map(\.name))
-        let addableSkills = discoverable.filter { $0.scope != .local && !localSkillNames.contains($0.name) }
+        let customSkillRoot = URL(fileURLWithPath: MothxServiceManager.customSkillRoot).standardizedFileURL.path
+        let addableSkills = discoverable.filter { skill in
+            guard skill.scope == .global, !skill.directory.isEmpty else { return false }
+            let skillURL = URL(fileURLWithPath: skill.directory).standardizedFileURL
+            // The conversation picker only promotes user-managed custom skills;
+            // system skills and server-only entries are intentionally excluded.
+            return skillURL.deletingLastPathComponent().path == customSkillRoot
+                && !localSkillNames.contains(skill.name)
+        }
         return VStack(alignment: .leading, spacing: 4) {
             if let plusSubmenu {
                 HStack(spacing: 8) {

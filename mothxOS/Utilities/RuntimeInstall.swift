@@ -1,5 +1,39 @@
 import Foundation
 
+enum MothxRuntimeCompatibility {
+    /// The supported mothx compatibility line. Patch versions in this line
+    /// remain compatible; only versions below 1.3 or at/above 1.4 are outside
+    /// the supported range.
+    static let compatibleMajor = 1
+    static let compatibleMinor = 3
+    static let defaultRecommendedVersion = "1.3.1"
+
+    /// Debug builds can override this to exercise upgrade/downgrade flows,
+    /// e.g. MOTHXOS_TEST_RECOMMENDED_MOTHX_VERSION=1.3.0.
+    static var recommendedVersion: String {
+        #if DEBUG
+        if let value = ProcessInfo.processInfo.environment["MOTHXOS_TEST_RECOMMENDED_MOTHX_VERSION"] {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        #endif
+        return defaultRecommendedVersion
+    }
+}
+
+enum MothxRuntimeVersionStatus: Equatable {
+    case missing
+    case invalid
+    /// Current runtime is below the supported 1.3.x compatibility line.
+    case needsUpgrade
+    /// Current runtime is in 1.3.x but below the concrete recommended patch.
+    case updateAvailable
+    /// Current runtime is at or above 1.4.x and can be downgraded to 1.3.x.
+    case newerCanDowngrade
+    /// Current runtime is in the supported 1.3.x compatibility line.
+    case compatible
+}
+
 /// Shared helpers for installing/updating the global `mothx-installer` npm
 /// package, including the admin-elevated path needed when npm's global prefix
 /// is root-owned (the official Node.js pkg installs to /usr/local as root).
@@ -27,10 +61,11 @@ enum RuntimeInstall {
     /// Runs `npm install -g mothx-installer` through the system authorization
     /// prompt (`osascript ... with administrator privileges`). macOS npm
     /// locations contain no spaces, so no quoting is needed.
-    static func installGloballyAsAdmin(onOutput: @escaping (String) -> Void) async -> Int32 {
+    static func installGloballyAsAdmin(version: String, onOutput: @escaping (String) -> Void) async -> Int32 {
         let npmPath = await npmExecutablePath()
-        let installCommand = npmPath.map { "\($0) install -g mothx-installer 2>&1" }
-            ?? "npm install -g mothx-installer 2>&1"
+        let packageSpec = "mothx-installer@\(version)"
+        let installCommand = npmPath.map { "\($0) install -g \(shellQuote(packageSpec)) 2>&1" }
+            ?? "npm install -g \(shellQuote(packageSpec)) 2>&1"
         // Escape backslashes and quotes for the AppleScript string literal.
         let escaped = installCommand
             .replacingOccurrences(of: "\\", with: "\\\\")
@@ -99,6 +134,35 @@ enum RuntimeInstall {
         compareVersion(current, latest) < 0
     }
 
+    static func runtimeVersionStatus(current: String?, recommended: String = MothxRuntimeCompatibility.recommendedVersion) -> MothxRuntimeVersionStatus {
+        guard let current, !current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return .missing }
+        guard isValidVersion(current), isValidVersion(recommended) else { return .invalid }
+
+        // Compatibility is defined by the 1.3.x line, not by the concrete
+        // patch selected for installation (currently 1.3.1). This prevents a
+        // newer compatible patch such as 1.3.100 from being incorrectly
+        // treated as a runtime that must be downgraded.
+        let currentMajorMinor = majorMinorComponents(current)
+        let compatibleMajorMinor = (MothxRuntimeCompatibility.compatibleMajor, MothxRuntimeCompatibility.compatibleMinor)
+        if currentMajorMinor.0 < compatibleMajorMinor.0
+            || (currentMajorMinor.0 == compatibleMajorMinor.0 && currentMajorMinor.1 < compatibleMajorMinor.1) {
+            return .needsUpgrade
+        }
+        if currentMajorMinor.0 > compatibleMajorMinor.0
+            || (currentMajorMinor.0 == compatibleMajorMinor.0 && currentMajorMinor.1 > compatibleMajorMinor.1) {
+            return .newerCanDowngrade
+        }
+
+        // Within 1.3.x, still offer the concrete recommended patch when the
+        // installed patch is older, but do not classify any newer 1.3.x patch
+        // as incompatible.
+        return compareVersion(current, recommended) < 0 ? .updateAvailable : .compatible
+    }
+
+    static func isValidVersion(_ version: String) -> Bool {
+        !numericComponents(version).isEmpty
+    }
+
     /// Latest publishable version if one is available, else nil.
     static func checkMothxUpdate() async -> String? {
         guard let current = await mothxVersionString(),
@@ -107,7 +171,7 @@ enum RuntimeInstall {
         return latest
     }
 
-    private static func compareVersion(_ a: String, _ b: String) -> Int {
+    static func compareVersion(_ a: String, _ b: String) -> Int {
         let av = numericComponents(a)
         let bv = numericComponents(b)
         let count = max(av.count, bv.count)
@@ -119,12 +183,24 @@ enum RuntimeInstall {
         return 0
     }
 
+    private static func majorMinorComponents(_ version: String) -> (Int, Int) {
+        let components = numericComponents(version)
+        return (
+            components.indices.contains(0) ? components[0] : 0,
+            components.indices.contains(1) ? components[1] : 0
+        )
+    }
+
     private static func numericComponents(_ version: String) -> [Int] {
         let trimmed = version.trimmingCharacters(in: .whitespacesAndNewlines)
         // Strip pre-release/build suffixes ("-dirty") and a leading "v".
         let core = trimmed.split(separator: "-").first.map(String.init) ?? trimmed
         let noV = core.hasPrefix("v") || core.hasPrefix("V") ? String(core.dropFirst()) : core
         return noV.split(separator: ".").compactMap { Int($0) }
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     /// Runs `command` in an interactive login shell (so nvm/homebrew PATH

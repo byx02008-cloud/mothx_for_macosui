@@ -101,7 +101,7 @@ struct TextMessageBubble: View {
     private func startTypewriter(resetProgress: Bool = true) {
         if resetProgress { displayedCharCount = 0 }
         typewriterTimer?.invalidate()
-        typewriterTimer = Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { _ in
+        typewriterTimer = Timer.scheduledTimer(withTimeInterval: 0.02, repeats: true) { _ in
             if displayedCharCount < typingTarget.count {
                 displayedCharCount += 1
             }

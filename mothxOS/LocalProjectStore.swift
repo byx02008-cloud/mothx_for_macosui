@@ -44,6 +44,12 @@ final class LocalProjectStore {
         """)
         // Migration for databases created before provider_id existed.
         try? execute("ALTER TABLE session_preferences ADD COLUMN provider_id TEXT")
+        try execute("""
+            CREATE TABLE IF NOT EXISTS session_active_skills (
+                session_id TEXT PRIMARY KEY NOT NULL,
+                names_json TEXT NOT NULL
+            )
+        """)
     }
 
     deinit { sqlite3_close(database) }
@@ -110,8 +116,45 @@ final class LocalProjectStore {
     }
 
     func removeSession(sessionID: String) throws {
+        try execute("DELETE FROM session_active_skills WHERE session_id = ?", bindings: [sessionID])
         try execute("DELETE FROM project_sessions WHERE session_id = ?", bindings: [sessionID])
         try execute("DELETE FROM session_preferences WHERE session_id = ?", bindings: [sessionID])
+    }
+
+    /// Persists the skills explicitly activated for a conversation. An empty
+    /// set is intentionally stored as a real value: it represents the user's
+    /// explicit suspend-all action and must not fall back to a stale server
+    /// value after the app or mothx service restarts.
+    func setActiveSkills(_ names: Set<String>, for sessionID: String) throws {
+        let sortedNames = names
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .sorted()
+        let data = try JSONSerialization.data(withJSONObject: sortedNames, options: [])
+        guard let json = String(data: data, encoding: .utf8) else {
+            throw LocalProjectStoreError.writeFailed
+        }
+        try execute("""
+            INSERT INTO session_active_skills (session_id, names_json) VALUES (?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET names_json = excluded.names_json
+        """, bindings: [sessionID, json])
+    }
+
+    /// Returns nil when this session has never explicitly saved an active
+    /// skill selection. This distinction lets older sessions adopt the
+    /// server's current state once, while an explicitly saved empty set stays
+    /// empty across restarts.
+    func activeSkills(for sessionID: String) throws -> Set<String>? {
+        let statement = try prepare("SELECT names_json FROM session_active_skills WHERE session_id = ?")
+        defer { sqlite3_finalize(statement) }
+        try bind(sessionID, to: statement, index: 1)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        let json = string(statement, column: 0)
+        guard let data = json.data(using: .utf8),
+              let values = try JSONSerialization.jsonObject(with: data) as? [String] else {
+            throw LocalProjectStoreError.prepareFailed
+        }
+        return Set(values)
     }
 
     func setModel(_ modelID: String, for sessionID: String) throws {
