@@ -10,6 +10,7 @@ struct TextMessageBubble: View {
     var onFork: (() -> Void)? = nil
     var isForking = false
     var onPreviewImage: ((MothxImagePreview) -> Void)? = nil
+    var onPreviewDocument: ((MothxDocumentPreview) -> Void)? = nil
 
     private var isUser: Bool { message.isUser }
 
@@ -45,6 +46,9 @@ struct TextMessageBubble: View {
                         }
                         if !message.imagePreviews.isEmpty {
                             ImagePreviewStrip(images: message.imagePreviews, onSelect: onPreviewImage ?? { _ in })
+                        }
+                        if !message.documentPreviews.isEmpty {
+                            DocumentPreviewStrip(documents: message.documentPreviews, onSelect: onPreviewDocument ?? { _ in })
                         }
                         if isTyping {
                             Rectangle().fill(Color.primary.opacity(0.6)).frame(width: 8, height: 16)

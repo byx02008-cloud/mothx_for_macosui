@@ -5,6 +5,10 @@ enum MothxAgentTransport: String, CaseIterable, Identifiable {
     case serve
 
     static let defaultsKey = "mothxOS.agentTransport"
+    /// Set only when the user explicitly chooses a transport in Settings.
+    /// Older builds defaulted to ACP and therefore may have a persisted
+    /// `acp` value that was never an intentional opt-in.
+    static let explicitSelectionKey = "mothxOS.agentTransport.explicitSelection"
 
     var id: String { rawValue }
 }

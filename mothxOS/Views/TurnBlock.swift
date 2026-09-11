@@ -46,8 +46,9 @@ nonisolated struct ToolInvocationSummary: Identifiable, Hashable {
     let isError: Bool
     let imagePreviews: [MothxImagePreview]
     let videoPreviews: [MothxVideoPreview]
+    let documentPreviews: [MothxDocumentPreview]
 
-    init(id: String, toolName: String, argumentsPreview: String, arguments: String, resultSummary: String, hasDetail: Bool, isError: Bool, imagePreviews: [MothxImagePreview] = [], videoPreviews: [MothxVideoPreview] = []) {
+    init(id: String, toolName: String, argumentsPreview: String, arguments: String, resultSummary: String, hasDetail: Bool, isError: Bool, imagePreviews: [MothxImagePreview] = [], videoPreviews: [MothxVideoPreview] = [], documentPreviews: [MothxDocumentPreview] = []) {
         self.id = id
         self.toolName = toolName
         self.argumentsPreview = argumentsPreview
@@ -57,6 +58,7 @@ nonisolated struct ToolInvocationSummary: Identifiable, Hashable {
         self.isError = isError
         self.imagePreviews = imagePreviews
         self.videoPreviews = videoPreviews
+        self.documentPreviews = documentPreviews
     }
 }
 
@@ -73,12 +75,12 @@ nonisolated func computeTurns(_ messages: [MothxMessage]) -> [Turn] {
         var fileCalls: [MothxMessage] = []
         for msg in messages {
             if msg.isAssistant,
-               (!msg.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !msg.imagePreviews.isEmpty || !msg.videoPreviews.isEmpty) {
-                results.append(MothxMessage(id: msg.id, seq: msg.seq, role: msg.role, content: msg.content.trimmingCharacters(in: .whitespacesAndNewlines), toolCallId: msg.toolCallId, toolName: msg.toolName, arguments: msg.arguments, plan: msg.plan, summary: msg.summary, hasDetail: msg.hasDetail, createdAt: msg.createdAt, imagePreviews: msg.imagePreviews, videoPreviews: msg.videoPreviews))
+               (!msg.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !msg.imagePreviews.isEmpty || !msg.videoPreviews.isEmpty || !msg.documentPreviews.isEmpty) {
+                results.append(MothxMessage(id: msg.id, seq: msg.seq, role: msg.role, content: msg.content.trimmingCharacters(in: .whitespacesAndNewlines), toolCallId: msg.toolCallId, toolName: msg.toolName, arguments: msg.arguments, plan: msg.plan, summary: msg.summary, hasDetail: msg.hasDetail, createdAt: msg.createdAt, imagePreviews: msg.imagePreviews, videoPreviews: msg.videoPreviews, documentPreviews: msg.documentPreviews))
             } else if msg.isToolCall {
                 let id = msg.toolCallId ?? msg.id
                 let name = msg.toolName ?? "tool"
-                calls[id] = ToolInvocationSummary(id: id, toolName: name, argumentsPreview: toolArgSummary(toolName: name, arguments: msg.arguments) ?? "", arguments: msg.arguments, resultSummary: "", hasDetail: false, isError: false, imagePreviews: msg.imagePreviews, videoPreviews: msg.videoPreviews)
+                calls[id] = ToolInvocationSummary(id: id, toolName: name, argumentsPreview: toolArgSummary(toolName: name, arguments: msg.arguments) ?? "", arguments: msg.arguments, resultSummary: "", hasDetail: false, isError: false, imagePreviews: msg.imagePreviews, videoPreviews: msg.videoPreviews, documentPreviews: msg.documentPreviews)
                 order.append(id)
                 if ["edit", "write", "insert", "edit_file", "write_file", "insert_file", "insert_text"].contains((msg.toolName ?? "").lowercased().replacingOccurrences(of: "-", with: "_")) {
                     fileCalls.append(msg)
@@ -95,7 +97,11 @@ nonisolated func computeTurns(_ messages: [MothxMessage]) -> [Turn] {
                 for preview in msg.videoPreviews where !videoPreviews.contains(where: { $0.source == preview.source }) {
                     videoPreviews.append(preview)
                 }
-                calls[id] = ToolInvocationSummary(id: id, toolName: old.toolName, argumentsPreview: old.argumentsPreview, arguments: old.arguments, resultSummary: compactToolSummary(msg.summary ?? ""), hasDetail: msg.hasDetail, isError: false, imagePreviews: previews, videoPreviews: videoPreviews)
+                var documentPreviews = old.documentPreviews
+                for preview in msg.documentPreviews where !documentPreviews.contains(where: { $0.source == preview.source }) {
+                    documentPreviews.append(preview)
+                }
+                calls[id] = ToolInvocationSummary(id: id, toolName: old.toolName, argumentsPreview: old.argumentsPreview, arguments: old.arguments, resultSummary: compactToolSummary(msg.summary ?? ""), hasDetail: msg.hasDetail, isError: false, imagePreviews: previews, videoPreviews: videoPreviews, documentPreviews: documentPreviews)
                 if !order.contains(id) { order.append(id) }
             }
         }
@@ -124,6 +130,84 @@ private nonisolated func compactToolSummary(_ text: String) -> String {
     return compact.count > 140 ? String(compact.prefix(140)) + "…" : compact
 }
 
+/// A small wrapping layout for compact process/tool chips.
+///
+/// SwiftUI's HStack keeps all children on one row and allows them to be
+/// proposed less width than they need. That is a poor fit for the process
+/// summary, where chips should stay readable and simply continue on another
+/// line when the conversation column becomes narrow.
+private struct FlowLayout: Layout {
+    var horizontalSpacing: CGFloat = 6
+    var verticalSpacing: CGFloat = 6
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) -> CGSize {
+        let availableWidth = proposal.width ?? .greatestFiniteMagnitude
+        let result = measure(subviews: subviews, maxWidth: availableWidth)
+        return CGSize(
+            width: proposal.width ?? result.width,
+            height: result.height
+        )
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) {
+        let placements = layout(subviews: subviews, maxWidth: bounds.width)
+        for placement in placements {
+            subviews[placement.index].place(
+                at: CGPoint(x: bounds.minX + placement.x, y: bounds.minY + placement.y),
+                anchor: .topLeading,
+                proposal: ProposedViewSize(placement.size)
+            )
+        }
+    }
+
+    private func measure(subviews: Subviews, maxWidth: CGFloat) -> (width: CGFloat, height: CGFloat) {
+        guard !subviews.isEmpty else { return (0, 0) }
+        let placements = layout(subviews: subviews, maxWidth: maxWidth)
+        let width = placements.map { $0.x + $0.size.width }.max() ?? 0
+        let height = placements.map { $0.y + $0.size.height }.max() ?? 0
+        return (width, height)
+    }
+
+    private func layout(subviews: Subviews, maxWidth: CGFloat) -> [Placement] {
+        var placements: [Placement] = []
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        let finiteWidth = maxWidth.isFinite
+
+        for (index, subview) in subviews.enumerated() {
+            let size = subview.sizeThatFits(.unspecified)
+            let wouldOverflow = finiteWidth && x > 0 && x + size.width > maxWidth
+            if wouldOverflow {
+                x = 0
+                y += rowHeight + verticalSpacing
+                rowHeight = 0
+            }
+
+            placements.append(Placement(index: index, x: x, y: y, size: size))
+            x += size.width + horizontalSpacing
+            rowHeight = max(rowHeight, size.height)
+        }
+        return placements
+    }
+
+    private struct Placement {
+        let index: Int
+        let x: CGFloat
+        let y: CGFloat
+        let size: CGSize
+    }
+}
+
 struct TurnBlock: View {
     @EnvironmentObject private var mothx: MothxServiceManager
     @EnvironmentObject private var languageStore: LanguageStore
@@ -143,6 +227,7 @@ struct TurnBlock: View {
     var onPreviewTool: ((ToolInvocationSummary) -> Void)? = nil
     var onPreviewImage: ((MothxImagePreview) -> Void)? = nil
     var onPreviewVideo: ((MothxVideoPreview) -> Void)? = nil
+    var onPreviewDocument: ((MothxDocumentPreview) -> Void)? = nil
 
     /// Explicit message forks are accepted only at the final assistant text
     /// entry of a completed turn. This mirrors mothx's `fork_unavailable`
@@ -259,6 +344,25 @@ struct TurnBlock: View {
         return result
     }
 
+    private var turnPublishArtifactDocuments: [MothxDocumentPreview] {
+        guard turnRunID != nil else { return [] }
+        let workDir = mothx.workDir(for: sessionID)
+        let directPreviews = turn.resultMessages.flatMap(\.documentPreviews)
+            + turn.toolSummaries.flatMap(\.documentPreviews)
+        let texts = turn.resultMessages.map(\.content)
+            + turn.toolSummaries.map(\.arguments)
+            + turn.toolSummaries.map(\.resultSummary)
+        var seen = Set<String>()
+        var result: [MothxDocumentPreview] = []
+        for preview in directPreviews where seen.insert(preview.source).inserted {
+            result.append(preview)
+        }
+        for preview in texts.flatMap({ MothxDocumentPreview.publishArtifactPreviews(from: $0, workDirectory: workDir) }) {
+            if seen.insert(preview.source).inserted { result.append(preview) }
+        }
+        return result
+    }
+
     /// Status for this turn: current-run live status for the last turn,
     /// otherwise historical run summary looked up from any message ID.
     private var turnStatus: (status: String, elapsed: TimeInterval, error: String?)? {
@@ -351,7 +455,8 @@ struct TurnBlock: View {
                 MessageBubble(
                     message: message,
                     isCurrentRunning: isTurnRunActive && mothx.currentRunningMessageID == message.id,
-                    onPreviewImage: onPreviewImage
+                    onPreviewImage: onPreviewImage,
+                    onPreviewDocument: onPreviewDocument
                 )
             }
             if !isTurnRunActive, let turnChanges, !turnChanges.files.isEmpty {
@@ -372,6 +477,13 @@ struct TurnBlock: View {
             if let runID = turnRunID, !artifactVideos.isEmpty {
                 PublishArtifactVideoCard(videos: artifactVideos, runID: runID) { video in
                     onPreviewVideo?(video)
+                }
+                .padding(.top, 2)
+            }
+            let artifactDocuments = turnPublishArtifactDocuments
+            if let runID = turnRunID, !artifactDocuments.isEmpty {
+                PublishArtifactDocumentCard(documents: artifactDocuments, runID: runID) { document in
+                    onPreviewDocument?(document)
                 }
                 .padding(.top, 2)
             }
@@ -406,27 +518,65 @@ struct TurnBlock: View {
     private var processBlock: some View {
         VStack(alignment: .leading, spacing: 0) {
             Button {
-                    withAnimation(.spring(response: 0.4, dampingFraction: 0.7)) { isProcessExpanded.toggle() }
-                    if isProcessExpanded { loadProcessPage(0) }
+                withAnimation(.spring(response: 0.4, dampingFraction: 0.7)) { isProcessExpanded.toggle() }
+                if isProcessExpanded { loadProcessPage(0) }
             } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "gearshape.2").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
-                    Text(languageStore.copy.process).font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
-                    Text("· 调用 \(turn.toolSummaries.count) · 结果 \(turn.toolResultCount)").font(.caption2).foregroundStyle(.tertiary)
-                    ForEach(turn.uniqueToolNames, id: \.self) { name in
-                        HStack(spacing: 2) {
-                            Image(systemName: toolIcon(for: name)).font(.system(size: 8))
-                            Text(toolDisplayName(name, language: languageStore.language)).font(.system(size: 8))
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "gearshape.2")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 16, height: 18)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        // Keep the title and summary at their intrinsic width.
+                        // Without this, a narrow conversation column can make
+                        // the Chinese title collapse into a vertical stack.
+                        FlowLayout(horizontalSpacing: 6, verticalSpacing: 2) {
+                            Text(languageStore.copy.process)
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: true, vertical: false)
+                            Text("· 调用 \(turn.toolSummaries.count) · 结果 \(turn.toolResultCount)")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
                         }
-                        .foregroundStyle(.orange)
-                        .padding(.horizontal, 4).padding(.vertical, 1)
-                        .background(Color.orange.opacity(0.1))
-                        .clipShape(Capsule())
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                        // HStack does not wrap its children, so the tool chips
+                        // used to compress each other (and the title) as the
+                        // conversation narrowed. FlowLayout keeps each chip
+                        // at its natural size and moves it to the next line.
+                        FlowLayout(horizontalSpacing: 5, verticalSpacing: 4) {
+                            ForEach(turn.uniqueToolNames, id: \.self) { name in
+                                HStack(spacing: 3) {
+                                    Image(systemName: toolIcon(for: name))
+                                        .font(.system(size: 8))
+                                    Text(toolDisplayName(name, language: languageStore.language))
+                                        .font(.system(size: 8))
+                                        .lineLimit(1)
+                                }
+                                .foregroundStyle(.orange)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 2)
+                                .background(Color.orange.opacity(0.1))
+                                .clipShape(Capsule())
+                                .fixedSize()
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    Spacer()
-                    Image(systemName: isProcessExpanded ? "chevron.up" : "chevron.down").font(.caption2).foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    Image(systemName: isProcessExpanded ? "chevron.up" : "chevron.down")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 16, height: 18)
+                        .fixedSize()
                 }
-                .padding(.horizontal, 8).padding(.vertical, 4)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)

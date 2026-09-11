@@ -683,14 +683,14 @@ private struct AdvancedSettingsSection: View {
     @EnvironmentObject private var mothx: MothxServiceManager
     @EnvironmentObject private var languageStore: LanguageStore
     @AppStorage("mothxOS.reuseExistingService") private var reuseExistingService = false
-    @AppStorage(MothxAgentTransport.defaultsKey) private var agentTransport = MothxAgentTransport.acp.rawValue
+    @AppStorage(MothxAgentTransport.defaultsKey) private var agentTransport = MothxAgentTransport.serve.rawValue
 
     var body: some View {
         let c = languageStore.copy
         return VStack(alignment: .leading, spacing: 16) {
             SettingsCard(
                 title: c.text("Agent 连接方式", "Agent transport"),
-                subtitle: c.text("ACP 直接承载对话运行；Serve API 继续负责设置、项目、历史与统计。", "ACP carries agent runs directly; the Serve API still manages settings, projects, history, and statistics.")
+                subtitle: c.text("Serve API 默认承载对话运行并负责持久化历史；ACP 可作为实验性传输手动启用。", "Serve API is the default conversation transport and persists history; ACP can be enabled manually as an experimental transport.")
             ) {
                 Picker(c.text("连接方式", "Transport"), selection: $agentTransport) {
                     Text(c.text("ACP（实验性）", "ACP (Experimental)"))
@@ -699,11 +699,21 @@ private struct AdvancedSettingsSection: View {
                         .tag(MothxAgentTransport.serve.rawValue)
                 }
                 .pickerStyle(.segmented)
-                Text(c.text("ACP 为此分支的默认方式。图片或显式选择 Skill 时会自动回退 Serve API。", "ACP is the default on this branch. Image input or explicitly selected Skills automatically fall back to the Serve API."))
+                Text(c.text("Serve API 是默认方式，可确保多轮对话使用持久化历史；ACP 仍可手动选择进行实验。图片或显式选择 Skill 时会自动使用 Serve API。", "Serve API is the safe default so multi-turn chats use durable history; ACP remains available as an explicit experiment. Image input or explicitly selected Skills always use Serve API."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            .onAppear {
+                // Migrate the old implicit ACP default to the durable Serve
+                // path. A user can still opt into ACP explicitly afterwards.
+                let defaults = UserDefaults.standard
+                if !defaults.bool(forKey: MothxAgentTransport.explicitSelectionKey),
+                   agentTransport == MothxAgentTransport.acp.rawValue {
+                    agentTransport = MothxAgentTransport.serve.rawValue
+                }
+            }
             .onChange(of: agentTransport) { _, value in
+                UserDefaults.standard.set(true, forKey: MothxAgentTransport.explicitSelectionKey)
                 if value == MothxAgentTransport.serve.rawValue {
                     Task { await mothx.stopACPClient() }
                 }

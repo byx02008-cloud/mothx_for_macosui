@@ -717,6 +717,14 @@ final class MothxServiceManager: ObservableObject {
             let reconciled = await reconcileDuplicateProjects(projects: projects, sessions: loadedSessions)
             projects = reconciled.projects
             loadedSessions = reconciled.sessions
+
+            // The server's project records only contain identity/name. When a
+            // local project database is rebuilt (for example after the app
+            // briefly used a temporary session database), synchronization can
+            // recreate every row with an empty work directory. Persisted
+            // sessions still carry their cwd, so recover missing project
+            // directories from that durable source once sessions are loaded.
+            restoreMissingProjectWorkDirs(from: loadedSessions)
             sessions = loadedSessions
             await teamManager.repairSessionProjectLinks()
             if !hadLocalProjectLoadError { settingsError = nil }
@@ -762,7 +770,11 @@ final class MothxServiceManager: ObservableObject {
         // persisted rows so imported and migrated projects share one shape.
         let localByID = Dictionary(uniqueKeysWithValues: try localProjectStore.projects().map { ($0.id, $0) })
         for remoteProject in remoteProjects where localByID[remoteProject.id] == nil {
-            _ = try localProjectStore.createProject(id: remoteProject.id, name: remoteProject.name, workDir: "")
+            _ = try localProjectStore.createProject(
+                id: remoteProject.id,
+                name: remoteProject.name,
+                workDir: remoteProject.workDir.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
         }
 
         let persisted = try localProjectStore.projects()
@@ -773,7 +785,13 @@ final class MothxServiceManager: ObservableObject {
         }
         return remoteProjects.map { remote in
             let local = persisted.first(where: { $0.id == remote.id })
-            return MothxProject(id: remote.id, name: remote.name, workDir: local?.workDir ?? "")
+            let localWorkDir = local?.workDir.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let remoteWorkDir = remote.workDir.trimmingCharacters(in: .whitespacesAndNewlines)
+            return MothxProject(
+                id: remote.id,
+                name: remote.name,
+                workDir: localWorkDir.isEmpty ? remoteWorkDir : localWorkDir
+            )
         }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
@@ -857,6 +875,44 @@ final class MothxServiceManager: ObservableObject {
 
     private func normalizedProjectName(_ name: String) -> String {
         name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// Restores project work directories from persisted session metadata.
+    ///
+    /// Project records on the mothx server intentionally store only identity
+    /// and name; the session's cwd is the durable source of truth for the
+    /// workspace. This is especially important after local project rows have
+    /// been recreated by synchronizeProjects with an empty workDir.
+    private func restoreMissingProjectWorkDirs(from sessions: [MothxSession]) {
+        guard let localProjectStore else { return }
+
+        var candidatesByProject: [String: [String: Int]] = [:]
+        for session in sessions {
+            guard let projectID = session.projectID?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !projectID.isEmpty,
+                  let rawWorkDir = session.workDir else { continue }
+            let workDir = rawWorkDir.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !workDir.isEmpty else { continue }
+            candidatesByProject[projectID, default: [:]][workDir, default: 0] += 1
+        }
+
+        for index in projects.indices {
+            guard projects[index].workDir.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  let candidates = candidatesByProject[projects[index].id],
+                  let selected = candidates.sorted(by: { lhs, rhs in
+                      if lhs.value != rhs.value { return lhs.value > rhs.value }
+                      return lhs.key < rhs.key
+                  }).first?.key else { continue }
+
+            let project = projects[index]
+            projects[index].workDir = selected
+            do {
+                try localProjectStore.updateProject(id: project.id, name: project.name, workDir: selected)
+                recordRuntimeLog("projects", "restored work directory for project \(project.id) from session metadata: \(selected)")
+            } catch {
+                recordRuntimeLog("projects", "failed to persist restored work directory for project \(project.id): \(describe(error))")
+            }
+        }
     }
 
     @discardableResult
@@ -1259,9 +1315,22 @@ final class MothxServiceManager: ObservableObject {
     }
 
     var preferredAgentTransport: MothxAgentTransport {
-        let raw = UserDefaults.standard.string(forKey: MothxAgentTransport.defaultsKey)
-            ?? MothxAgentTransport.acp.rawValue
-        return MothxAgentTransport(rawValue: raw) ?? .acp
+        // Serve remains the safe default for normal conversation turns. It is
+        // the durable session/run path and therefore guarantees that every
+        // new turn is reconstructed from the same persisted conversation.
+        // ACP is still available as an explicit experimental transport in
+        // Settings, but must not silently become the default again.
+        let defaults = UserDefaults.standard
+        // Builds before this fix used ACP as the implicit default. Treat that
+        // legacy value as Serve unless the user has explicitly selected ACP in
+        // the current settings UI. This migrates existing installations while
+        // preserving a deliberate ACP opt-in.
+        guard defaults.bool(forKey: MothxAgentTransport.explicitSelectionKey) else {
+            return .serve
+        }
+        let raw = defaults.string(forKey: MothxAgentTransport.defaultsKey)
+            ?? MothxAgentTransport.serve.rawValue
+        return MothxAgentTransport(rawValue: raw) ?? .serve
     }
 
     private func ensureACPClient(tools: [String]) async throws {
@@ -1336,7 +1405,15 @@ final class MothxServiceManager: ObservableObject {
         do {
             try await ensureACPClient(tools: tools)
             let cwd = workDir.isEmpty ? self.workDir(for: sessionID) : workDir
+            recordRuntimeLog(
+                "acp",
+                "resume start session=\(sessionID) cwd=\(cwd) localMessages=\((messagesBySession[sessionID] ?? []).count)"
+            )
             try await acpClient.resumeSession(id: sessionID, cwd: cwd)
+            recordRuntimeLog(
+                "acp",
+                "resume complete session=\(sessionID) localMessages=\((messagesBySession[sessionID] ?? []).count)"
+            )
             let resolvedProvider = provider.isEmpty
                 ? (sessionProviders[sessionID] ?? defaultProvider)
                 : provider
@@ -1744,6 +1821,11 @@ final class MothxServiceManager: ObservableObject {
     func submitRun(sessionID: String, message: String, images: [String], workDir: String = "", provider: String = "", model: String = "", mode: String = "agent", tools: [String] = [], skills: [String] = [], forceServe: Bool = false) async -> String? {
         guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !images.isEmpty else { return nil }
         clearImageRecognitionProgress()
+        recordRuntimeLog(
+            "run",
+            "submit session=\(sessionID) transport=\(preferredAgentTransport.rawValue) " +
+                "history=\((messagesBySession[sessionID] ?? []).count) images=\(images.count) skills=\(skills.count)"
+        )
         if preferredAgentTransport == .acp,
            !forceServe,
            pendingSessions[sessionID] == nil,
@@ -2867,12 +2949,22 @@ final class MothxServiceManager: ObservableObject {
     }
 
     private func restoreLatestRunMetrics(sessionID: String, runs: [[String: Any]]) async {
-        guard let latest = runs.first else {
-            metricsBySession[sessionID] = MothxSessionMetrics()
+        // A run row may legitimately be persisted before its Usage or
+        // ContextUsage is available (and ACP can persist an empty Usage object).
+        // Never replace the last known session metrics with an empty value in
+        // that case: doing so makes the context indicator appear to reset on
+        // every refresh/new turn even though the durable conversation is intact.
+        if runs.isEmpty {
+            if metricsBySession[sessionID] == nil {
+                metricsBySession[sessionID] = MothxSessionMetrics()
+            }
             return
         }
 
-        metricsBySession[sessionID] = MothxSessionMetrics()
+        if metricsBySession[sessionID] == nil {
+            metricsBySession[sessionID] = MothxSessionMetrics()
+        }
+        guard let latest = runs.first else { return }
         let modelWindow = contextWindow(for: latest, sessionID: sessionID)
         let restoredContext = updateRunContextUsage(
             from: latest["ContextUsage"] ?? latest["contextUsage"] ?? latest["context_usage"],
@@ -3085,6 +3177,7 @@ final class MothxServiceManager: ObservableObject {
             let hasDetail: Bool
             let imagePreviews = decodeImagePreviews(item, sessionID: sessionID)
             let videoPreviews = decodeVideoPreviews(item, sessionID: sessionID)
+            let documentPreviews = decodeDocumentPreviews(item, sessionID: sessionID)
 
             switch role {
             case "toolCall":
@@ -3125,6 +3218,7 @@ final class MothxServiceManager: ObservableObject {
 
             var combinedPreviews = imagePreviews
             var combinedVideoPreviews = videoPreviews
+            var combinedDocumentPreviews = documentPreviews
             // `publish_artifact` stores its tool name separately from the
             // JSON arguments. Resolve the relative `path` against this
             // session's work directory while the session context is known.
@@ -3142,6 +3236,13 @@ final class MothxServiceManager: ObservableObject {
                     workDirectory: workDir(for: sessionID)
                 ) where !combinedVideoPreviews.contains(where: { $0.source == candidate.source }) {
                     combinedVideoPreviews.append(candidate)
+                }
+                for candidate in MothxDocumentPreview.publishArtifactPreviews(
+                    toolName: toolName,
+                    arguments: arguments,
+                    workDirectory: workDir(for: sessionID)
+                ) where !combinedDocumentPreviews.contains(where: { $0.source == candidate.source }) {
+                    combinedDocumentPreviews.append(candidate)
                 }
             }
             // Assistant/user replies frequently reference locally generated
@@ -3161,6 +3262,10 @@ final class MothxServiceManager: ObservableObject {
                     where !combinedVideoPreviews.contains(where: { $0.source == candidate.source }) {
                     combinedVideoPreviews.append(candidate)
                 }
+                for candidate in MothxDocumentPreview.publishArtifactPreviews(from: content, workDirectory: workDir(for: sessionID))
+                    where !combinedDocumentPreviews.contains(where: { $0.source == candidate.source }) {
+                    combinedDocumentPreviews.append(candidate)
+                }
             }
             // Tool results publish generated files with the same notation, e.g.
             // `publish_artifact uploadimg/midautumn/20260830_200215_1.png`; keep
@@ -3173,6 +3278,10 @@ final class MothxServiceManager: ObservableObject {
                 for candidate in MothxVideoPreview.previews(from: summary, workDirectory: workDir(for: sessionID))
                     where !combinedVideoPreviews.contains(where: { $0.source == candidate.source }) {
                     combinedVideoPreviews.append(candidate)
+                }
+                for candidate in MothxDocumentPreview.publishArtifactPreviews(from: summary, workDirectory: workDir(for: sessionID))
+                    where !combinedDocumentPreviews.contains(where: { $0.source == candidate.source }) {
+                    combinedDocumentPreviews.append(candidate)
                 }
             }
 
@@ -3187,11 +3296,12 @@ final class MothxServiceManager: ObservableObject {
                     ?? (item["timestamp"] as? String)
                     ?? (item["createdAt"] as? NSNumber).map { ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: $0.doubleValue)) },
                 imagePreviews: combinedPreviews,
-                videoPreviews: combinedVideoPreviews
+                videoPreviews: combinedVideoPreviews,
+                documentPreviews: combinedDocumentPreviews
             )
         }.filter { msg in
             if msg.isToolCall || msg.isToolResult { return true }
-            return !msg.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !msg.imagePreviews.isEmpty || !msg.videoPreviews.isEmpty
+            return !msg.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !msg.imagePreviews.isEmpty || !msg.videoPreviews.isEmpty || !msg.documentPreviews.isEmpty
         }
     }
 
@@ -3229,6 +3339,49 @@ final class MothxServiceManager: ObservableObject {
     /// directory. Only existing image files are included.
     private func publishArtifactImagePreviews(from text: String, sessionID: String) -> [MothxImagePreview] {
         MothxImagePreview.publishArtifactPreviews(from: text, workDirectory: workDir(for: sessionID))
+    }
+
+    private func decodeDocumentPreviews(_ item: [String: Any], sessionID: String = "") -> [MothxDocumentPreview] {
+        let workDirectory = workDir(for: sessionID)
+        var result: [MothxDocumentPreview] = []
+        var index = 0
+
+        func append(value: [String: Any]) {
+            let sourceKeys = ["path", "source", "url", "file", "filePath", "file_path", "downloadedPath", "downloaded_path"]
+            let source = sourceKeys.compactMap { value[$0] as? String }.first(where: { !$0.isEmpty }) ?? ""
+            let name = value["name"] as? String ?? value["filename"] as? String
+            guard let preview = MothxDocumentPreview.localPreview(
+                source: source,
+                workDirectory: workDirectory,
+                id: "document-\(index)-\(UUID().uuidString)",
+                name: name
+            ), !result.contains(where: { $0.source == preview.source }) else { return }
+            result.append(preview)
+            index += 1
+        }
+
+        for key in ["documents", "documentPreviews", "document_previews", "artifacts"] {
+            if let values = item[key] as? [[String: Any]] {
+                values.forEach(append)
+            }
+        }
+
+        if let contents = item["contents"] as? [[String: Any]] {
+            for block in contents {
+                let type = (block["type"] as? String)?.lowercased()
+                guard type == "document" || type == "file" || type == "pdf" || type == "presentation" || type == "spreadsheet" || type == "word" else { continue }
+                append(value: (block["document"] as? [String: Any]) ?? (block["file"] as? [String: Any]) ?? block)
+            }
+        }
+
+        if let attachments = item["attachments"] as? [[String: Any]] {
+            for attachment in attachments {
+                let kind = (attachment["kind"] as? String)?.lowercased()
+                guard kind == "document" || kind == "file" || kind == "pdf" || kind == "presentation" || kind == "spreadsheet" || kind == "word" else { continue }
+                append(value: attachment)
+            }
+        }
+        return result
     }
 
     private func decodeVideoPreviews(_ item: [String: Any], sessionID: String = "") -> [MothxVideoPreview] {

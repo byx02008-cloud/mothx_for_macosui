@@ -92,10 +92,13 @@ struct PlanCard: View {
                 }
             }
         }
+        // Keep the task plan opaque so streamed text behind it never bleeds
+        // through. Use platform semantic colors so the surface follows the
+        // current light/dark appearance instead of relying on transparency.
         .background(
             colorScheme == .light
-                ? Color.blue.opacity(0.04)
-                : Color.blue.opacity(0.08)
+                ? Color(nsColor: .textBackgroundColor)
+                : Color(nsColor: .controlBackgroundColor)
         )
         .clipShape(RoundedRectangle(cornerRadius: 10))
         .overlay(

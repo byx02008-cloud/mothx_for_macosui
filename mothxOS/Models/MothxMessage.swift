@@ -89,6 +89,141 @@ struct MothxImagePreview: Identifiable, Hashable {
 }
 
 
+/// A locally generated document that can be previewed by macOS Quick Look.
+/// Office formats are intentionally handled by Quick Look instead of trying
+/// to parse their container formats in the client, which keeps PPT/PDF/Word/
+/// Excel previews faithful to the files that were actually generated.
+struct MothxDocumentPreview: Identifiable, Hashable {
+    let id: String
+    let source: String
+    let mediaType: String
+    let name: String?
+
+    static let supportedExtensions: Set<String> = [
+        "pdf", "ppt", "pptx", "key",
+        "doc", "docx", "pages",
+        "xls", "xlsx", "numbers", "csv"
+    ]
+
+    static func mediaType(for url: URL) -> String {
+        switch url.pathExtension.lowercased() {
+        case "pdf": return "application/pdf"
+        case "ppt": return "application/vnd.ms-powerpoint"
+        case "pptx": return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        case "doc": return "application/msword"
+        case "docx": return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        case "xls": return "application/vnd.ms-excel"
+        case "xlsx": return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        case "key": return "application/vnd.apple.keynote"
+        case "pages": return "application/vnd.apple.pages"
+        case "numbers": return "application/vnd.apple.numbers"
+        case "csv": return "text/csv"
+        default: return "application/octet-stream"
+        }
+    }
+
+    static func localPreview(
+        source: String,
+        workDirectory: String,
+        id: String,
+        name: String? = nil
+    ) -> MothxDocumentPreview? {
+        let cleaned = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty,
+              let url = MothxImagePreview.resolvedFileURL(for: cleaned, workDirectory: workDirectory),
+              supportedExtensions.contains(url.pathExtension.lowercased()) else {
+            return nil
+        }
+        return MothxDocumentPreview(
+            id: id,
+            source: url.path,
+            mediaType: mediaType(for: url),
+            name: name?.isEmpty == false ? name : url.lastPathComponent
+        )
+    }
+
+    /// Extracts locally published document files from publish output and
+    /// `publish_artifact path` references in assistant/tool text. The PPT
+    /// generator prints `PPT_PATH: /path/with spaces/file.pptx`, so this
+    /// parser deliberately supports spaces and non-ASCII characters in paths.
+    static func publishArtifactPreviews(from text: String, workDirectory: String) -> [MothxDocumentPreview] {
+        let patterns = [
+            #"(?im)^\s*(?:PPT_PATH|PDF_PATH|DOC(?:X)?_PATH|XLS(?:X)?_PATH|FILE_PATH|OUTPUT_PATH)\s*:\s*(.+?)\s*$"#,
+            #"(?im)^\s*publish_artifact\s+(?:\"([^\"]+)\"|'([^']+)'|`([^`]+)`|(.+?))\s*$"#,
+            #"(?i)((?:file://)?(?:/|\.{1,2}/)[^\r\n]*?\.(?:pdf|ppt|pptx|key|doc|docx|pages|xls|xlsx|numbers|csv))(?![A-Za-z0-9_-])"#,
+            // Final answers often show a directory once and then list only
+            // backtick-quoted filenames, e.g. `报告.pdf`. Resolve those
+            // filenames against the session/project work directory below.
+            #"(?i)[`\"']([^`\"'\r\n]+\.(?:pdf|ppt|pptx|key|doc|docx|pages|xls|xlsx|numbers|csv))[`\"']"#,
+            // Also accept unquoted filenames in Markdown tables or shell
+            // output. The file-exists check in localPreview prevents prose
+            // such as “document.pdf” from becoming a false preview.
+            #"(?i)(?<![A-Za-z0-9._/])([^\s|`\"'][^\r\n|`\"']*?\.(?:pdf|ppt|pptx|key|doc|docx|pages|xls|xlsx|numbers|csv))(?![A-Za-z0-9_-])"#,
+            #"(?i)(?<![A-Za-z0-9._-])((?:/|\.{1,2}/)?[A-Za-z0-9][A-Za-z0-9_./+%~\-]*\.(?:pdf|ppt|pptx|key|doc|docx|pages|xls|xlsx|numbers|csv))(?![A-Za-z0-9_-])"#
+        ]
+        var sources: [String] = []
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(text.startIndex..., in: text)
+            for match in regex.matches(in: text, range: range) {
+                var raw: String?
+                if match.numberOfRanges == 2 {
+                    raw = Range(match.range(at: 1), in: text).map { String(text[$0]) }
+                } else {
+                    for group in 1..<match.numberOfRanges {
+                        if let range = Range(match.range(at: group), in: text) {
+                            raw = String(text[range])
+                            break
+                        }
+                    }
+                }
+                guard var raw else { continue }
+                raw = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                while let first = raw.first, ["\"", "'", "`"].contains(String(first)) {
+                    raw.removeFirst()
+                }
+                while let last = raw.last, ["\"", "'", ",", ")", "]", "}", "`", "."].contains(String(last)) {
+                    raw.removeLast()
+                }
+                if !raw.isEmpty { sources.append(raw) }
+            }
+        }
+        var previews: [MothxDocumentPreview] = []
+        var seen = Set<String>()
+        for (index, source) in sources.enumerated() {
+            guard let preview = localPreview(
+                source: source,
+                workDirectory: workDirectory,
+                id: "document-artifact-\(index)-\(UUID().uuidString)"
+            ), seen.insert(preview.source).inserted else { continue }
+            previews.append(preview)
+        }
+        return previews
+    }
+
+    /// Extracts a document path from a structured `publish_artifact` call.
+    static func publishArtifactPreviews(toolName: String?, arguments: String, workDirectory: String) -> [MothxDocumentPreview] {
+        guard toolName?.lowercased() == "publish_artifact",
+              let data = arguments.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return []
+        }
+        let candidateKeys = ["path", "file", "filePath", "file_path", "downloadedPath", "downloaded_path", "url"]
+        for key in candidateKeys {
+            guard let path = object[key] as? String, !path.isEmpty,
+                  let preview = localPreview(
+                      source: path,
+                      workDirectory: workDirectory,
+                      id: "document-artifact-argument-\(UUID().uuidString)",
+                      name: object["filename"] as? String ?? object["name"] as? String
+                  ) else { continue }
+            return [preview]
+        }
+        return []
+    }
+}
+
+
 /// A locally generated or downloaded video file that can be previewed in the
 /// conversation's right sidebar.
 struct MothxVideoPreview: Identifiable, Hashable {
@@ -211,8 +346,9 @@ nonisolated struct MothxMessage: Identifiable, Hashable {
     let createdAt: String?
     let imagePreviews: [MothxImagePreview]
     let videoPreviews: [MothxVideoPreview]
+    let documentPreviews: [MothxDocumentPreview]
 
-    init(id: String, seq: Int?, role: String, content: String, toolCallId: String?, toolName: String?, arguments: String, plan: MothxPlan?, summary: String?, hasDetail: Bool, createdAt: String?, imagePreviews: [MothxImagePreview] = [], videoPreviews: [MothxVideoPreview] = []) {
+    init(id: String, seq: Int?, role: String, content: String, toolCallId: String?, toolName: String?, arguments: String, plan: MothxPlan?, summary: String?, hasDetail: Bool, createdAt: String?, imagePreviews: [MothxImagePreview] = [], videoPreviews: [MothxVideoPreview] = [], documentPreviews: [MothxDocumentPreview] = []) {
         self.id = id
         self.seq = seq
         self.role = role
@@ -226,6 +362,7 @@ nonisolated struct MothxMessage: Identifiable, Hashable {
         self.createdAt = createdAt
         self.imagePreviews = imagePreviews
         self.videoPreviews = videoPreviews
+        self.documentPreviews = documentPreviews
     }
 
     var isUser: Bool { role == "user" }

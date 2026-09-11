@@ -43,6 +43,7 @@ struct WorkspaceView: View {
     @State private var previewedTool: ToolInvocationSummary?
     @State private var previewedImage: MothxImagePreview?
     @State private var previewedVideo: MothxVideoPreview?
+    @State private var previewedDocument: MothxDocumentPreview?
     @State private var reviewSidebarWidth: CGFloat = 420
     /// Remembers the sidebar width when a resize drag starts so the new width
     /// is derived from the pre-drag value rather than the previous frame.
@@ -159,7 +160,8 @@ struct WorkspaceView: View {
                                         onPreviewSkill: presentSkillPreview,
                                         onPreviewTool: presentToolPreview,
                                         onPreviewImage: presentImagePreview,
-                                        onPreviewVideo: presentVideoPreview
+                                        onPreviewVideo: presentVideoPreview,
+                                        onPreviewDocument: presentDocumentPreview
                                     )
                                 }
 
@@ -179,6 +181,12 @@ struct WorkspaceView: View {
                                     )
                                 }
 
+                                // Keep a deliberate breathing space between the
+                                // last message and the composer. Put the scroll
+                                // anchor after the spacer so scrollTo really lands
+                                // on the native bottom instead of stopping above it.
+                                Color.clear
+                                    .frame(height: 140)
                                 Color.clear
                                     .frame(height: 1)
                                     .id(conversationBottomID)
@@ -297,7 +305,16 @@ struct WorkspaceView: View {
                         .overlay(alignment: .bottom) {
                             if !isConversationAtBottom {
                                 ConversationScrollButton(isRunning: mothx.runSessionID == sessionID && mothx.isRunning) {
+                                    // Hide immediately for an explicit user
+                                    // request. The observer will turn it back
+                                    // on if layout growth leaves us more than
+                                    // 50pt from the actual document bottom.
+                                    isConversationAtBottom = true
                                     scrollToBottom(reader, animated: true)
+                                    // Also ask the AppKit observer to settle at
+                                    // the actual document bottom after SwiftUI
+                                    // finishes the animated layout pass.
+                                    requestScrollToBottom()
                                 }
                                 .padding(.bottom, 12)
                             }
@@ -597,13 +614,14 @@ struct WorkspaceView: View {
 
     private func toggleRightSidebar() {
         withAnimation(.easeInOut(duration: 0.22)) {
-            if reviewedChanges != nil || previewedSkill != nil || previewedTool != nil || previewedImage != nil || previewedVideo != nil {
+            if reviewedChanges != nil || previewedSkill != nil || previewedTool != nil || previewedImage != nil || previewedVideo != nil || previewedDocument != nil {
                 reviewedChanges = nil
                 showEmptyPreviewSidebar = false
                 previewedSkill = nil
                 previewedTool = nil
                 previewedImage = nil
                 previewedVideo = nil
+                previewedDocument = nil
                 return
             }
             guard let sessionID,
@@ -625,6 +643,7 @@ struct WorkspaceView: View {
             previewedTool = nil
             previewedImage = nil
             previewedVideo = nil
+            previewedDocument = nil
             reviewedChanges = changes
         }
         // Warm the cache for this turn immediately even before the sidebar
@@ -674,6 +693,7 @@ struct WorkspaceView: View {
             previewedTool = nil
             previewedImage = nil
             previewedVideo = nil
+            previewedDocument = nil
             reviewedChanges = nil
         }
     }
@@ -686,6 +706,7 @@ struct WorkspaceView: View {
             previewedSkill = nil
             previewedImage = nil
             previewedVideo = nil
+            previewedDocument = nil
             reviewedChanges = nil
         }
     }
@@ -698,6 +719,7 @@ struct WorkspaceView: View {
             previewedVideo = nil
             previewedTool = nil
             previewedSkill = nil
+            previewedDocument = nil
             reviewedChanges = nil
         }
     }
@@ -708,6 +730,20 @@ struct WorkspaceView: View {
             showEmptyPreviewSidebar = false
             previewedVideo = video
             previewedImage = nil
+            previewedTool = nil
+            previewedSkill = nil
+            previewedDocument = nil
+            reviewedChanges = nil
+        }
+    }
+
+    private func presentDocumentPreview(_ document: MothxDocumentPreview) {
+        withAnimation(.easeInOut(duration: 0.22)) {
+            conversationWasAtBottomBeforeReview = isConversationAtBottom
+            showEmptyPreviewSidebar = false
+            previewedDocument = document
+            previewedImage = nil
+            previewedVideo = nil
             previewedTool = nil
             previewedSkill = nil
             reviewedChanges = nil
@@ -722,6 +758,7 @@ struct WorkspaceView: View {
             previewedTool = nil
             previewedImage = nil
             previewedVideo = nil
+            previewedDocument = nil
         }
     }
 
@@ -742,7 +779,7 @@ struct WorkspaceView: View {
     }
 
     private var isRightSidebarOpen: Bool {
-        showEmptyPreviewSidebar || reviewedChanges != nil || previewedSkill != nil || previewedTool != nil || previewedImage != nil || previewedVideo != nil
+        showEmptyPreviewSidebar || reviewedChanges != nil || previewedSkill != nil || previewedTool != nil || previewedImage != nil || previewedVideo != nil || previewedDocument != nil
     }
 
     /// The review/preview panel currently shown. Mutators keep these states
@@ -767,6 +804,10 @@ struct WorkspaceView: View {
             }
         } else if let previewedVideo {
             VideoPreviewSidebar(video: previewedVideo) {
+                closeRightSidebar()
+            }
+        } else if let previewedDocument {
+            DocumentPreviewSidebar(document: previewedDocument) {
                 closeRightSidebar()
             }
         } else if showEmptyPreviewSidebar {
@@ -1967,6 +2008,11 @@ private struct ConversationScrollObserver: NSViewRepresentable {
         var scrollToBottomToken = 0
         var appliedScrollToBottomToken: Int?
         var lastBottomState: Bool?
+        /// Coalesces bounds notifications before publishing to SwiftUI. A
+        /// cancelled work item may already be executing, so the revision is
+        /// checked as well as cancelling it.
+        var bottomStateUpdateWorkItem: DispatchWorkItem?
+        var bottomStateRevision = 0
         weak var observedScrollView: NSScrollView?
         var boundsObserver: NSObjectProtocol?
         var documentFrameObserver: NSObjectProtocol?
@@ -2048,6 +2094,7 @@ private struct ConversationScrollObserver: NSViewRepresentable {
                 ) { [weak self] _ in
                     self?.scheduleScrollOffsetClamp()
                     self?.retryScrollToBottomIfNeeded()
+                    self?.updateBottomState()
                 }
                 self.documentBoundsObserver = NotificationCenter.default.addObserver(
                     forName: NSView.boundsDidChangeNotification,
@@ -2056,6 +2103,7 @@ private struct ConversationScrollObserver: NSViewRepresentable {
                 ) { [weak self] _ in
                     self?.scheduleScrollOffsetClamp()
                     self?.retryScrollToBottomIfNeeded()
+                    self?.updateBottomState()
                 }
             }
         }
@@ -2073,6 +2121,14 @@ private struct ConversationScrollObserver: NSViewRepresentable {
                   let documentView = scrollView.documentView else { return }
             let documentHeight = documentView.bounds.height
             guard documentHeight > lastScrollToBottomDocumentHeight + 10 else { return }
+            // Do not re-apply an old bottom request after the user has started
+            // reading earlier content. Streaming/layout notifications can
+            // continue for a few seconds after a click; only retry while the
+            // viewport is still within the 50pt bottom zone.
+            guard distanceToBottom() <= 50 else {
+                lastScrollToBottomTime = nil
+                return
+            }
             scrollToBottomNow()
         }
 
@@ -2146,32 +2202,63 @@ private struct ConversationScrollObserver: NSViewRepresentable {
             // bottom of the content is at maxY = height - clipHeight.
             let maxY = max(0, documentHeight - clipHeight)
             let currentY = clipView.bounds.origin.y
-            guard abs(currentY - maxY) > 0.5 else { return }
-            clipView.scroll(to: NSPoint(x: 0, y: maxY))
-            scrollView.reflectScrolledClipView(clipView)
+            if abs(currentY - maxY) > 0.5 {
+                clipView.scroll(to: NSPoint(x: 0, y: maxY))
+                scrollView.reflectScrolledClipView(clipView)
+            }
+            // Re-evaluate even when the clip view was already at maxY. This
+            // fixes the stale-button case where a prior bounds notification
+            // reported the old position and the next scroll request becomes a
+            // no-op.
+            updateBottomState()
             // Record when and at what height we scrolled so we can retry if
             // LazyVStack grows the document after this point.
             lastScrollToBottomTime = Date()
             lastScrollToBottomDocumentHeight = documentHeight
         }
 
-        func updateBottomState() {
+        func distanceToBottom() -> CGFloat {
             guard let scrollView = observedScrollView,
-                  let documentView = scrollView.documentView else { return }
-            // Convert the visible rect into document coordinates. Comparing
-            // contentView.bounds directly with documentView.bounds is wrong
-            // when the scroll view is flipped or has a non-zero origin.
+                  let documentView = scrollView.documentView else { return .greatestFiniteMagnitude }
+            // Convert the clip view bounds into document coordinates rather
+            // than comparing the two views' bounds directly. This works for
+            // the flipped hosting document used by SwiftUI.
             let visibleRect = documentView.convert(
                 scrollView.contentView.bounds,
                 from: scrollView.contentView
             )
-            let visibleBottom = visibleRect.maxY
-            let documentBottom = documentView.bounds.maxY
-            // Account for the bottom content inset and sub-pixel rounding.
-            let atBottom = documentBottom - visibleBottom <= 50
+            return max(0, documentView.bounds.maxY - visibleRect.maxY)
+        }
+
+        func updateBottomState() {
+            guard observedScrollView != nil,
+                  observedScrollView?.documentView != nil else { return }
+            let distanceToBottom = distanceToBottom()
+            // Show the button only when the viewport is more than 50pt away
+            // from the document bottom. At exactly 50pt it is considered at
+            // the bottom and the button stays hidden.
+            let atBottom = distanceToBottom <= 50
             guard lastBottomState != atBottom else { return }
             lastBottomState = atBottom
-            onBottomChanged(atBottom)
+
+            // Scroll notifications can arrive while SwiftUI is reconciling the
+            // NSViewRepresentable. Publishing the binding synchronously from
+            // that callback triggers “Modifying state during view update”.
+            // Defer and coalesce the state change onto a later main-queue turn.
+            bottomStateRevision &+= 1
+            let revision = bottomStateRevision
+            bottomStateUpdateWorkItem?.cancel()
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self,
+                      self.bottomStateRevision == revision else { return }
+                self.bottomStateUpdateWorkItem = nil
+                self.onBottomChanged(atBottom)
+            }
+            bottomStateUpdateWorkItem = workItem
+            // A tiny delay keeps this out of the current AppKit/SwiftUI
+            // layout transaction even when boundsDidChange is delivered while
+            // SwiftUI is updating the representable.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.01, execute: workItem)
         }
 
         static func findScrollView(from view: NSView) -> NSScrollView? {
@@ -2184,6 +2271,7 @@ private struct ConversationScrollObserver: NSViewRepresentable {
         }
 
         deinit {
+            bottomStateUpdateWorkItem?.cancel()
             if let boundsObserver {
                 NotificationCenter.default.removeObserver(boundsObserver)
             }
@@ -2228,10 +2316,10 @@ private struct ConversationScrollButton: View {
             }
         }
         .buttonStyle(.plain)
-        .frame(width: 44, height: 44)
+        .frame(width: 34, height: 34)
         .background(.regularMaterial, in: Circle())
         .overlay(Circle().stroke(Color.primary.opacity(0.12), lineWidth: 1))
-        .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+        .shadow(color: .black.opacity(0.12), radius: 5, y: 2)
         .help(isRunning ? languageStore.copy.scrollRunningHelp : languageStore.copy.scrollBottomHelp)
         .onAppear {
             if isRunning { animationPhase = true }
