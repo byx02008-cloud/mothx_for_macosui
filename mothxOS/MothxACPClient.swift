@@ -152,8 +152,8 @@ actor MothxACPClient {
         }
     }
 
-    func createSession(cwd: String) async throws -> String {
-        let result = try await request(method: "session/new", params: ["cwd": cwd, "mcpServers": []])
+    func createSession(cwd: String, mcpServers: [[String: Any]] = []) async throws -> String {
+        let result = try await request(method: "session/new", params: ["cwd": cwd, "mcpServers": mcpServers])
         guard let sessionID = result["sessionId"] as? String, !sessionID.isEmpty else {
             throw MothxACPError.invalidResponse("session/new omitted sessionId")
         }
@@ -162,9 +162,9 @@ actor MothxACPClient {
         return sessionID
     }
 
-    func resumeSession(id: String, cwd: String) async throws {
+    func resumeSession(id: String, cwd: String, mcpServers: [[String: Any]] = []) async throws {
         guard !loadedSessions.contains(id) else { return }
-        let result = try await request(method: "session/resume", params: ["sessionId": id, "cwd": cwd, "mcpServers": []])
+        let result = try await request(method: "session/resume", params: ["sessionId": id, "cwd": cwd, "mcpServers": mcpServers])
         loadedSessions.insert(id)
         sessionConfigs[id] = configValues(from: result)
     }

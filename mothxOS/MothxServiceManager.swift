@@ -204,6 +204,11 @@ final class MothxServiceManager: ObservableObject {
     @Published private(set) var imageGeneration = MothxImageGenerationConfig()
     @Published private(set) var imageRecognition = MothxImageRecognitionConfig()
     @Published private(set) var imageRecognitionProgress = MothxImageRecognitionProgress()
+    /// MCP servers managed through `GET/PUT /api/mcp` (the global `mcp.json`).
+    /// Serve sessions reload it themselves; ACP sessions receive the same list
+    /// so both transports share one source of truth.
+    @Published private(set) var mcpServers: [MothxMCPServer] = []
+    @Published var mcpError: String?
     @Published private(set) var projects: [MothxProject] = []
     @Published private(set) var sessions: [MothxSession] = []
     @Published private(set) var workspaceSyncState: WorkspaceSyncState = .pending
@@ -225,6 +230,7 @@ final class MothxServiceManager: ObservableObject {
     @Published private(set) var runReplyMessageID: String?
     @Published var settingsError: String?
     private var rawSettings: [String: Any] = [:]
+    private var mcpConfigLoaded = false
 
     /// Thinking text is transient UI state. Keep only the tail so a long run
     /// cannot grow an unbounded string while ACP or Serve streams deltas.
@@ -250,6 +256,7 @@ final class MothxServiceManager: ObservableObject {
     private static var cachedLoginShellEnvironment: [String: String]?
     private var startupOutput = ""
     private var logStreamTask: Task<Void, Never>?
+    private var logStreamToken: UUID?
     private var runtimeHeartbeatTask: Task<Void, Never>?
     private var runElapsedTask: Task<Void, Never>?
     private var logSocket: URLSessionWebSocketTask?
@@ -257,7 +264,9 @@ final class MothxServiceManager: ObservableObject {
     private var runExistingMessageIDs: Set<String> = []
     private var cancelRequested = false
     private var runEventTask: Task<Void, Never>?
+    private var runEventSocket: URLSessionWebSocketTask?
     private var runEventStreamSessionID: String?
+    private var runEventStreamToken: UUID?
     private var runEventLastSeq: Int = 0
     private var monitoredRunIDs: Set<String> = []
     private let acpClient = MothxACPClient()
@@ -265,10 +274,21 @@ final class MothxServiceManager: ObservableObject {
     private var acpToolInputs: [String: [String: Any]] = [:]
     private var acpToolNames: [String: String] = [:]
     private var acpDurableRunID: String?
-    private let changeStore = MothxChangeStore()
+    private let changeStore = LocalChangeStore()
     private var changeSaveGeneration = 0
     private var fileChangesByRun: [String: [String: MothxFileChange]] = [:]
     private var toolChangesByCall: [String: MothxToolChangeRecord] = [:]
+    /// Pre-edit file contents captured while a write-like tool is running,
+    /// keyed by `sessionID\u{0}toolCallID\u{0}relativePath`. mothx never returns
+    /// a before/after pair over Serve, so the client reads the file itself and
+    /// pairs this snapshot with the post-edit content when the tool finishes.
+    /// Entries are transient: they are consumed (or dropped on failure) as soon
+    /// as the tool reaches a terminal state.
+    private var pendingBeforeContents: [String: String] = [:]
+    /// `sessionID\u{0}toolCallID` keys whose server tool detail was already
+    /// fetched and folded into `toolChangesByCall`. Avoids repeating the
+    /// request on every rebuild for preview-only (Serve / new-file) changes.
+    private var resolvedToolChangeRecords: Set<String> = []
     @Published private(set) var currentRunID: String?
     @Published private(set) var sessionModels: [String: String] = [:]
     @Published private(set) var sessionProviders: [String: String] = [:]
@@ -503,16 +523,36 @@ final class MothxServiceManager: ObservableObject {
         logSocket?.cancel(with: .goingAway, reason: nil)
         serviceLog = ""
 
+        let streamToken = UUID()
+        logStreamToken = streamToken
         logStreamTask = Task { [weak self] in
             guard let self else { return }
+            defer {
+                Task { @MainActor in
+                    guard self.logStreamToken == streamToken else { return }
+                    self.logSocket = nil
+                    self.logStreamTask = nil
+                    self.logStreamToken = nil
+                }
+            }
             while !Task.isCancelled {
                 var request = URLRequest(url: URL(string: "ws://127.0.0.1:7872/ws/logs")!)
                 // mothx's WebSocket origin check rejects requests without a
                 // local WebUI origin, even though the service itself is local.
                 request.setValue("http://127.0.0.1:7872/", forHTTPHeaderField: "Origin")
                 let socket = URLSession.shared.webSocketTask(with: request)
+                let isCurrentStream = await MainActor.run {
+                    self.logStreamToken == streamToken
+                }
+                guard isCurrentStream else {
+                    socket.cancel(with: .goingAway, reason: nil)
+                    return
+                }
+                await MainActor.run {
+                    guard self.logStreamToken == streamToken else { return }
+                    self.logSocket = socket
+                }
                 socket.resume()
-                self.logSocket = socket
                 do {
                     while !Task.isCancelled {
                         let message = try await socket.receive()
@@ -525,7 +565,6 @@ final class MothxServiceManager: ObservableObject {
                 if Task.isCancelled { break }
                 try? await Task.sleep(for: .seconds(1))
             }
-            self.logSocket = nil
         }
     }
 
@@ -691,14 +730,33 @@ final class MothxServiceManager: ObservableObject {
         do {
             // MOTHX_API.md 3.2: the limit/offset form reads persisted sessions.
             var loadedSessions: [MothxSession] = []
+            var loadedSessionIDs = Set<String>()
             var offset = 0
-            while true {
+            var pageCount = 0
+            var paginationFinished = false
+            let maxSessionPages = 10_000
+            while pageCount < maxSessionPages {
                 let data = try await request(path: "api/sessions?limit=200&offset=\(offset)", method: "GET")
                 let page = decodeSessions(data)
-                loadedSessions.append(contentsOf: page)
+                let newSessions = page.filter { loadedSessionIDs.insert($0.id).inserted }
+
+                // A server that ignores offset can return the same full page
+                // forever. Stop before repeatedly appending duplicate sessions.
+                if !page.isEmpty && newSessions.isEmpty {
+                    throw WorkspaceError.sessionPaginationDidNotAdvance
+                }
+
+                loadedSessions.append(contentsOf: newSessions)
+                pageCount += 1
                 let total = decodeTotal(data)
-                if page.isEmpty || page.count < 200 || (total > 0 && loadedSessions.count >= total) { break }
+                if page.isEmpty || page.count < 200 || (total > 0 && loadedSessions.count >= total) {
+                    paginationFinished = true
+                    break
+                }
                 offset += page.count
+            }
+            if !paginationFinished {
+                throw WorkspaceError.sessionPaginationLimitExceeded
             }
             // Migrate the old desktop-only links once by projecting them into
             // mothx metadata. From this point on, the server response is the
@@ -1030,7 +1088,8 @@ final class MothxServiceManager: ObservableObject {
         }
         do {
             try await ensureACPClient(tools: [])
-            let sessionID = try await acpClient.createSession(cwd: project.workDir)
+            await ensureMCPConfigLoaded()
+            let sessionID = try await acpClient.createSession(cwd: project.workDir, mcpServers: mcpServersForACP)
             let session = MothxSession(
                 id: sessionID,
                 title: "New session",
@@ -1151,14 +1210,34 @@ final class MothxServiceManager: ObservableObject {
         metricsBySession[sessionID] ?? MothxSessionMetrics()
     }
 
+    /// - Parameter suppressChangeRebuild: Set by a polling Run for its own
+    ///   session even after `runSessionID` has followed the user to another
+    ///   conversation. Without it the change rebuild would re-run on every
+    ///   ~500ms tick for a background session, repeating tool-detail requests.
+    ///   The rebuild still runs on session load and at Run completion.
     @discardableResult
-    func loadMessages(sessionID: String) async -> [MothxMessage] {
+    func loadMessages(sessionID: String, suppressChangeRebuild: Bool = false) async -> [MothxMessage] {
         let started = Date()
         recordRuntimeLog("messages", "load start session=\(sessionID)")
         do {
             let data = try await request(path: "api/sessions/\(sessionID)/messages?limit=200", method: "GET")
-            let messages = decodeMessages(data, sessionID: sessionID)
-            recordRuntimeLog("messages", "load complete session=\(sessionID) count=\(messages.count) bytes=\(data.count) elapsedMs=\(Int(Date().timeIntervalSince(started) * 1000))")
+            // `limit=200` is a bounded *tail* window (`hasMore` marks it as a
+            // partial page), not the whole history. Keep the window itself for
+            // run correlation and only widen it when a turn anchor is missing.
+            let snapshot = decodeMessages(data, sessionID: sessionID)
+            var windowHasMore = decodeMessagesHasMore(data)
+            recordRuntimeLog("messages", "load complete session=\(sessionID) count=\(snapshot.count) hasMore=\(windowHasMore) bytes=\(data.count) elapsedMs=\(Int(Date().timeIntervalSince(started) * 1000))")
+            let previousMessages = messagesBySession[sessionID] ?? []
+            var messages = snapshot
+            // On a fresh load the tail window can start mid-turn and omit the
+            // user message that anchors it. `computeTurns()` keys every turn on
+            // a user message, so such a window renders zero turns and the
+            // conversation opens blank. Page backwards until at least the
+            // nearest user anchor is included.
+            if previousMessages.isEmpty, windowHasMore, !messages.contains(where: { $0.isUser }) {
+                messages = await extendWindowToUserAnchor(messages, sessionID: sessionID, hasMore: &windowHasMore)
+                recordRuntimeLog("messages", "window extended session=\(sessionID) count=\(messages.count) anchored=\(messages.contains(where: { $0.isUser }))")
+            }
             // While this session's run is streaming, the HTTP message list is
             // only a checkpoint: it can lag the WS/ACP stream (missing the
             // in-progress assistant reply or even the current user anchor).
@@ -1169,9 +1248,21 @@ final class MothxServiceManager: ObservableObject {
             // returns the same checkpoint. Merge the checkpoint into the live
             // projection instead; replace outright only when the run is
             // terminal or the session is otherwise idle.
-            let previousMessages = messagesBySession[sessionID] ?? []
             let runIsActiveForSession = runSessionID == sessionID && isRunning
-            let resolvedMessages = runIsActiveForSession
+            // A Run reaching a terminal state triggers one more refresh whose
+            // bounded tail window may no longer contain the user message that
+            // anchors the visible turns. Replacing the projection with it drops
+            // every turn at once and the conversation goes blank right after
+            // the Run finishes. When the incoming window lost an anchor the
+            // client already holds, merge so the turn structure survives.
+            let snapshotDropsAnchor = !previousMessages.isEmpty
+                && previousMessages.contains(where: { $0.isUser })
+                && !messages.contains(where: { $0.isUser })
+                && (windowHasMore || messages.count < previousMessages.count)
+            if snapshotDropsAnchor {
+                recordRuntimeLog("messages", "anchor preserved session=\(sessionID) previous=\(previousMessages.count) window=\(messages.count) hasMore=\(windowHasMore)")
+            }
+            let resolvedMessages = (runIsActiveForSession || snapshotDropsAnchor)
                 ? mergedLiveMessages(existing: previousMessages, snapshot: messages)
                 : messages
             if messagesBySession[sessionID] != resolvedMessages {
@@ -1182,13 +1273,14 @@ final class MothxServiceManager: ObservableObject {
             // only needed for already-loaded history; skip them while the run
             // is live (pollRun calls this every ~500ms) unless this is a fresh
             // load of a session that already has an active run.
-            if !runIsActiveForSession || previousMessages.isEmpty {
+            let skipRebuild = suppressChangeRebuild || (runIsActiveForSession && !previousMessages.isEmpty)
+            if !skipRebuild {
                 await loadHistoricalRuns(sessionID: sessionID, messages: resolvedMessages)
                 await rebuildHistoricalChanges(sessionID: sessionID, messages: resolvedMessages)
             }
             startRunEventStream(sessionID: sessionID)
             if sessionID == runSessionID {
-                runReplyMessageID = messages.first { message in
+                runReplyMessageID = snapshot.first { message in
                     message.role != "user" && !runExistingMessageIDs.contains(message.id)
                 }?.id
             }
@@ -1196,12 +1288,12 @@ final class MothxServiceManager: ObservableObject {
             // plan after the server has reported a terminal Run state.
             let terminalStatuses = ["completed", "succeeded", "failed", "error", "cancelled", "canceled", "timed_out", "timeout", "expired", "incomplete"]
             if sessionID == runSessionID, isRunning, !terminalStatuses.contains((runStatus ?? "").lowercased()),
-               let plan = messages.last(where: { $0.isPlan && !runExistingMessageIDs.contains($0.id) })?.plan {
+               let plan = snapshot.last(where: { $0.isPlan && !runExistingMessageIDs.contains($0.id) })?.plan {
                 currentPlan = plan
             } else if sessionID == runSessionID, terminalStatuses.contains((runStatus ?? "").lowercased()) {
                 currentPlan = nil
             }
-            return messages
+            return snapshot
         } catch {
             recordRuntimeLog("messages", "load failed session=\(sessionID) elapsedMs=\(Int(Date().timeIntervalSince(started) * 1000)) error=\(describe(error))")
             settingsError = copy.loadMessagesFailedPrefix(describe(error))
@@ -1271,6 +1363,45 @@ final class MothxServiceManager: ObservableObject {
             }
         }
         return order.compactMap { byID[$0] }
+    }
+
+    /// `GET /api/sessions/{id}/messages` answers with `{messages, hasMore}`.
+    /// `hasMore` marks the response as a bounded tail window rather than the
+    /// full history.
+    private func decodeMessagesHasMore(_ data: Data) -> Bool {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        return object["hasMore"] as? Bool ?? false
+    }
+
+    /// Pages backwards from a bounded tail window until it contains at least
+    /// the nearest user message, i.e. a turn anchor `computeTurns()` can use.
+    /// Without this a fresh open of a very long session renders the window as
+    /// zero turns and the conversation appears empty. Bounded so a session that
+    /// spans thousands of messages cannot turn opening it into an unbounded
+    /// history download.
+    private func extendWindowToUserAnchor(_ messages: [MothxMessage], sessionID: String, hasMore: inout Bool) async -> [MothxMessage] {
+        var combined = messages
+        var more = hasMore
+        var pages = 0
+        let maxOlderPages = 4
+        while more, pages < maxOlderPages, !combined.contains(where: { $0.isUser }) {
+            guard let firstSeq = combined.first?.seq else { break }
+            do {
+                let data = try await request(path: "api/sessions/\(sessionID)/messages?before=\(firstSeq)&limit=200", method: "GET")
+                let older = decodeMessages(data, sessionID: sessionID)
+                more = decodeMessagesHasMore(data)
+                let known = Set(combined.map(\.id))
+                let extra = older.filter { !known.contains($0.id) }
+                if extra.isEmpty { break }
+                combined = extra + combined
+                pages += 1
+            } catch {
+                recordRuntimeLog("messages", "window extend failed session=\(sessionID) error=\(describe(error))")
+                break
+            }
+        }
+        hasMore = more
+        return combined
     }
 
     /// Loads one tool result only when the user opens its process page. The
@@ -1409,7 +1540,8 @@ final class MothxServiceManager: ObservableObject {
                 "acp",
                 "resume start session=\(sessionID) cwd=\(cwd) localMessages=\((messagesBySession[sessionID] ?? []).count)"
             )
-            try await acpClient.resumeSession(id: sessionID, cwd: cwd)
+            await ensureMCPConfigLoaded()
+            try await acpClient.resumeSession(id: sessionID, cwd: cwd, mcpServers: mcpServersForACP)
             recordRuntimeLog(
                 "acp",
                 "resume complete session=\(sessionID) localMessages=\((messagesBySession[sessionID] ?? []).count)"
@@ -1452,6 +1584,7 @@ final class MothxServiceManager: ObservableObject {
                 runStatus = "incomplete"
                 runError = copy.text("ACP 运行未完整结束：\(stopReason)", "ACP run ended incompletely: \(stopReason)")
             }
+            await finalizeRunChanges(sessionID: sessionID)
             return runID
         } catch {
             runElapsed = elapsedSinceRunStart()
@@ -1467,6 +1600,7 @@ final class MothxServiceManager: ObservableObject {
                 settingsError = copy.text("ACP 运行失败：\(describe(error))", "ACP run failed: \(describe(error))")
             }
             recordRuntimeLog("acp", "run failed session=\(sessionID) error=\(describe(error))")
+            await finalizeRunChanges(sessionID: sessionID)
             return nil
         }
     }
@@ -1621,6 +1755,14 @@ final class MothxServiceManager: ObservableObject {
         upsertACPToolCall(sessionID: sessionID, update: update)
         let status = (update["status"] as? String ?? "").lowercased()
         let text = acpToolOutputText(update)
+        // ACP announces a tool call before it executes. Snapshot the target file
+        // now so a change can still be reviewed when the completion update omits
+        // the structured oldText/newText pair.
+        if !["completed", "failed", "cancelled", "canceled"].contains(status),
+           let path = toolPath(from: acpToolInputs[callID] ?? [:]),
+           let target = captureTarget(path, sessionID: sessionID) {
+            await capturePendingBefore(sessionID: sessionID, toolCallID: callID, path: target.relativePath, url: target.url)
+        }
         if ["completed", "failed"].contains(status) || !text.isEmpty {
             let resultID = "acp-result-\(callID)"
             let bounded = await Task.detached(priority: .userInitiated) { Self.boundedToolDetail(text) }.value
@@ -1655,12 +1797,41 @@ final class MothxServiceManager: ObservableObject {
                   let target = captureTarget(rawPath, sessionID: sessionID) else { continue }
             if let oldText = content["oldText"] as? String,
                let newText = content["newText"] as? String {
+                pendingBeforeContents.removeValue(forKey: pendingBeforeKey(sessionID: sessionID, toolCallID: toolCallID, path: target.relativePath))
                 pending.append((target.relativePath, oldText, newText, nil))
+            } else if ["completed", "failed", "cancelled", "canceled"].contains((update["status"] as? String ?? "").lowercased()),
+                      let localPair = await localBeforeAfter(sessionID: sessionID, toolCallID: toolCallID, path: target.relativePath, url: target.url) {
+                // No authoritative pair in the ACP content block; fall back to the
+                // before/after the client captured around the tool call.
+                pending.append((target.relativePath, localPair.oldText, localPair.newText, nil))
             } else {
+                // A newly created file arrives with `oldText: null` (mothx
+                // encodes it explicitly). There is no before/after pair to
+                // review, but the written content is still authoritative for the
+                // added-line count. Fall back to the tool output's `Diff: +N -M`
+                // summary so the live card matches a history reload instead of
+                // always reporting +0 -0.
+                let newText = content["newText"] as? String
+                let isCreation = newText != nil && !(content["oldText"] is String)
                 let preview = summary.isEmpty
                     ? copy.text("ACP 返回了文件变更，但缺少完整的 oldText/newText。", "ACP returned a file change without a complete oldText/newText pair.")
                     : summary
-                pending.append((target.relativePath, nil, nil, MothxFileChange(previewPath: target.relativePath, unifiedDiff: preview, added: 0, deleted: 0)))
+                var counts = Self.historicalDiffCounts(summary) ?? (0, 0)
+                if counts == (0, 0), let newText, isCreation, !newText.isEmpty {
+                    counts = (Self.lineCount(newText), 0)
+                }
+                pending.append((
+                    target.relativePath,
+                    nil,
+                    nil,
+                    MothxFileChange(
+                        previewPath: target.relativePath,
+                        unifiedDiff: preview,
+                        added: counts.0,
+                        deleted: counts.1,
+                        kind: isCreation ? .created : .modified
+                    )
+                ))
             }
         }
         guard !pending.isEmpty else { return }
@@ -2277,7 +2448,7 @@ final class MothxServiceManager: ObservableObject {
                 if let usage = await latestRunUsage(sessionID: sessionID, runID: runID) {
                     updateRunCacheHitRate(from: usage)
                 }
-                let messages = await loadMessages(sessionID: sessionID)
+                let messages = await loadMessages(sessionID: sessionID, suppressChangeRebuild: true)
                 // Track current running message for typewriter effect
                 if let replyID = runReplyMessageID {
                     currentRunningMessageID = replyID
@@ -2291,6 +2462,7 @@ final class MothxServiceManager: ObservableObject {
                     if ["failed", "error", "timed_out", "timeout", "expired", "incomplete"].contains(status.lowercased()) {
                         runError = object["error"] as? String ?? object["errorMessage"] as? String ?? (status.lowercased() == "incomplete" ? copy.runFailedFallback : copy.waitReplyTimeout)
                     }
+                    await finalizeRunChanges(sessionID: sessionID)
                     await loadWorkspace()
                     return
                 }
@@ -2566,8 +2738,6 @@ final class MothxServiceManager: ObservableObject {
               isWriteLikeTool(tool) else { return }
 
         let status = ((data["status"] as? String) ?? (data["state"] as? String) ?? "").lowercased()
-        guard ["completed", "succeeded", "success", "done"].contains(status) else { return }
-
         let args = toolArguments(from: data) ?? [:]
         let diff = (data["diff"] as? [String: Any])
             ?? (data["toolDiff"] as? [String: Any])
@@ -2575,27 +2745,102 @@ final class MothxServiceManager: ObservableObject {
         guard let rawPath = toolPath(from: diff ?? [:]) ?? toolPath(from: args),
               let target = captureTarget(rawPath, sessionID: sessionID) else { return }
         let toolCallID = (data["toolCallId"] as? String) ?? (data["tool_call_id"] as? String)
-        guard let pair = serverBeforeAfter(from: data) else {
-            let summary = data["summary"] as? String ?? ""
-            let counts = serverDiffCounts(from: data) ?? Self.historicalDiffCounts(summary) ?? (0, 0)
-            await mergeServerChange(
-                MothxFileChange(
-                    previewPath: target.relativePath,
-                    unifiedDiff: summary,
-                    added: counts.added,
-                    deleted: counts.deleted
-                ),
-                sessionID: sessionID, runID: runID, toolCallID: toolCallID
-            )
+
+        // Serve publishes a `running` tool event before the tool executes. Read
+        // the target file now so a reviewable before/after pair can be built at
+        // completion even though the server never returns oldText/newText.
+        if Self.runningToolStatuses.contains(status), let toolCallID {
+            await capturePendingBefore(sessionID: sessionID, toolCallID: toolCallID, path: target.relativePath, url: target.url)
             return
         }
-        // LCS diff construction over a large file runs off the main thread;
-        // the result is merged on MainActor when ready. The UI never blocks.
-        let relativePath = target.relativePath
-        let change = await Task.detached(priority: .userInitiated) {
-            MothxDiffBuilder.make(path: relativePath, oldText: pair.oldText, newText: pair.newText)
+
+        guard ["completed", "succeeded", "success", "done"].contains(status) else {
+            // Failed or cancelled writes produce no change; drop the snapshot so
+            // it cannot be paired with an unrelated later edit.
+            if let toolCallID {
+                pendingBeforeContents.removeValue(forKey: pendingBeforeKey(sessionID: sessionID, toolCallID: toolCallID, path: target.relativePath))
+            }
+            return
+        }
+
+        // A server-supplied pair always wins; the client-captured snapshot is
+        // only the fallback for tools whose result carries no before/after.
+        if let pair = serverBeforeAfter(from: data) {
+            if let toolCallID {
+                pendingBeforeContents.removeValue(forKey: pendingBeforeKey(sessionID: sessionID, toolCallID: toolCallID, path: target.relativePath))
+            }
+            let change = await Task.detached(priority: .userInitiated) {
+                MothxDiffBuilder.make(path: target.relativePath, oldText: pair.oldText, newText: pair.newText)
+            }.value
+            await mergeServerChange(change, sessionID: sessionID, runID: runID, toolCallID: toolCallID)
+            return
+        }
+
+        if let toolCallID,
+           let pair = await localBeforeAfter(sessionID: sessionID, toolCallID: toolCallID, path: target.relativePath, url: target.url) {
+            let change = await Task.detached(priority: .userInitiated) {
+                MothxDiffBuilder.make(path: target.relativePath, oldText: pair.oldText, newText: pair.newText)
+            }.value
+            await mergeServerChange(change, sessionID: sessionID, runID: runID, toolCallID: toolCallID)
+            return
+        }
+
+        let summary = data["summary"] as? String ?? ""
+        let counts = serverDiffCounts(from: data) ?? Self.historicalDiffCounts(summary) ?? (0, 0)
+        await mergeServerChange(
+            MothxFileChange(
+                previewPath: target.relativePath,
+                unifiedDiff: summary,
+                added: counts.added,
+                deleted: counts.deleted
+            ),
+            sessionID: sessionID, runID: runID, toolCallID: toolCallID
+        )
+    }
+
+    private static let runningToolStatuses: Set<String> = ["running", "pending", "in_progress", "started", "starting"]
+
+    private func pendingBeforeKey(sessionID: String, toolCallID: String, path: String) -> String {
+        "\(sessionID)\u{0}\(toolCallID)\u{0}\(path)"
+    }
+
+    /// Reads and remembers a write target's pre-edit content. `readEditableContent`
+    /// returns nil for unreadable or oversized files, in which case no snapshot
+    /// is kept and the review falls back to a preview. A missing file is a
+    /// legitimate empty snapshot (a create or delete).
+    private func capturePendingBefore(sessionID: String, toolCallID: String, path: String, url: URL) async {
+        guard !toolCallID.isEmpty else { return }
+        // A replayed `running` event after the tool already completed must not
+        // overwrite the real before snapshot with the post-edit file content.
+        if let existing = localChange(sessionID: sessionID, toolCallID: toolCallID, path: path), existing.isReviewable { return }
+        let key = pendingBeforeKey(sessionID: sessionID, toolCallID: toolCallID, path: path)
+        guard pendingBeforeContents[key] == nil else { return }
+        guard let content = await Self.readEditableContent(at: url) else { return }
+        pendingBeforeContents[key] = content
+    }
+
+    /// Consumes the pre-edit snapshot and pairs it with the file's current
+    /// content. Returns nil when no snapshot was captured for this tool call.
+    private func localBeforeAfter(sessionID: String, toolCallID: String, path: String, url: URL) async -> (oldText: String, newText: String)? {
+        let key = pendingBeforeKey(sessionID: sessionID, toolCallID: toolCallID, path: path)
+        guard let before = pendingBeforeContents.removeValue(forKey: key) else { return nil }
+        let after = await Self.readEditableContent(at: url) ?? ""
+        return (before, after)
+    }
+
+    /// Upper bound on a client-captured file snapshot. Bigger (or undecodable)
+    /// files are skipped so a multi-megabyte binary can never be pulled into the
+    /// change database; the review then falls back to a preview.
+    private static let maximumSnapshotBytes = 2 * 1024 * 1024
+
+    private nonisolated static func readEditableContent(at url: URL) async -> String? {
+        await Task.detached(priority: .userInitiated) {
+            let fileManager = FileManager.default
+            guard fileManager.fileExists(atPath: url.path) else { return "" }
+            let attributes = try? fileManager.attributesOfItem(atPath: url.path)
+            if let size = attributes?[.size] as? NSNumber, size.intValue > maximumSnapshotBytes { return nil }
+            return try? String(contentsOf: url, encoding: .utf8)
         }.value
-        await mergeServerChange(change, sessionID: sessionID, runID: runID, toolCallID: toolCallID)
     }
 
     /// Tool names have changed across mothx releases and adapters. The
@@ -2695,16 +2940,21 @@ final class MothxServiceManager: ObservableObject {
     }
 
     private func combinedServerChange(previous: MothxFileChange?, next: MothxFileChange) async -> MothxFileChange {
-        guard let previous,
-              let firstOldText = previous.oldText,
-              next.isReviewable,
-              let finalNewText = next.newText else {
-            return next
+        guard let previous else { return next }
+        if let firstOldText = previous.oldText,
+           next.isReviewable,
+           let finalNewText = next.newText {
+            let path = next.path
+            return await Task.detached(priority: .userInitiated) {
+                MothxDiffBuilder.make(path: path, oldText: firstOldText, newText: finalNewText)
+            }.value
         }
-        let path = next.path
-        return await Task.detached(priority: .userInitiated) {
-            MothxDiffBuilder.make(path: path, oldText: firstOldText, newText: finalNewText)
-        }.value
+        // A later preview-only event (for example a Serve tool summary that was
+        // truncated to its first line, or an ACP file creation without a pair)
+        // must never replace an already reviewable before/after. Keeping the
+        // richer entry also preserves its line statistics.
+        if previous.isReviewable, !next.isReviewable { return previous }
+        return next
     }
 
     private func captureTarget(_ rawPath: String, sessionID: String) -> (url: URL, relativePath: String)? {
@@ -2721,13 +2971,20 @@ final class MothxServiceManager: ObservableObject {
         workDir(for: sessionID)
     }
 
-    /// Rebuilds the change card for runs that happened while the app was
-    /// closed. Complete ACP captures come from the local tool-call store;
-    /// Server tool details remain the compatibility fallback for old turns.
+    /// Rebuilds the change card for every turn in a session from the
+    /// authoritative sources: the local ACP tool-call store when a complete
+    /// before/after pair was captured, otherwise the server tool detail (whose
+    /// `Diff: +N -M` summary is the same data a history reload shows).
+    ///
+    /// This runs on session load and again when a Run reaches a terminal state
+    /// (`finalizeRunChanges`), which is what keeps a finished turn's card
+    /// attached to its own user message instead of surfacing on whichever turn
+    /// happens to be last.
     private func rebuildHistoricalChanges(sessionID: String, messages: [MothxMessage]) async {
         guard let runMapping = historicalRunsByMessage[sessionID], !runMapping.isEmpty else { return }
         recordRuntimeLog("changes", "historical rebuild session=\(sessionID) runs=\(runMapping.count) messages=\(messages.count)")
-        changesByMessage[sessionID] = [:]
+        let previousBindings = changesByMessage[sessionID] ?? [:]
+        var rebuilt: [String: MothxTurnChanges] = [:]
         var currentUserID: String?
         var calls: [(MothxMessage, [String: Any], (url: URL, relativePath: String), MothxMessage?)] = []
         var resultsByCallID: [String: MothxMessage] = [:]
@@ -2746,11 +3003,17 @@ final class MothxServiceManager: ObservableObject {
                 let local = call.toolCallId.flatMap {
                     localChange(sessionID: sessionID, toolCallID: $0, path: target.relativePath)
                 }
+                let resolvedKey = call.toolCallId.map { toolChangeKey(sessionID: sessionID, toolCallID: $0) }
+                let alreadyResolved = resolvedKey.map { resolvedToolChangeRecords.contains($0) } ?? false
                 let change: MothxFileChange?
                 if let local, local.isReviewable {
                     // ACP is the authoritative source for complete before /
                     // after content. Server history is only a fallback for
                     // conversations that predate local ACP persistence.
+                    change = local
+                } else if let local, alreadyResolved {
+                    // The detail was already fetched for this call; reuse the
+                    // stored statistics instead of repeating the request.
                     change = local
                 } else {
                     let detail: MothxToolResultDetail?
@@ -2762,12 +3025,19 @@ final class MothxServiceManager: ObservableObject {
                     if !summary.contains("Diff:"), let detail {
                         summary = detail.content
                     }
-                    let targetCapture = target
+                    let relativePath = target.relativePath
                     change = await Task.detached(priority: .userInitiated) {
-                        Self.historicalChange(target: targetCapture, summary: summary, detail: detail)
+                        Self.historicalChange(relativePath: relativePath, summary: summary, detail: detail)
                     }.value
+                    if let change, let resolvedKey {
+                        resolvedToolChangeRecords.insert(resolvedKey)
+                        if let callID = call.toolCallId {
+                            upgradeToolChange(sessionID: sessionID, toolCallID: callID, change: change)
+                        }
+                    }
                 }
                 guard let change else { continue }
+                if let existing = files[change.path], existing.isReviewable, !change.isReviewable { continue }
                 files[change.path] = await combinedServerChange(previous: files[change.path], next: change)
             }
             guard !files.isEmpty else {
@@ -2786,7 +3056,7 @@ final class MothxServiceManager: ObservableObject {
             // Bind the reconstructed changes directly to the user message
             // that started this turn. This is stable even for legacy tui_*
             // runs without an intent ID or assistant result message.
-            changesByMessage[sessionID, default: [:]][currentUserID] = turnChanges
+            rebuilt[currentUserID] = turnChanges
             latestChangesBySession[sessionID] = turnChanges
             recordRuntimeLog("changes", "historical rebuild complete run=\(run.id) files=\(files.count)")
             calls.removeAll()
@@ -2817,19 +3087,62 @@ final class MothxServiceManager: ObservableObject {
             }
         }
         await flush()
+        // Preserve a live binding for any turn the rebuild could not resolve
+        // yet, so a card never disappears just because a later rebuild ran.
+        changesByMessage[sessionID] = previousBindings.merging(rebuilt) { _, new in new }
         persistChanges()
     }
 
-    private nonisolated static func historicalChange(target: (url: URL, relativePath: String), summary: String, detail: MothxToolResultDetail?) -> MothxFileChange? {
+    /// Re-derives this session's per-turn change cards once a Run is terminal.
+    ///
+    /// A live Run only records its changes against the active Run ID, so the
+    /// card would otherwise surface on whichever turn happens to be last, and a
+    /// Serve tool summary (the tool's first output line) carries no `Diff: +N -M`
+    /// at all. Rebuilding at completion binds each turn to its own user message
+    /// and resolves the real line statistics from the tool details — the same
+    /// data a history reload shows.
+    private func finalizeRunChanges(sessionID: String) async {
+        let messages = messagesBySession[sessionID] ?? []
+        guard !messages.isEmpty else { return }
+        // A run is terminal here, so no write tool can still be running: any
+        // pre-edit snapshot that was never paired with a completion belongs to
+        // an aborted or failed call and must not leak into a later edit.
+        prunePendingBefore(sessionID: sessionID)
+        await loadHistoricalRuns(sessionID: sessionID, messages: messages)
+        await rebuildHistoricalChanges(sessionID: sessionID, messages: messages)
+    }
+
+    private func prunePendingBefore(sessionID: String) {
+        let prefix = "\(sessionID)\u{0}"
+        pendingBeforeContents = pendingBeforeContents.filter { !$0.key.hasPrefix(prefix) }
+    }
+
+    /// Merges a server-resolved change back into the per-tool-call store so a
+    /// later rebuild can reuse it without another detail request. A reviewable
+    /// entry is never downgraded to a preview-only one.
+    private func upgradeToolChange(sessionID: String, toolCallID: String, change: MothxFileChange) {
+        let key = toolChangeKey(sessionID: sessionID, toolCallID: toolCallID)
+        var callFiles = Dictionary(uniqueKeysWithValues: (toolChangesByCall[key]?.files ?? []).map { ($0.path, $0) })
+        if let existing = callFiles[change.path], existing.isReviewable, !change.isReviewable { return }
+        callFiles[change.path] = change
+        toolChangesByCall[key] = MothxToolChangeRecord(
+            sessionID: sessionID,
+            toolCallID: toolCallID,
+            files: callFiles.values.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending },
+            capturedAt: Date()
+        )
+    }
+
+    private nonisolated static func historicalChange(relativePath: String, summary: String, detail: MothxToolResultDetail?) -> MothxFileChange? {
         guard detail?.isError != true else { return nil }
         if let oldText = detail?.oldText,
            let newText = detail?.newText {
-            return MothxDiffBuilder.make(path: target.relativePath, oldText: oldText, newText: newText)
+            return MothxDiffBuilder.make(path: relativePath, oldText: oldText, newText: newText)
         }
         guard detail != nil || !summary.isEmpty else { return nil }
         let counts = historicalDiffCounts(summary) ?? (0, 0)
         return MothxFileChange(
-            previewPath: target.relativePath,
+            previewPath: relativePath,
             unifiedDiff: summary,
             added: counts.added,
             deleted: counts.deleted
@@ -2847,6 +3160,16 @@ final class MothxServiceManager: ObservableObject {
         return (added, deleted)
     }
 
+    /// Counts content lines the same way `MothxDiffBuilder` does: split on `\n`
+    /// and drop a single trailing empty component from a terminal newline.
+    private nonisolated static func lineCount(_ value: String) -> Int {
+        let normalized = MothxDiffBuilder.normalizedNewlines(value)
+        guard !normalized.isEmpty else { return 0 }
+        var lines = normalized.split(separator: "\n", omittingEmptySubsequences: false).count
+        if normalized.hasSuffix("\n") { lines -= 1 }
+        return max(0, lines)
+    }
+
     /// UI fallback for historical turns. It is intentionally idempotent and
     /// scoped to one displayed turn, so a missing historical reconstruction
     /// cannot hide a Diff summary just because the app was restarted.
@@ -2862,21 +3185,27 @@ final class MothxServiceManager: ObservableObject {
                   let path = toolPath(from: args),
                   let target = captureTarget(path, sessionID: sessionID),
                   let callID = call.toolCallId else { continue }
+            let resolvedKey = toolChangeKey(sessionID: sessionID, toolCallID: callID)
             let change: MothxFileChange?
             if let local = localChange(sessionID: sessionID, toolCallID: callID, path: target.relativePath),
-               local.isReviewable {
+               local.isReviewable || resolvedToolChangeRecords.contains(resolvedKey) {
                 change = local
             } else if let detail = await loadToolResultDetail(sessionID: sessionID, toolCallID: callID) {
                 // Compatibility path for conversations created before ACP
                 // file changes were persisted locally.
-                let targetCapture = target
+                let relativePath = target.relativePath
                 change = await Task.detached(priority: .userInitiated) {
-                    Self.historicalChange(target: targetCapture, summary: detail.content, detail: detail)
+                    Self.historicalChange(relativePath: relativePath, summary: detail.content, detail: detail)
                 }.value
+                if let change {
+                    resolvedToolChangeRecords.insert(resolvedKey)
+                    upgradeToolChange(sessionID: sessionID, toolCallID: callID, change: change)
+                }
             } else {
                 change = nil
             }
             guard let change else { continue }
+            if let existing = files[change.path], existing.isReviewable, !change.isReviewable { continue }
             files[change.path] = await combinedServerChange(previous: files[change.path], next: change)
         }
         guard !files.isEmpty else { return }
@@ -3067,20 +3396,40 @@ final class MothxServiceManager: ObservableObject {
         // session; only (re)connect on session switch or genuine drop.
         if runEventStreamSessionID == sessionID, runEventTask != nil { return }
         runEventTask?.cancel()
+        runEventSocket?.cancel(with: .goingAway, reason: nil)
+        runEventTask = nil
+        runEventSocket = nil
         if runEventStreamSessionID != sessionID { runEventLastSeq = 0 }
         runEventStreamSessionID = sessionID
+        let streamToken = UUID()
+        runEventStreamToken = streamToken
         runEventTask = Task { [weak self] in
             guard let self else { return }
             defer {
                 Task { @MainActor in
-                    if self.runEventStreamSessionID == sessionID {
+                    if self.runEventStreamToken == streamToken {
                         self.runEventStreamSessionID = nil
+                        self.runEventSocket = nil
+                        self.runEventTask = nil
+                        self.runEventStreamToken = nil
                     }
                 }
             }
             var request = URLRequest(url: URL(string: "ws://127.0.0.1:7872/ws/runs")!)
             request.setValue("http://127.0.0.1:7872/", forHTTPHeaderField: "Origin")
             let socket = URLSession.shared.webSocketTask(with: request)
+            let isCurrentStream = await MainActor.run {
+                self.runEventStreamToken == streamToken
+                    && self.runEventStreamSessionID == sessionID
+            }
+            guard isCurrentStream else {
+                socket.cancel(with: .goingAway, reason: nil)
+                return
+            }
+            await MainActor.run {
+                guard self.runEventStreamToken == streamToken else { return }
+                self.runEventSocket = socket
+            }
             socket.resume()
             defer { socket.cancel(with: .goingAway, reason: nil) }
             do {
@@ -4139,6 +4488,116 @@ final class MothxServiceManager: ObservableObject {
         await saveGlobalSettings(["skillsDir": skillsDir, "sessionDir": sessionDir])
     }
 
+    // MARK: - MCP configuration
+
+    /// Loads the global MCP configuration (`GET /api/mcp`). The endpoint returns
+    /// `{}` when no `mcp.json` exists yet, which decodes to an empty list.
+    func loadMCPConfig() async {
+        guard state == .connected else { return }
+        do {
+            let data = try await request(path: "api/mcp", method: "GET")
+            let config = try JSONDecoder().decode(MothxMCPConfig.self, from: data)
+            mcpServers = config.mcpServers
+            mcpConfigLoaded = true
+            mcpError = nil
+        } catch {
+            mcpError = copy.text("读取 MCP 配置失败：\(describe(error))", "Failed to load MCP configuration: \(describe(error))")
+        }
+    }
+
+    /// Replaces the global MCP configuration (`PUT /api/mcp`). The server
+    /// normalizes entries (empty `type` becomes `stdio`) and returns the stored
+    /// document, which becomes the new source of truth.
+    @discardableResult
+    func saveMCPConfig(_ servers: [MothxMCPServer]) async -> Bool {
+        do {
+            let payload = try JSONEncoder().encode(MothxMCPConfig(mcpServers: servers))
+            let data = try await request(path: "api/mcp", method: "PUT", body: payload)
+            let config = try JSONDecoder().decode(MothxMCPConfig.self, from: data)
+            mcpServers = config.mcpServers
+            mcpConfigLoaded = true
+            mcpError = nil
+            return true
+        } catch {
+            mcpError = copy.text("保存 MCP 配置失败：\(describe(error))", "Failed to save MCP configuration: \(describe(error))")
+            return false
+        }
+    }
+
+    /// Fetches the MCP config once, so the ACP transport can pass it without
+    /// the Settings screen ever being opened.
+    private func ensureMCPConfigLoaded() async {
+        guard !mcpConfigLoaded else { return }
+        await loadMCPConfig()
+    }
+
+    /// MCP servers serialized to the JSON shape expected by ACP
+    /// `session/new` / `session/resume` (`mcpServers` array).
+    private var mcpServersForACP: [[String: Any]] {
+        guard let data = try? JSONEncoder().encode(mcpServers),
+              let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
+        return array
+    }
+
+    /// Searches the official MCP Registry (public endpoint, no auth). Results
+    /// are deduplicated by server name because the registry returns one row per
+    /// published version.
+    func searchMCPMarket(query: String, limit: Int = 30, cursor: String? = nil) async throws -> MothxMCPMarketResponse {
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = "registry.modelcontextprotocol.io"
+        components.path = "/v0/servers"
+        var items = [URLQueryItem(name: "limit", value: String(limit))]
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { items.append(URLQueryItem(name: "search", value: trimmed)) }
+        if let cursor, !cursor.isEmpty { items.append(URLQueryItem(name: "cursor", value: cursor)) }
+        components.queryItems = items
+        guard let url = components.url else { throw URLError(.badURL) }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 20
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        guard (200..<300).contains(http.statusCode) else {
+            throw MothxAPIError(statusCode: http.statusCode, detail: "MCP registry request failed")
+        }
+        var decoded = try JSONDecoder().decode(MothxMCPMarketResponse.self, from: data)
+        var seen = Set<String>()
+        decoded.servers = decoded.servers.filter { seen.insert($0.server.name).inserted }
+        return decoded
+    }
+
+    // MARK: - Project-level MCP
+
+    /// Finds a session whose workDir matches the project, used as the anchor for
+    /// reading/writing the project's `.mothx/mcp.json`. mothx exposes
+    /// project-scoped MCP config through a session in that directory.
+    func mcpAnchorSessionID(forProject projectID: String) -> String? {
+        guard let project = projects.first(where: { $0.id == projectID }) else { return nil }
+        let workDir = project.workDir.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !workDir.isEmpty,
+           let match = sessions.first(where: { ($0.workDir ?? "").trimmingCharacters(in: .whitespacesAndNewlines) == workDir }) {
+            return match.id
+        }
+        return sessions.first { $0.projectID == projectID }?.id
+    }
+
+    /// Loads a project's MCP configuration (`GET /api/sessions/{id}/mcp`).
+    func loadProjectMCPConfig(sessionID: String) async throws -> [MothxMCPServer] {
+        let data = try await request(path: "api/sessions/\(sessionID)/mcp", method: "GET")
+        return try JSONDecoder().decode(MothxMCPConfig.self, from: data).mcpServers
+    }
+
+    /// Replaces a project's MCP configuration
+    /// (`PUT /api/sessions/{id}/mcp`) and returns the stored document.
+    @discardableResult
+    func saveProjectMCPConfig(sessionID: String, servers: [MothxMCPServer]) async throws -> [MothxMCPServer] {
+        let payload = try JSONEncoder().encode(MothxMCPConfig(mcpServers: servers))
+        let data = try await request(path: "api/sessions/\(sessionID)/mcp", method: "PUT", body: payload)
+        return try JSONDecoder().decode(MothxMCPConfig.self, from: data).mcpServers
+    }
+
     func saveImageGeneration(_ config: MothxImageGenerationConfig) {
         imageGeneration = config
         persistImageGeneration(config)
@@ -4357,6 +4816,13 @@ final class MothxServiceManager: ObservableObject {
     func stopOwnedService() async {
         logStreamTask?.cancel()
         logSocket?.cancel(with: .goingAway, reason: nil)
+        logStreamToken = nil
+        runEventTask?.cancel()
+        runEventSocket?.cancel(with: .goingAway, reason: nil)
+        runEventTask = nil
+        runEventSocket = nil
+        runEventStreamSessionID = nil
+        runEventStreamToken = nil
         if let process, process.isRunning {
             process.terminate()
             for _ in 0..<20 where process.isRunning {
@@ -4598,7 +5064,19 @@ private enum ImageRecognitionError: LocalizedError {
 
 private enum WorkspaceError: LocalizedError {
     case projectResponseInvalid
-    var errorDescription: String? { "项目创建接口返回的数据无效" }
+    case sessionPaginationDidNotAdvance
+    case sessionPaginationLimitExceeded
+
+    var errorDescription: String? {
+        switch self {
+        case .projectResponseInvalid:
+            return "项目创建接口返回的数据无效"
+        case .sessionPaginationDidNotAdvance:
+            return "会话分页接口没有继续向前推进，已停止加载"
+        case .sessionPaginationLimitExceeded:
+            return "会话分页数量异常，已停止加载"
+        }
+    }
 }
 
 private enum SettingsLoadError: LocalizedError {

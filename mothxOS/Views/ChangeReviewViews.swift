@@ -50,6 +50,13 @@ struct ChangeSummaryCard: View {
     let onReview: () -> Void
     let onPreview: () -> Void
 
+    /// A turn can mix exact (before/after) diffs with preview-only summaries.
+    /// If any file only has an approximate server count, the aggregate cannot
+    /// be trusted, so it is suppressed instead of shown as if precise.
+    private var countsAreApproximate: Bool {
+        changes.files.contains { $0.countsAreApproximate }
+    }
+
     var body: some View {
         let c = languageStore.copy
         VStack(alignment: .leading, spacing: 0) {
@@ -82,11 +89,13 @@ struct ChangeSummaryCard: View {
                         .buttonStyle(.plain)
                         .foregroundStyle(.secondary)
                     }
-                    HStack(spacing: 5) {
-                        Text("+\(changes.added)").foregroundStyle(.green)
-                        Text("-\(changes.deleted)").foregroundStyle(.red)
-                    }
-                    .font(.system(size: 12, weight: .medium).monospacedDigit())
+                    DiffStatView(
+                        added: changes.added,
+                        deleted: changes.deleted,
+                        approximate: countsAreApproximate,
+                        font: .system(size: 12, weight: .medium).monospacedDigit(),
+                        unavailableLabel: c.text("行数不可用", "counts n/a")
+                    )
                 }
                 Spacer()
                 if changes.files.contains(where: \.isReviewable) {
@@ -110,10 +119,14 @@ struct ChangeSummaryCard: View {
                         .foregroundStyle(.primary)
                         .lineLimit(1)
                     Spacer(minLength: 10)
-                    Text("+\(file.added)").foregroundStyle(.green)
-                    Text("-\(file.deleted)").foregroundStyle(.red)
+                    DiffStatView(
+                        added: file.added,
+                        deleted: file.deleted,
+                        approximate: file.countsAreApproximate,
+                        font: .system(size: 12, weight: .medium).monospacedDigit(),
+                        unavailableLabel: c.text("行数不可用", "counts n/a")
+                    )
                 }
-                .font(.system(size: 12, weight: .medium).monospacedDigit())
                 .padding(.horizontal, 14)
                 .padding(.vertical, 6)
             }
@@ -140,7 +153,8 @@ struct DiffLine: Identifiable, Hashable {
 
 /// Turns a unified-diff string into colored lines.
 nonisolated private func makeDiffLines(_ unifiedDiff: String) -> [DiffLine] {
-    unifiedDiff.split(separator: "\n", omittingEmptySubsequences: false).enumerated().map { offset, raw in
+    MothxDiffBuilder.normalizedNewlines(unifiedDiff)
+        .split(separator: "\n", omittingEmptySubsequences: false).enumerated().map { offset, raw in
         let line = String(raw)
         let kind: DiffLineKind = line.hasPrefix("+ ") ? .added : (line.hasPrefix("- ") ? .deleted : .context)
         return DiffLine(index: offset, text: line, kind: kind)
@@ -150,8 +164,35 @@ nonisolated private func makeDiffLines(_ unifiedDiff: String) -> [DiffLine] {
 /// Turns a plain text blob into context lines (truncated before/after views
 /// and plain-text file previews).
 nonisolated private func makePlainLines(_ text: String) -> [DiffLine] {
-    text.split(separator: "\n", omittingEmptySubsequences: false).enumerated().map {
+    MothxDiffBuilder.normalizedNewlines(text)
+        .split(separator: "\n", omittingEmptySubsequences: false).enumerated().map {
         DiffLine(index: $0.offset, text: String($0.element), kind: .context)
+    }
+}
+
+/// Renders the green `+added` / red `-deleted` convention. When the counts are
+/// only a server-side approximation for a very large file (mothx reports the
+/// whole file as changed) or could not be resolved, they are suppressed rather
+/// than shown as if they were exact.
+private struct DiffStatView: View {
+    let added: Int
+    let deleted: Int
+    let approximate: Bool
+    let font: Font
+    let unavailableLabel: String
+
+    var body: some View {
+        if approximate {
+            Text(unavailableLabel)
+                .font(font)
+                .foregroundStyle(.tertiary)
+        } else {
+            HStack(spacing: 5) {
+                Text("+\(added)").foregroundStyle(.green)
+                Text("-\(deleted)").foregroundStyle(.red)
+            }
+            .font(font)
+        }
     }
 }
 
@@ -441,6 +482,7 @@ private nonisolated struct ReviewFileRow: Identifiable, Hashable {
     let deleted: Int
     let isReviewable: Bool
     let truncated: Bool
+    let countsAreApproximate: Bool
     var id: String { path }
 }
 
@@ -467,6 +509,11 @@ struct ChangeReviewSidebar: View {
         // at most four rows. List remains scrollable when there are more.
         let rowCount = min(max(rows?.count ?? 1, 1), 4)
         return CGFloat(rowCount) * 64 + 12
+    }
+
+    /// Suppress the aggregate when any file only has an approximate count.
+    private var countsAreApproximate: Bool {
+        rows?.contains { $0.countsAreApproximate } ?? changes.files.contains { $0.countsAreApproximate }
     }
 
     var body: some View {
@@ -498,9 +545,13 @@ struct ChangeReviewSidebar: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
-                Text("+\(changes.added)  -\(changes.deleted)")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                DiffStatView(
+                    added: changes.added,
+                    deleted: changes.deleted,
+                    approximate: countsAreApproximate,
+                    font: .caption.monospacedDigit(),
+                    unavailableLabel: c.text("行数不可用", "counts n/a")
+                )
             }
             .padding(.horizontal, 18)
             .padding(.vertical, 10)
@@ -511,10 +562,14 @@ struct ChangeReviewSidebar: View {
                         Text(file.path).lineLimit(1)
                         HStack(spacing: 6) {
                             Text(file.kind.label(using: c)).foregroundStyle(.secondary)
-                            Text("+\(file.added)").foregroundStyle(.green)
-                            Text("-\(file.deleted)").foregroundStyle(.red)
+                            DiffStatView(
+                                added: file.added,
+                                deleted: file.deleted,
+                                approximate: file.countsAreApproximate,
+                                font: .caption.monospacedDigit(),
+                                unavailableLabel: c.text("行数不可用", "counts n/a")
+                            )
                         }
-                        .font(.caption.monospacedDigit())
                     }
                     .tag(file.path)
                     .padding(.vertical, 3)
@@ -539,9 +594,15 @@ struct ChangeReviewSidebar: View {
                         if file.isReviewable {
                             if file.truncated { Text(c.diffTooLarge).font(.caption).foregroundStyle(.orange) }
                         } else {
-                            Text("当前文件预览")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            VStack(alignment: .trailing, spacing: 1) {
+                                Text(c.text("当前文件预览", "Current file preview"))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(c.text("服务端未提供修改前后内容，无法显示逐行增删",
+                                            "No before/after from server; per-line markers unavailable"))
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
                         }
                     }
                     Divider()
@@ -565,7 +626,7 @@ struct ChangeReviewSidebar: View {
             let files = changes.files
             let projected = await Task.detached(priority: .userInitiated) {
                 files.map {
-                    ReviewFileRow(path: $0.path, kind: $0.kind, added: $0.added, deleted: $0.deleted, isReviewable: $0.isReviewable, truncated: $0.truncated)
+                    ReviewFileRow(path: $0.path, kind: $0.kind, added: $0.added, deleted: $0.deleted, isReviewable: $0.isReviewable, truncated: $0.truncated, countsAreApproximate: $0.countsAreApproximate)
                 }
             }.value
             guard !Task.isCancelled else { return }

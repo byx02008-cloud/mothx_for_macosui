@@ -23,6 +23,19 @@ nonisolated struct MothxFileChange: Identifiable, Codable, Hashable {
         oldText != nil && newText != nil
     }
 
+    /// True when the change has no authoritative before/after pair and its
+    /// line counts were derived from a mothx tool summary that flagged them as
+    /// approximate, or could not be resolved at all. mothx reports a very
+    /// large file as a complete replacement (its LCS guard), so those numbers
+    /// describe the whole file, not the edit, and must never be shown as exact.
+    var countsAreApproximate: Bool {
+        guard !isReviewable else { return false }
+        if unifiedDiff.contains("line ranges approximate") { return true }
+        if unifiedDiff.contains("无法在此处展开") { return true }
+        if unifiedDiff.contains("Diff too large") { return true }
+        return added == 0 && deleted == 0
+    }
+
     init(path: String, oldText: String, newText: String, unifiedDiff: String, added: Int, deleted: Int, truncated: Bool = false) {
         self.id = path
         self.path = path
@@ -38,12 +51,26 @@ nonisolated struct MothxFileChange: Identifiable, Codable, Hashable {
         self.truncated = truncated
     }
 
-    /// Creates a compact historical change when the server only persisted a
-    /// tool summary and not the structured before/after file contents.
-    init(previewPath path: String, unifiedDiff: String, added: Int, deleted: Int) {
+    /// Rebuilds a change from the local SQLite store, where the kind and the
+    /// before/after payload are already known and must not be re-derived.
+    init(path: String, kind: MothxFileChangeKind, added: Int, deleted: Int, unifiedDiff: String, oldText: String?, newText: String?, truncated: Bool) {
         self.id = path
         self.path = path
-        self.kind = .modified
+        self.kind = kind
+        self.added = added
+        self.deleted = deleted
+        self.unifiedDiff = unifiedDiff
+        self.oldText = oldText
+        self.newText = newText
+        self.truncated = truncated
+    }
+
+    /// Creates a compact historical change when the server only persisted a
+    /// tool summary and not the structured before/after file contents.
+    init(previewPath path: String, unifiedDiff: String, added: Int, deleted: Int, kind: MothxFileChangeKind = .modified) {
+        self.id = path
+        self.path = path
+        self.kind = kind
         self.added = added
         self.deleted = deleted
         self.unifiedDiff = unifiedDiff
@@ -76,83 +103,6 @@ struct MothxToolChangeRecord: Codable, Hashable {
 struct MothxChangeStoreState {
     let turns: [String: MothxTurnChanges]
     let toolChanges: [String: MothxToolChangeRecord]
-}
-
-/// Persists the change database off the main thread. `save` is cheap to call
-/// from the UI thread: encoding and the atomic write happen synchronously
-/// inside the caller-started background task, so the main run loop is never
-/// blocked by multi-megabyte diff serialization while a large file is being
-/// edited. A generation counter drops stale snapshots that would otherwise
-/// overwrite a newer save that already landed.
-nonisolated final class MothxChangeStore: @unchecked Sendable {
-    private static let currentVersion = 2
-
-    private struct Envelope: Codable {
-        let version: Int
-        let turns: [String: MothxTurnChanges]
-        let toolChanges: [String: MothxToolChangeRecord]
-    }
-
-    private let url: URL
-    private let saveLock = NSLock()
-    private var lastSavedGeneration = 0
-    private let decoder = JSONDecoder()
-
-    init() {
-        let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("mothxOS", isDirectory: true)
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        url = directory.appendingPathComponent("changes.json")
-    }
-
-    func load() -> MothxChangeStoreState {
-        guard let data = try? Data(contentsOf: url) else {
-            return MothxChangeStoreState(turns: [:], toolChanges: [:])
-        }
-
-        if let envelope = try? decoder.decode(Envelope.self, from: data),
-           envelope.version >= Self.currentVersion {
-            return MothxChangeStoreState(turns: envelope.turns, toolChanges: envelope.toolChanges)
-        }
-
-        // Legacy files were keyed only by the temporary Run ID. They may also
-        // contain content from an older experimental format without a stable
-        // ACP tool-call key, so intentionally downgrade them to preview-only.
-        guard let legacy = try? decoder.decode([String: MothxTurnChanges].self, from: data) else {
-            return MothxChangeStoreState(turns: [:], toolChanges: [:])
-        }
-        let previewTurns = legacy.mapValues { turn in
-            MothxTurnChanges(
-                id: turn.id,
-                runID: turn.runID,
-                files: turn.files.map { file in
-                    MothxFileChange(
-                        previewPath: file.path,
-                        unifiedDiff: "历史运行已完成，详细 Diff 未持久化。",
-                        added: file.added,
-                        deleted: file.deleted
-                    )
-                },
-                capturedAt: turn.capturedAt
-            )
-        }
-        return MothxChangeStoreState(turns: previewTurns, toolChanges: [:])
-    }
-
-    /// Serializes the given snapshot and writes it atomically. Meant to be
-    /// called from a background task; the generation guard ensures an older
-    /// snapshot that finishes late never clobbers a newer one.
-    func save(turns: [String: MothxTurnChanges], toolChanges: [String: MothxToolChangeRecord], generation: Int) {
-        saveLock.lock()
-        defer { saveLock.unlock() }
-        guard generation >= lastSavedGeneration else { return }
-        lastSavedGeneration = generation
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        let envelope = Envelope(version: Self.currentVersion, turns: turns, toolChanges: toolChanges)
-        guard let data = try? encoder.encode(envelope) else { return }
-        try? data.write(to: url, options: .atomic)
-    }
 }
 
 nonisolated enum MothxDiffBuilder {
@@ -250,8 +200,19 @@ nonisolated enum MothxDiffBuilder {
 
     private static func lines(_ value: String) -> [String] {
         guard !value.isEmpty else { return [] }
-        var result = value.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var result = normalizedNewlines(value)
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
         if result.last == "" { result.removeLast() }
         return result
+    }
+
+    /// Splits on `\n`, `\r\n` and `\r`. Swift treats a `\r\n` pair as a single
+    /// `Character`, so `split(separator: "\n")` alone leaves an entire CRLF
+    /// file as one line, which made every CRLF edit look like a whole-file
+    /// replacement and produced meaningless counts and diffs.
+    static func normalizedNewlines(_ value: String) -> String {
+        value.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
     }
 }

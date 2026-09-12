@@ -681,6 +681,22 @@ final class TeamRunManager: ObservableObject {
             }
 
             if changed { saveTasks(runID, tasks) }
+
+            // A corrupted or partially migrated task graph can leave every
+            // non-terminal task blocked with no running/queued work. Without
+            // this guard the scheduler wakes every 800 ms forever, keeping the
+            // team run active and repeatedly hitting the local database.
+            let nonTerminalTasks = tasks.filter { !$0.status.isTerminal }
+            let hasRunnableWork = tasks.contains {
+                $0.status == .running || $0.status == .queued
+            }
+            if !nonTerminalTasks.isEmpty && !hasRunnableWork {
+                let unresolved = nonTerminalTasks.map(\.id).joined(separator: ", ")
+                let dependencyError = "团队任务无法继续，存在未解析的任务依赖：\(unresolved)"
+                finishRun(run, status: .failed, error: dependencyError)
+                return
+            }
+
             if let stopReason {
                 await cancelChildRuns(runID)
                 var stoppedTasks = loadTasks(runID)

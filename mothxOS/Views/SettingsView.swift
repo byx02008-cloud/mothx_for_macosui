@@ -52,6 +52,8 @@ struct SettingsView: View {
                     GeneralSection(language: $language, imageRecognition: $imageRecognition)
                 } else if section == "skills" {
                     SkillsSection(skillsDir: $skillsDir, sessionID: selectedSessionID)
+                } else if section == "mcp" {
+                    MCPSection()
                 } else if section == "sessions" {
                     SessionsSection(sessionDir: $sessionDir, showSettings: $showSettings, selectedProjectID: $selectedProjectID, selectedSessionID: $selectedSessionID, pendingDeletion: $pendingDeletion)
                 } else if section == "advanced" {
@@ -176,7 +178,7 @@ struct SettingsNavigation: View {
     @Environment(\.colorScheme) private var colorScheme
     @EnvironmentObject private var languageStore: LanguageStore
     @Binding var section: String
-    var body: some View { let c = languageStore.copy; return VStack(alignment: .leading, spacing: 8) { Text(c.settings.uppercased()).sectionLabel().padding(.bottom, 10); SettingsNavItem(title: c.general, icon: "gearshape", id: "general", section: $section); SettingsNavItem(title: c.providers, icon: "server.rack", id: "providers", section: $section); SettingsNavItem(title: c.skills, icon: "sparkles", id: "skills", section: $section); SettingsNavItem(title: c.sessions, icon: "clock", id: "sessions", section: $section); SettingsNavItem(title: c.advancedSettings, icon: "wrench.and.screwdriver", id: "advanced", section: $section); Spacer() }.padding(22).frame(width: 230).background(colorScheme == .light ? .white : .codexSidebar) }
+    var body: some View { let c = languageStore.copy; return VStack(alignment: .leading, spacing: 8) { Text(c.settings.uppercased()).sectionLabel().padding(.bottom, 10); SettingsNavItem(title: c.general, icon: "gearshape", id: "general", section: $section); SettingsNavItem(title: c.providers, icon: "server.rack", id: "providers", section: $section); SettingsNavItem(title: c.skills, icon: "sparkles", id: "skills", section: $section); SettingsNavItem(title: c.mcp, icon: "puzzlepiece.extension", id: "mcp", section: $section); SettingsNavItem(title: c.sessions, icon: "clock", id: "sessions", section: $section); SettingsNavItem(title: c.advancedSettings, icon: "wrench.and.screwdriver", id: "advanced", section: $section); Spacer() }.padding(22).frame(width: 230).background(colorScheme == .light ? .white : .codexSidebar) }
 }
 
 struct SettingsNavItem: View { let title: String; let icon: String; let id: String; @Binding var section: String
@@ -677,6 +679,524 @@ private struct SessionRecordRow: View {
         .onHover { isHovered = $0 }
         .animation(.easeInOut(duration: 0.12), value: isHovered)
     }
+}
+
+// MARK: - MCP settings
+
+/// Global MCP configuration (`GET/PUT /api/mcp`). Lists the configured servers
+/// and lets the user add, edit, or delete them, mirroring mothx's `mcp.json`.
+struct MCPSection: View {
+    @EnvironmentObject private var mothx: MothxServiceManager
+    @EnvironmentObject private var languageStore: LanguageStore
+
+    /// Empty means the global scope; otherwise a project ID.
+    @State private var scopeProjectID = ""
+    @State private var servers: [MothxMCPServer] = []
+    @State private var isLoading = true
+    @State private var isSaving = false
+    @State private var isDirty = false
+    @State private var showHelp = false
+    @State private var showMarket = false
+    @State private var notice: String?
+    @State private var noticeIsError = false
+
+    private var isProjectScope: Bool { !scopeProjectID.isEmpty }
+    /// mothx exposes the project-level `mcp.json` through a session in that
+    /// project's workDir, so project scope needs a matching session.
+    private var anchorSessionID: String? {
+        isProjectScope ? mothx.mcpAnchorSessionID(forProject: scopeProjectID) : nil
+    }
+    private var isScopeBlocked: Bool { isProjectScope && anchorSessionID == nil }
+
+    var body: some View {
+        let c = languageStore.copy
+        return VStack(alignment: .leading, spacing: 16) {
+            SettingsCard(title: c.mcp, subtitle: c.mcpSubtitle) {
+                HStack(spacing: 10) {
+                    Text(c.mcpScope).font(.caption).foregroundStyle(.secondary)
+                    Picker(c.mcpScope, selection: $scopeProjectID) {
+                        Text(c.mcpScopeGlobal).tag("")
+                        ForEach(mothx.projects) { project in
+                            Text(project.name).tag(project.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: 260, alignment: .leading)
+                    Spacer()
+                }
+                .onChange(of: scopeProjectID) { _, _ in Task { await reload() } }
+
+                Text(isProjectScope ? c.mcpProjectHint : c.mcpGlobalHint)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                HStack(spacing: 10) {
+                    Button { servers.append(MothxMCPServer()); isDirty = true } label: {
+                        Label(c.mcpAddServer, systemImage: "plus")
+                    }.buttonStyle(.bordered)
+                    Button { servers = [MothxMCPServer.basicTemplate()]; isDirty = true } label: {
+                        Text(c.mcpBasicTemplate)
+                    }.buttonStyle(.bordered)
+                    Button { servers = MothxMCPServer.fullTemplates(); isDirty = true } label: {
+                        Text(c.mcpFullTemplate)
+                    }.buttonStyle(.bordered)
+                    Button { showMarket = true } label: {
+                        Label(c.mcpBrowseMarket, systemImage: "square.grid.2x2")
+                    }.buttonStyle(.bordered)
+                    Spacer()
+                    Button { showHelp.toggle() } label: {
+                        Image(systemName: "questionmark.circle")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help(c.mcpHelpTitle)
+                    .popover(isPresented: $showHelp, arrowEdge: .bottom) {
+                        MCPHelpView().frame(width: 380)
+                    }
+                    Button { Task { await save() } } label: {
+                        Text(isSaving ? c.mcpSaving : c.save)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
+                    .disabled(isLoading || isSaving || !isDirty || isScopeBlocked)
+                }
+                .disabled(isScopeBlocked)
+                if isLoading {
+                    Text(c.mcpLoading).font(.callout).foregroundStyle(.secondary)
+                } else if isScopeBlocked {
+                    Text(c.mcpProjectNoSession).font(.callout).foregroundStyle(.orange)
+                } else if servers.isEmpty {
+                    Text(c.mcpEmpty).font(.callout).foregroundStyle(.secondary)
+                } else {
+                    VStack(alignment: .leading, spacing: 14) {
+                        ForEach($servers) { $server in
+                            MCPServerCard(server: $server) {
+                                servers.removeAll { $0.id == server.id }
+                                isDirty = true
+                            }
+                        }
+                    }
+                }
+                Text(c.mcpApplyHint).font(.caption).foregroundStyle(.secondary)
+            }
+            if let notice {
+                Text(notice).font(.callout).foregroundStyle(noticeIsError ? .red : .green)
+            }
+            if !isProjectScope, let error = mothx.mcpError {
+                Text(error).font(.callout).foregroundStyle(.red)
+            }
+        }
+        .task { await reload() }
+        .sheet(isPresented: $showMarket) {
+            MCPMarketSheet { server in
+                var candidate = server
+                candidate.name = uniqueName(for: server.name)
+                servers.append(candidate)
+                isDirty = true
+            }
+        }
+    }
+
+    /// Keeps market-added server names unique within the edited list.
+    private func uniqueName(for base: String) -> String {
+        let root = base.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "mcp-server" : base.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard servers.contains(where: { $0.name == root }) else { return root }
+        var index = 2
+        while servers.contains(where: { $0.name == "\(root)-\(index)" }) { index += 1 }
+        return "\(root)-\(index)"
+    }
+
+    private func reload() async {
+        isLoading = true
+        notice = nil
+        noticeIsError = false
+        if isProjectScope {
+            if let sessionID = anchorSessionID {
+                do {
+                    servers = try await mothx.loadProjectMCPConfig(sessionID: sessionID)
+                } catch {
+                    servers = []
+                    notice = error.localizedDescription
+                    noticeIsError = true
+                }
+            } else {
+                servers = []
+            }
+        } else {
+            await mothx.loadMCPConfig()
+            servers = mothx.mcpServers
+        }
+        isLoading = false
+        isDirty = false
+    }
+
+    private func save() async {
+        guard servers.allSatisfy({ !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+            notice = languageStore.copy.mcpNameRequired
+            noticeIsError = true
+            return
+        }
+        isSaving = true
+        notice = nil
+        noticeIsError = false
+        if isProjectScope {
+            if let sessionID = anchorSessionID {
+                do {
+                    servers = try await mothx.saveProjectMCPConfig(sessionID: sessionID, servers: servers)
+                    isDirty = false
+                    notice = languageStore.copy.mcpProjectSaved
+                } catch {
+                    notice = error.localizedDescription
+                    noticeIsError = true
+                }
+            }
+        } else {
+            let saved = await mothx.saveMCPConfig(servers)
+            if saved {
+                servers = mothx.mcpServers
+                isDirty = false
+            }
+        }
+        isSaving = false
+    }
+}
+
+/// One editable MCP server card. Fields follow the transport: stdio shows a
+/// command plus args/env, http/sse show a URL plus headers (sse also messageUrl).
+private struct MCPServerCard: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @EnvironmentObject private var languageStore: LanguageStore
+    @Binding var server: MothxMCPServer
+    let remove: () -> Void
+
+    var body: some View {
+        let c = languageStore.copy
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text(server.name.isEmpty ? c.mcpUntitledServer : server.name)
+                    .font(.system(size: 14, weight: .semibold))
+                Spacer()
+                Button(role: .destructive) { remove() } label: {
+                    Label(c.delete, systemImage: "trash")
+                }.buttonStyle(.plain).foregroundStyle(.red.opacity(0.85))
+            }
+            HStack(alignment: .bottom, spacing: 12) {
+                SettingsField(title: c.mcpName, text: $server.name, placeholder: "filesystem")
+                VStack(alignment: .leading, spacing: 7) {
+                    Text(c.mcpTransport).font(.caption).foregroundStyle(.secondary)
+                    Picker(c.mcpTransport, selection: $server.type) {
+                        ForEach(MothxMCPServer.transportOptions, id: \.self) { option in
+                            Text(option == MothxMCPServer.httpType ? "HTTP" : option).tag(option)
+                        }
+                    }.labelsHidden().frame(maxWidth: .infinity, alignment: .leading)
+                }.frame(width: 150)
+            }
+            if server.isStdio {
+                SettingsField(title: c.mcpCommand, text: $server.command, placeholder: "/absolute/path/to/mcp-server")
+            } else {
+                SettingsField(title: c.mcpURL, text: $server.url, placeholder: "https://mcp.example.com")
+                if server.isSSE {
+                    SettingsField(title: c.mcpMessageURL, text: $server.messageUrl, placeholder: "https://mcp.example.com/messages")
+                }
+            }
+            if server.isStdio {
+                argsEditor(c)
+            }
+            pairEditor(title: c.mcpHeaders, field: $server.headers, namePlaceholder: "Authorization")
+            if server.isStdio {
+                pairEditor(title: c.mcpEnv, field: $server.env, namePlaceholder: "API_KEY")
+            }
+        }
+        .padding(14)
+        .background(colorScheme == .light ? .white : Color.codexCard)
+        .clipShape(RoundedRectangle(cornerRadius: 9))
+        .overlay { RoundedRectangle(cornerRadius: 9).stroke(Color.primary.opacity(0.12), lineWidth: 1) }
+    }
+
+    @ViewBuilder
+    private func argsEditor(_ c: Copy) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(c.mcpArgs).font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button { server.args.append("") } label: {
+                    Label(c.mcpAddRow, systemImage: "plus")
+                }.buttonStyle(.plain).foregroundStyle(.orange)
+            }
+            ForEach(server.args.indices, id: \.self) { index in
+                HStack(spacing: 8) {
+                    TextField("--argument", text: $server.args[index])
+                        .textFieldStyle(.plain).padding(8)
+                        .background(Color.primary.opacity(0.12)).clipShape(RoundedRectangle(cornerRadius: 6))
+                    Button { server.args.remove(at: index) } label: {
+                        Image(systemName: "trash")
+                    }.buttonStyle(.plain).foregroundStyle(.red.opacity(0.8))
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func pairEditor(title: String, field: Binding<[MothxMCPPair]>, namePlaceholder: String) -> some View {
+        let c = languageStore.copy
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(title).font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button { field.wrappedValue.append(MothxMCPPair()) } label: {
+                    Label(c.mcpAddRow, systemImage: "plus")
+                }.buttonStyle(.plain).foregroundStyle(.orange)
+            }
+            ForEach(field) { $pair in
+                HStack(spacing: 8) {
+                    TextField(namePlaceholder, text: $pair.name)
+                        .textFieldStyle(.plain).padding(8)
+                        .background(Color.primary.opacity(0.12)).clipShape(RoundedRectangle(cornerRadius: 6))
+                    TextField(c.mcpValue, text: $pair.value)
+                        .textFieldStyle(.plain).padding(8)
+                        .background(Color.primary.opacity(0.12)).clipShape(RoundedRectangle(cornerRadius: 6))
+                    Button { field.wrappedValue.removeAll { $0.id == pair.id } } label: {
+                        Image(systemName: "trash")
+                    }.buttonStyle(.plain).foregroundStyle(.red.opacity(0.8))
+                }
+            }
+        }
+    }
+}
+
+/// Marketplace sheet backed by the official MCP Registry. Selecting a row
+/// converts it into a prefilled, editable server card in the settings list.
+private struct MCPMarketSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var mothx: MothxServiceManager
+    @EnvironmentObject private var languageStore: LanguageStore
+    let onAdd: (MothxMCPServer) -> Void
+
+    @State private var query = ""
+    @State private var items: [MothxMCPMarketServer] = []
+    @State private var cursor: String?
+    @State private var isLoading = false
+    @State private var errorMessage: String?
+    @State private var addedName: String?
+
+    var body: some View {
+        let c = languageStore.copy
+        return VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(c.mcpMarketTitle).font(.system(size: 20, weight: .semibold))
+                    Text(c.mcpMarketSubtitle).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                TextField(c.mcpMarketSearchPlaceholder, text: $query)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 280)
+                    .onSubmit { Task { await search() } }
+                Button(c.mcpMarketSearch) { Task { await search() } }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
+                Button(c.cancel) { dismiss() }.buttonStyle(.bordered)
+            }
+            .padding(20)
+            Divider()
+
+            HStack(spacing: 8) {
+                Text(c.mcpMarketHint).font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                if isLoading { ProgressView().controlSize(.small) }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+
+            Divider()
+
+            if items.isEmpty && !isLoading {
+                VStack(spacing: 8) {
+                    Image(systemName: "shippingbox").font(.system(size: 28)).foregroundStyle(.secondary)
+                    Text(c.mcpMarketEmpty).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(items, id: \.name) { item in
+                            MCPMarketRow(server: item, added: addedName == item.name) { add(item) }
+                            Divider().padding(.leading, 16)
+                        }
+                    }
+                }
+            }
+
+            Divider()
+            HStack {
+                Button(c.mcpMarketLoadMore) { Task { await loadMore() } }
+                    .buttonStyle(.bordered)
+                    .disabled(isLoading || cursor == nil)
+                Spacer()
+                Text(c.text("共 \(items.count) 个", "\(items.count) total"))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(12)
+
+            if let errorMessage {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                    Text(errorMessage).lineLimit(2)
+                    Spacer()
+                    Button { self.errorMessage = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain)
+                }
+                .font(.caption).foregroundStyle(.red)
+                .padding(.horizontal, 16).padding(.vertical, 10)
+                .background(Color.red.opacity(0.08))
+            }
+        }
+        .frame(minWidth: 720, minHeight: 560)
+        .task { await search() }
+    }
+
+    private func search() async {
+        isLoading = true
+        errorMessage = nil
+        addedName = nil
+        do {
+            let response = try await mothx.searchMCPMarket(query: query)
+            items = response.servers.map(\.server)
+            cursor = response.metadata?.nextCursor
+        } catch {
+            errorMessage = error.localizedDescription
+            items = []
+            cursor = nil
+        }
+        isLoading = false
+    }
+
+    private func loadMore() async {
+        guard let cursor, !isLoading else { return }
+        isLoading = true
+        do {
+            let response = try await mothx.searchMCPMarket(query: query, cursor: cursor)
+            let existing = Set(items.map(\.name))
+            items.append(contentsOf: response.servers.map(\.server).filter { !existing.contains($0.name) })
+            self.cursor = response.metadata?.nextCursor
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        isLoading = false
+    }
+
+    private func add(_ item: MothxMCPMarketServer) {
+        guard let server = item.makeMCPServer() else {
+            errorMessage = languageStore.copy.mcpMarketUnsupported
+            return
+        }
+        onAdd(server)
+        addedName = item.name
+    }
+}
+
+private struct MCPMarketRow: View {
+    @EnvironmentObject private var languageStore: LanguageStore
+    let server: MothxMCPMarketServer
+    let added: Bool
+    let add: () -> Void
+
+    private var displayTitle: String {
+        if let title = server.title, !title.isEmpty { return title }
+        return server.suggestedName
+    }
+
+    private var transportLabels: [String] {
+        var labels = Set<String>()
+        for package in server.packages ?? [] {
+            if let type = package.registryType { labels.insert(type) }
+        }
+        for remote in server.remotes ?? [] {
+            if let type = remote.type { labels.insert(type) }
+        }
+        return labels.sorted()
+    }
+
+    var body: some View {
+        let c = languageStore.copy
+        return HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Text(displayTitle).font(.system(size: 14, weight: .medium))
+                    if let version = server.version, !version.isEmpty {
+                        Text(version).font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+                Text(server.name).font(.caption2).foregroundStyle(.secondary)
+                if let description = server.description, !description.isEmpty {
+                    Text(description).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                }
+                if !transportLabels.isEmpty {
+                    HStack(spacing: 6) {
+                        ForEach(transportLabels, id: \.self) { label in
+                            Text(label).font(.caption2)
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(Color.primary.opacity(0.08))
+                                .clipShape(Capsule())
+                        }
+                    }
+                }
+            }
+            Spacer()
+            Button(added ? c.mcpMarketAddedLabel : c.mcpMarketAdd) { add() }
+                .buttonStyle(.bordered)
+                .disabled(added)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+}
+
+/// Help popover explaining what MCP is and how the entries are used.
+private struct MCPHelpView: View {
+    @EnvironmentObject private var languageStore: LanguageStore
+
+    var body: some View {
+        let c = languageStore.copy
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(c.mcpHelpTitle).font(.headline)
+                Text(c.mcpHelpIntro).font(.callout).fixedSize(horizontal: false, vertical: true)
+                Text(c.mcpHelpTransports).font(.callout).fixedSize(horizontal: false, vertical: true)
+                Text(c.mcpHelpNaming).font(.callout).fixedSize(horizontal: false, vertical: true)
+                Text(c.mcpHelpConfig).font(.callout).fixedSize(horizontal: false, vertical: true)
+                Text(c.mcpHelpSecrets).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Text(c.mcpHelpExampleTitle).font(.subheadline).fontWeight(.semibold)
+                Text(Self.exampleJSON)
+                    .font(.system(size: 11, design: .monospaced))
+                    .textSelection(.enabled)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.primary.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+            .padding(16)
+        }
+        .frame(maxHeight: 460)
+    }
+
+    private static let exampleJSON = """
+    {
+      "mcpServers": [
+        {
+          "name": "filesystem",
+          "type": "stdio",
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path"]
+        },
+        {
+          "name": "remote",
+          "type": "http",
+          "url": "https://mcp.example.com",
+          "headers": [{ "name": "Authorization", "value": "Bearer <token>" }]
+        }
+      ]
+    }
+    """
 }
 
 private struct AdvancedSettingsSection: View {

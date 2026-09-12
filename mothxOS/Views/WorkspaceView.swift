@@ -71,6 +71,16 @@ struct WorkspaceView: View {
     /// positions the scrollbar against partial content: the scrollbar
     /// position is determined only after the content is loaded and collapsed.
     @State private var isRestoringConversation = false
+    /// Bumped every time a different session starts loading. The scroll
+    /// observer uses it to drop retry/settle state that belongs to the
+    /// previous conversation, so the new session never inherits a stale
+    /// viewport offset or an in-flight "follow the bottom" window.
+    @State private var conversationSessionToken = 0
+    /// Identifies the newest session restore. A cancelled older restore must
+    /// not clear `isRestoringConversation` while a newer one is still loading
+    /// its content, otherwise a premature scroll can position the viewport
+    /// against partial content and leave the conversation blank.
+    @State private var sessionRestoreGeneration = 0
 
     private let conversationBottomID = "conversation-bottom"
 
@@ -197,7 +207,9 @@ struct WorkspaceView: View {
                             .background(
                                 ConversationScrollObserver(
                                     layoutToken: conversationLayoutID,
-                                    scrollToBottomToken: scrollToBottomRequest
+                                    scrollToBottomToken: scrollToBottomRequest,
+                                    sessionToken: conversationSessionToken,
+                                    isLoading: isRestoringConversation
                                 ) { atBottom in
                                     isConversationAtBottom = atBottom
                                 }
@@ -395,9 +407,22 @@ struct WorkspaceView: View {
             // message/turn change handlers must not position the scrollbar
             // against partial content. The position is determined exactly once
             // at the end of the restore, after the content is loaded and
-            // collapsed.
+            // collapsed. The generation guard makes this cancellation-safe:
+            // a superseded restore must not clear the gate for the restore
+            // that replaced it.
+            sessionRestoreGeneration += 1
+            let restoreGeneration = sessionRestoreGeneration
             isRestoringConversation = true
-            defer { isRestoringConversation = false }
+            // Tell the scroll observer a new conversation is loading. It parks
+            // the viewport at the top and drops the previous session's retry
+            // state so no stale offset or in-flight bottom-follow can render a
+            // blank viewport before this session's content exists.
+            conversationSessionToken += 1
+            defer {
+                if sessionRestoreGeneration == restoreGeneration {
+                    isRestoringConversation = false
+                }
+            }
             if let sessionID {
                 // Drop the previous conversation immediately so the restored
                 // session never renders stale turns while its messages are
@@ -465,10 +490,16 @@ struct WorkspaceView: View {
                 }
                 guard !Task.isCancelled else { return }
                 // The collapse (only the last turn stays expanded) and the
-                // prepared content need one committed layout pass before the
-                // scrollbar position is determined.
-                await Task.yield()
-                await Task.yield()
+                // prepared content need committed layout passes before the
+                // scrollbar position is determined. `Task.yield()` only yields
+                // within the main actor and may run before AppKit has actually
+                // laid the new document out, so hop the main queue instead:
+                // this guarantees the restored content is committed before we
+                // move the viewport.
+                await awaitMainRunLoopTurn()
+                await awaitMainRunLoopTurn()
+                guard !Task.isCancelled,
+                      sessionRestoreGeneration == restoreGeneration else { return }
                 // Load order complete: content loaded → collapsed → prepared.
                 // Only now determine the scrollbar position; the premature
                 // requests from the change handlers were suppressed above.
@@ -582,6 +613,16 @@ struct WorkspaceView: View {
 
     private func requestScrollToBottom() {
         scrollToBottomRequest += 1
+    }
+
+    /// Suspends until the main queue has delivered the next turn. Unlike
+    /// `Task.yield()`, which only yields within the main actor, this lets
+    /// already-scheduled SwiftUI/AppKit layout work commit before the caller
+    /// continues, so callers can position the scrollbar against real content.
+    private func awaitMainRunLoopTurn() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async { continuation.resume() }
+        }
     }
 
     /// computeTurns repeatedly splits, trims and copies potentially huge
@@ -1979,6 +2020,13 @@ private struct ConversationScrollObserver: NSViewRepresentable {
     /// Bumped by WorkspaceView whenever the conversation should land at the
     /// bottom (session restore, history commit, review close).
     let scrollToBottomToken: Int
+    /// Bumped whenever a different session starts loading. Resets the
+    /// observer's retry state so the new conversation cannot inherit the
+    /// previous one's viewport offset or bottom-follow window.
+    let sessionToken: Int
+    /// True while WorkspaceView is restoring a saved conversation. The
+    /// observer must not chase the bottom or retry against partial content.
+    let isLoading: Bool
     let onBottomChanged: (Bool) -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -1990,6 +2038,8 @@ private struct ConversationScrollObserver: NSViewRepresentable {
         view.postsFrameChangedNotifications = false
         context.coordinator.layoutToken = layoutToken
         context.coordinator.scrollToBottomToken = scrollToBottomToken
+        context.coordinator.sessionToken = sessionToken
+        context.coordinator.isLoading = isLoading
         context.coordinator.attach(to: view)
         return view
     }
@@ -1998,6 +2048,8 @@ private struct ConversationScrollObserver: NSViewRepresentable {
         context.coordinator.onBottomChanged = onBottomChanged
         context.coordinator.layoutToken = layoutToken
         context.coordinator.scrollToBottomToken = scrollToBottomToken
+        context.coordinator.sessionToken = sessionToken
+        context.coordinator.isLoading = isLoading
         context.coordinator.attach(to: nsView)
     }
 
@@ -2022,6 +2074,12 @@ private struct ConversationScrollObserver: NSViewRepresentable {
         var lastScrollToBottomTime: Date?
         /// The document height recorded during the last scroll-to-bottom attempt.
         var lastScrollToBottomDocumentHeight: CGFloat = 0
+        var sessionToken = 0
+        var appliedSessionToken: Int?
+        var isLoading = false
+        /// Generation counter for the post-scroll settle passes. A new request
+        /// (or a new session) invalidates any older in-flight passes.
+        var settleGeneration = 0
 
         init(onBottomChanged: @escaping (Bool) -> Void) {
             self.onBottomChanged = onBottomChanged
@@ -2040,6 +2098,7 @@ private struct ConversationScrollObserver: NSViewRepresentable {
                 }
 
                 guard self.observedScrollView !== scrollView else {
+                    self.applySessionResetIfNeeded(scrollView: scrollView)
                     self.refreshLayoutIfNeeded()
                     self.refreshScrollIfNeeded()
                     self.scheduleScrollOffsetClamp()
@@ -2069,11 +2128,38 @@ private struct ConversationScrollObserver: NSViewRepresentable {
                     self?.updateBottomState()
                 }
                 self.reattachDocumentObservers(scrollView: scrollView)
+                self.applySessionResetIfNeeded(scrollView: scrollView)
                 self.refreshLayoutIfNeeded()
                 self.refreshScrollIfNeeded()
                 self.scheduleScrollOffsetClamp()
                 self.updateBottomState()
             }
+        }
+
+        /// When a different session starts loading, drop everything that
+        /// describes the previous conversation's scroll state and park the
+        /// viewport at the top of the (soon to be empty) document. This is the
+        /// key to "load first, then position": the stale offset from the
+        /// previous conversation can never survive into the new one and render
+        /// a blank viewport while its content is still being loaded.
+        func applySessionResetIfNeeded(scrollView: NSScrollView) {
+            guard appliedSessionToken != sessionToken else { return }
+            appliedSessionToken = sessionToken
+            // Cancel any bottom-follow / settle work that belongs to the
+            // previous session so it cannot fight the new conversation.
+            lastScrollToBottomTime = nil
+            lastScrollToBottomDocumentHeight = 0
+            settleGeneration &+= 1
+            lastBottomState = nil
+            // Adopt the current scroll token. The next bottom request must come
+            // from the completed restore (it increments the token), never from
+            // a stale one that is already applied.
+            appliedScrollToBottomToken = scrollToBottomToken
+            scrollView.needsLayout = true
+            scrollView.layoutSubtreeIfNeeded()
+            let clipView = scrollView.contentView
+            clipView.scroll(to: .zero)
+            scrollView.reflectScrolledClipView(clipView)
         }
 
         func reattachDocumentObservers(scrollView: NSScrollView) {
@@ -2115,6 +2201,10 @@ private struct ConversationScrollObserver: NSViewRepresentable {
         /// passes (markdown, images, per-file historical changes fetched over
         /// the network), each of which can grow the document later.
         func retryScrollToBottomIfNeeded() {
+            // Never chase the bottom while a saved conversation is still being
+            // restored; the restore issues exactly one scroll once its content
+            // is committed.
+            guard !isLoading else { return }
             guard let lastTime = lastScrollToBottomTime,
                   Date().timeIntervalSince(lastTime) < 4.0,
                   let scrollView = observedScrollView,
@@ -2147,10 +2237,52 @@ private struct ConversationScrollObserver: NSViewRepresentable {
         /// blank viewport until the user scrolls. Runs one runloop after the
         /// token change so the turn list has been committed.
         func refreshScrollIfNeeded() {
+            // Strict "load first, then position": while a saved conversation is
+            // loading, ignore every bottom request (including ones triggered by
+            // the previous run's status changes). The restore bumps the token
+            // again once its content is committed, so the request is not lost.
+            guard !isLoading else { return }
             guard appliedScrollToBottomToken != scrollToBottomToken else { return }
             appliedScrollToBottomToken = scrollToBottomToken
             DispatchQueue.main.async { [weak self] in
-                self?.scrollToBottomNow()
+                guard let self else { return }
+                self.scrollToBottomNow()
+                // Landing at the estimated document bottom can leave freshly
+                // realized rows undrawn until something forces another layout
+                // pass, and no AppKit notification arrives when the estimate
+                // was already correct. Settle the viewport over a few frames so
+                // restored content is actually rendered.
+                self.settleAfterScroll(remaining: 8)
+            }
+        }
+
+        /// Runs a few deferred layout/display passes after a bottom jump.
+        /// LazyVStack realizes rows around the viewport; after jumping to the
+        /// bottom the newly visible rows may not be drawn yet. Forcing layout
+        /// and display here prevents the restored conversation from rendering
+        /// blank until the user nudges the scrollbar.
+        func settleAfterScroll(remaining: Int) {
+            settleGeneration &+= 1
+            let generation = settleGeneration
+            scheduleSettleStep(remaining: remaining, generation: generation)
+        }
+
+        private func scheduleSettleStep(remaining: Int, generation: Int) {
+            guard remaining > 0 else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.settleGeneration == generation,
+                      let scrollView = self.observedScrollView,
+                      let documentView = scrollView.documentView else { return }
+                scrollView.needsLayout = true
+                scrollView.layoutSubtreeIfNeeded()
+                documentView.needsDisplay = true
+                documentView.displayIfNeeded()
+                // Keep following the bottom while settling, but stop if the
+                // user has dragged away from it (same rule as the retry path).
+                if self.distanceToBottom() <= 50 || self.lastBottomState == true {
+                    self.scrollToBottomNow()
+                }
+                self.scheduleSettleStep(remaining: remaining - 1, generation: generation)
             }
         }
 
@@ -2202,9 +2334,20 @@ private struct ConversationScrollObserver: NSViewRepresentable {
             // bottom of the content is at maxY = height - clipHeight.
             let maxY = max(0, documentHeight - clipHeight)
             let currentY = clipView.bounds.origin.y
+            var moved = false
             if abs(currentY - maxY) > 0.5 {
                 clipView.scroll(to: NSPoint(x: 0, y: maxY))
                 scrollView.reflectScrolledClipView(clipView)
+                moved = true
+            }
+            if moved {
+                // Force the newly visible region to realize and draw. Without
+                // this, the jump can land on a valid offset that still paints
+                // blank until the user scrolls.
+                scrollView.needsLayout = true
+                scrollView.layoutSubtreeIfNeeded()
+                documentView.needsDisplay = true
+                documentView.displayIfNeeded()
             }
             // Re-evaluate even when the clip view was already at maxY. This
             // fixes the stale-button case where a prior bounds notification

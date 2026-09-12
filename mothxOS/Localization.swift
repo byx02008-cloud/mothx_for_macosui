@@ -358,6 +358,54 @@ struct Copy {
     var stopAndSwitch: String { text("停止并切换", "Stop and switch") }
     var continueAndSwitch: String { text("继续执行并切换", "Continue and switch") }
 
+    // MARK: - MCP
+
+    var mcp: String { text("MCP", "MCP") }
+    var mcpSubtitle: String { text("全局与项目级 MCP 服务器配置", "Global and project-level MCP server configuration") }
+    var mcpAddServer: String { text("添加服务器", "Add server") }
+    var mcpBasicTemplate: String { text("基础模板", "Basic template") }
+    var mcpFullTemplate: String { text("完整模板", "Full template") }
+    var mcpName: String { text("名称", "Name") }
+    var mcpTransport: String { text("传输方式", "Transport") }
+    var mcpCommand: String { text("命令", "Command") }
+    var mcpURL: String { text("URL", "URL") }
+    var mcpMessageURL: String { text("消息 URL", "Message URL") }
+    var mcpArgs: String { text("参数", "Arguments") }
+    var mcpHeaders: String { text("请求头", "Headers") }
+    var mcpEnv: String { text("环境变量", "Environment") }
+    var mcpValue: String { text("值", "Value") }
+    var mcpAddRow: String { text("添加", "Add") }
+    var mcpEmpty: String { text("暂未配置 MCP 服务器。点击“添加服务器”开始，或使用模板快速体验。", "No MCP servers configured yet. Use \"Add server\" or a template to get started.") }
+    var mcpLoading: String { text("正在读取 MCP 配置…", "Loading MCP configuration…") }
+    var mcpSaving: String { text("保存中…", "Saving…") }
+    var mcpNameRequired: String { text("每个 MCP 服务器都需要一个名称。", "Every MCP server needs a name.") }
+    var mcpUntitledServer: String { text("未命名服务器", "Untitled server") }
+    var mcpApplyHint: String { text("MCP 配置在新建会话或重启 mothx 服务后生效；进行中的会话不会重新加载。", "MCP changes take effect on the next new session or mothx restart; in-flight sessions are not reloaded.") }
+    var mcpHelpTitle: String { text("MCP 使用帮助", "MCP help") }
+    var mcpHelpIntro: String { text("MCP（Model Context Protocol）让 mothx 的 Agent 调用它内置工具之外的外部系统，例如数据库、issue 系统、内部 API 或第三方服务。", "MCP (Model Context Protocol) lets the mothx agent call external systems beyond its built-in tools, such as databases, issue trackers, internal APIs, or third-party services.") }
+    var mcpHelpTransports: String { text("传输方式：stdio 用于本地可执行文件（命令 + 参数 + 环境变量）；http 用于流式 HTTP 端点（URL + 请求头）；sse 用于旧式 SSE 端点（URL + 消息 URL）。", "Transports: stdio spawns a local executable (command + args + env); http talks to a streamable HTTP endpoint (URL + headers); sse targets a legacy SSE endpoint (URL + message URL).") }
+    var mcpHelpNaming: String { text("连接成功后，服务器暴露的工具会以 mcp_<服务器名>_<工具名> 注册进会话，Agent 会像内置工具一样自动调用。", "Once connected, a server's tools are registered as mcp_<server>_<tool> and the agent calls them alongside built-in tools.") }
+    var mcpHelpConfig: String { text("保存到全局 ~/.mothx/mcp.json 或项目的 .mothx/mcp.json；两者会合并生效。", "Saved to the global ~/.mothx/mcp.json or a project's .mothx/mcp.json; the two are merged.") }
+    var mcpHelpSecrets: String { text("在请求头或环境变量中填写的密钥会原样保存到 mcp.json，请勿在共享机器上放置生产凭证。", "Secrets entered in headers or environment are stored verbatim in mcp.json; avoid production credentials on shared machines.") }
+    var mcpHelpExampleTitle: String { text("示例", "Example") }
+    var mcpBrowseMarket: String { text("浏览市场", "Browse marketplace") }
+    var mcpScope: String { text("作用范围", "Scope") }
+    var mcpScopeGlobal: String { text("全局（所有项目）", "Global (all projects)") }
+    var mcpGlobalHint: String { text("全局配置写入 ~/.mothx/mcp.json，对所有项目生效。", "Global config is written to ~/.mothx/mcp.json and applies to every project.") }
+    var mcpProjectHint: String { text("项目级配置写入该项目的 .mothx/mcp.json，并与全局配置合并；只给本项目用的服务器放在这里。", "Project config is written to the project's .mothx/mcp.json and is merged with the global config. Put project-only servers here.") }
+    var mcpProjectNoSession: String { text("该项目还没有会话，请先在该项目下发起一次对话，再回来配置项目级 MCP。", "This project has no session yet. Start a conversation in the project first, then return to configure project-level MCP.") }
+    var mcpProjectSaved: String { text("项目级 MCP 已保存，新会话生效。", "Project MCP saved; takes effect on new sessions.") }
+    var mcpMarketTitle: String { text("MCP 市场", "MCP marketplace") }
+    var mcpMarketSubtitle: String { text("registry.modelcontextprotocol.io", "registry.modelcontextprotocol.io") }
+    var mcpMarketSearchPlaceholder: String { text("搜索 MCP 服务器", "Search MCP servers") }
+    var mcpMarketSearch: String { text("搜索", "Search") }
+    var mcpMarketEmpty: String { text("没有找到 MCP 服务器", "No MCP servers found") }
+    var mcpMarketAdd: String { text("加入", "Add") }
+    var mcpMarketAddedLabel: String { text("已加入", "Added") }
+    var mcpMarketUnsupported: String { text("该条目暂不支持自动填充，请手动配置。", "This entry cannot be auto-filled; please configure it manually.") }
+    var mcpMarketLoadMore: String { text("加载更多", "Load more") }
+    var mcpMarketHint: String { text("来自官方 MCP Registry 的公开目录，数据由社区/厂商发布；加入后请核对命令、参数与密钥再保存。", "Public catalog from the official MCP Registry, published by the community/vendors. Verify command, args, and secrets before saving.") }
+
     // MARK: - About
     var about: String { text("关于软件", "About") }
     var advancedSettings: String { text("高级设置", "Advanced settings") }

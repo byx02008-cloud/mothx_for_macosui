@@ -13,8 +13,13 @@ nonisolated struct Turn: Identifiable {
     let toolResultCount: Int
     let hasResponded: Bool
     let isLast: Bool
+    /// True when the turn has no user message of its own: the server returned
+    /// a bounded window that starts mid-turn (see `MothxServiceManager
+    /// .extendWindowToUserAnchor`). The header is hidden and the body is always
+    /// rendered so an anchorless window can never show an empty conversation.
+    let isAnchorless: Bool
 
-    init(index: Int, userMessage: MothxMessage, resultMessages: [MothxMessage], toolSummaries: [ToolInvocationSummary], fileToolCalls: [MothxMessage] = [], toolResultCount: Int, hasResponded: Bool, isLast: Bool) {
+    init(index: Int, userMessage: MothxMessage, resultMessages: [MothxMessage], toolSummaries: [ToolInvocationSummary], fileToolCalls: [MothxMessage] = [], toolResultCount: Int, hasResponded: Bool, isLast: Bool, isAnchorless: Bool = false) {
         self.id = userMessage.id
         self.index = index
         self.userMessage = userMessage
@@ -24,6 +29,7 @@ nonisolated struct Turn: Identifiable {
         self.toolResultCount = toolResultCount
         self.hasResponded = hasResponded
         self.isLast = isLast
+        self.isAnchorless = isAnchorless
     }
 
     var hasProcess: Bool { !toolSummaries.isEmpty }
@@ -67,7 +73,7 @@ nonisolated func computeTurns(_ messages: [MothxMessage]) -> [Turn] {
     var turns: [Turn] = []
     var curUser: MothxMessage?
     var curSub: [MothxMessage] = []
-    func makeTurn(index: Int, user: MothxMessage, messages: [MothxMessage], isLast: Bool) -> Turn {
+    func makeTurn(index: Int, user: MothxMessage, messages: [MothxMessage], isLast: Bool, isAnchorless: Bool = false) -> Turn {
         var results: [MothxMessage] = []
         var calls: [String: ToolInvocationSummary] = [:]
         var order: [String] = []
@@ -109,7 +115,7 @@ nonisolated func computeTurns(_ messages: [MothxMessage]) -> [Turn] {
         // work. Only the final non-empty assistant projection belongs in the
         // main transcript; the rest is process detail, loaded separately.
         let finalResult = results.last.map { [$0] } ?? []
-        return Turn(index: index, userMessage: user, resultMessages: finalResult, toolSummaries: order.compactMap { calls[$0] }, fileToolCalls: fileCalls, toolResultCount: resultCount, hasResponded: !messages.isEmpty, isLast: isLast)
+        return Turn(index: index, userMessage: user, resultMessages: finalResult, toolSummaries: order.compactMap { calls[$0] }, fileToolCalls: fileCalls, toolResultCount: resultCount, hasResponded: !messages.isEmpty, isLast: isLast, isAnchorless: isAnchorless)
     }
     for msg in messages {
         if msg.isUser {
@@ -118,9 +124,22 @@ nonisolated func computeTurns(_ messages: [MothxMessage]) -> [Turn] {
         } else { curSub.append(msg) }
     }
     if let u = curUser { turns.append(makeTurn(index: turns.count, user: u, messages: curSub, isLast: false)) }
+    if turns.isEmpty, !messages.isEmpty {
+        // The window starts mid-turn and has no user message to anchor it — the
+        // server answered with a bounded tail page for a very long session.
+        // Render everything under a synthetic anchor instead of returning zero
+        // turns, which would leave the conversation area blank.
+        let anchor = MothxMessage(
+            id: "window-anchor-\(messages.first?.id ?? "start")",
+            seq: nil, role: "user", content: "",
+            toolCallId: nil, toolName: nil, arguments: "",
+            plan: nil, summary: nil, hasDetail: false, createdAt: nil
+        )
+        turns.append(makeTurn(index: 0, user: anchor, messages: messages, isLast: false, isAnchorless: true))
+    }
     if !turns.isEmpty {
         let last = turns[turns.count - 1]
-        turns[turns.count - 1] = Turn(index: last.index, userMessage: last.userMessage, resultMessages: last.resultMessages, toolSummaries: last.toolSummaries, fileToolCalls: last.fileToolCalls, toolResultCount: last.toolResultCount, hasResponded: last.hasResponded, isLast: true)
+        turns[turns.count - 1] = Turn(index: last.index, userMessage: last.userMessage, resultMessages: last.resultMessages, toolSummaries: last.toolSummaries, fileToolCalls: last.fileToolCalls, toolResultCount: last.toolResultCount, hasResponded: last.hasResponded, isLast: true, isAnchorless: last.isAnchorless)
     }
     return turns
 }
@@ -234,6 +253,7 @@ struct TurnBlock: View {
     /// validation and avoids offering an action that the API must reject.
     private var forkableAssistantMessage: MothxMessage? {
         guard !isRunActive,
+              !turn.isAnchorless,
               let message = turn.resultMessages.last,
               let seq = message.seq,
               seq > 0,
@@ -383,29 +403,35 @@ struct TurnBlock: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button(action: onToggle) {
-                HStack(spacing: 8) {
-                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                        .font(.caption2).foregroundStyle(.tertiary)
-                    Text(turn.userMessage.content)
-                        .font(.subheadline).foregroundStyle(.primary).lineLimit(1)
-                    Spacer()
+            // An anchorless turn (a mid-turn server window) has no user message
+            // to title the accordion row with, so render its content directly.
+            if !turn.isAnchorless {
+                Button(action: onToggle) {
+                    HStack(spacing: 8) {
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.caption2).foregroundStyle(.tertiary)
+                        Text(turn.userMessage.content)
+                            .font(.subheadline).foregroundStyle(.primary).lineLimit(1)
+                        Spacer()
+                    }
+                    .padding(.vertical, 8).padding(.horizontal, 2)
+                    .contentShape(Rectangle())
                 }
-                .padding(.vertical, 8).padding(.horizontal, 2)
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
 
-            if isExpanded {
+            if isExpanded || turn.isAnchorless {
                 if isContentReady {
                     VStack(alignment: .leading, spacing: 10) {
-                        MessageBubble(
-                            message: turn.userMessage,
-                            isCurrentRunning: false,
-                            onFork: forkAction,
-                            isForking: forkingMessageID == forkableAssistantMessage?.id,
-                            onPreviewImage: onPreviewImage
-                        )
+                        if !turn.isAnchorless {
+                            MessageBubble(
+                                message: turn.userMessage,
+                                isCurrentRunning: false,
+                                onFork: forkAction,
+                                isForking: forkingMessageID == forkableAssistantMessage?.id,
+                                onPreviewImage: onPreviewImage
+                            )
+                        }
                         if turn.hasResponded { agentResponseBlock }
                         // Show status for the last turn before the agent responds,
                         // so the user sees elapsed time while waiting.
